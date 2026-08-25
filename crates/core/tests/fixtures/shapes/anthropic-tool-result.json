@@ -1,0 +1,1 @@
+{"model":"claude-sonnet-4","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_001","content":"2026-08-25T20:00:01Z INFO tool 10.10.0.1 ok\n2026-08-25T20:00:02Z INFO tool 10.10.0.2 ok"},{"type":"text","text":"and summarize"}]}]}
