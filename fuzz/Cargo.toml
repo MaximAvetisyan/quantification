@@ -1,0 +1,27 @@
+[package]
+name = "quantification-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+quantification-core = { path = "../crates/core" }
+
+[[bin]]
+name = "fuzz_sniff"
+path = "fuzz_targets/fuzz_sniff.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_locator"
+path = "fuzz_targets/fuzz_locator.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_splitter"
+path = "fuzz_targets/fuzz_splitter.rs"
+test = false
+doc = false

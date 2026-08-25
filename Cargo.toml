@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/proto", "crates/server"]
+# standalone cargo-fuzz crate; not a member (TASKS.md W0.4)
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
