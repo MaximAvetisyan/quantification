@@ -1,0 +1,15 @@
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "2026-08-25T11:00:01Z INFO db 10.1.0.1 ok\n2026-08-25T11:00:02Z INFO db 10.1.0.2 ok\n2026-08-25T11:00:03Z INFO db 10.1.0.3 ok\n2026-08-25T11:00:04Z INFO db 10.1.0.4 ok"
+        }
+      ]
+    }
+  ]
+}

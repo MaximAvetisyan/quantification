@@ -1,0 +1,1 @@
+{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"text","text":"2026-08-25T14:00:01Z INFO mix 10.4.0.1 ok\n2026-08-25T14:00:02Z INFO mix 10.4.0.2 ok\n2026-08-25T14:00:03Z INFO mix 10.4.0.3 ok"},{"type":"image_url","image_url":{"url":"https://example.com/dump.png"}}]}]}

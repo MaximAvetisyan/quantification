@@ -1,0 +1,1 @@
+{"model":"gpt-4o","input":[{"type":"function_call","call_id":"call_001","name":"fetch_rows","arguments":"{\"limit\":3}"},{"type":"function_call_output","call_id":"call_001","output":"{\"rows\":[{\"id\":1,\"st\":\"ok\"},{\"id\":2,\"st\":\"ok\"},{\"id\":3,\"st\":\"ok\"}]}"},{"type":"message","role":"user","content":[{"type":"text","text":"summarize the rows"}]}]}
