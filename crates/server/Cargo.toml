@@ -1,0 +1,7 @@
+[package]
+name = "quantification-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quantification-core = { path = "../core" }
