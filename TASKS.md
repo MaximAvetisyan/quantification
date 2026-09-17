@@ -30,6 +30,14 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - Baseline `cargo build --workspace` and `cargo test --workspace` pass
   (9 config tests). W0.2 defaults/option resolution are covered; this is
   not evidence for any Wave 1 functionality.
+- W0.4 fuzz exit: one clean `cargo fuzz run` per stub target
+  (fuzz_sniff / fuzz_locator / fuzz_splitter, 200 runs each, exit 0,
+  zero crashes). Toolchain deviation: nightly could not be installed
+  (static.rust-lang.org connection timeout, retried); fallback ran on
+  stable 1.98.0 with `RUSTC_BOOTSTRAP=1` and `-s none` (no ASan, which
+  stable cannot enable). The `.github/workflows/fuzz.yml` nightly+ASan
+  configuration is unchanged and must be exercised when nightly is
+  reachable; stub coverage stays shallow until targets are wired in W1.
 
 ## Wave 0.5 — go/no-go spike (sequential, blocks Wave 1)
 
