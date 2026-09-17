@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-quantification-core = { path = "../crates/core" }
+quantification-core = { path = "../crates/core", version = "0.1.0" }
 
 [[bin]]
 name = "fuzz_sniff"

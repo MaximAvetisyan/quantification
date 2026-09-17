@@ -23,7 +23,10 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - W0.1 licensing fix: workspace packages are explicitly unpublished;
   `deny.toml` exempts private packages only. No license was assigned.
   cargo-deny 0.20.2 reports `licenses ok`, `advisories ok`, `sources ok`.
-  Full check exposed a separate path-dependency wildcard ban to fix next.
+  Explicit versions now accompany both local path dependencies; full workspace
+  `cargo deny check` passes (unused license-allowance warnings only).
+  Optional separate fuzz-manifest audit finds libfuzzer-sys's declared NCSA
+  license outside the existing allowlist; no license policy was broadened.
 - Baseline `cargo build --workspace` and `cargo test --workspace` pass
   (9 config tests). W0.2 defaults/option resolution are covered; this is
   not evidence for any Wave 1 functionality.
