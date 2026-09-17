@@ -48,7 +48,7 @@ exercise exist (W1.x/W2.x), so this corpus never has to break meaning.
 | `prior-markers.json` | content already containing marker-shaped text, unicode (`⟪×N … ·hhhh⟫`) and ASCII fallback forms; idempotence input | §12 idempotence, §4.5 |
 | `profitability-below-threshold.json` | three groups of ≥ `min_group_size` ultra-short repeats that must stay verbatim: anchor + marker > removed bytes for every group | §4.4 profitability gate |
 | `single-line-tool-dump-small.json` | human-scale one-line `[{…},{…},…]` array, ZERO `\n` escapes; stage-1b shape showcase (under-cap, so 1b does not trigger) | §4.4 stage 1b |
-| `single-line-tool-dump-overcap.json` | GENERATED — single line of 121857 raw escaped bytes dense with `},{` (3071 separators, 3072 records cycling 3 shapes, max record 41 B); triggers stage 1b end-to-end | §4.4 stage 1b |
+| `single-line-tool-dump-overcap.json` | GENERATED — single line of 128001 raw escaped bytes dense with `},{` (3071 separators, 3072 records cycling 3 shapes, max record 43 B); triggers stage 1b end-to-end | §4.4 stage 1b |
 | `stage1b-no-separator-overcap.json` | GENERATED — 131072-byte single line with zero `},{` ⇒ must stay verbatim through 1b | §4.4 stage 1b |
 | `stage1b-record-len-16383.json` | GENERATED — five identical-shape records padded to exactly `max_record_bytes - 1`, joined by `,` inside brackets; whole line 81921 B > `max_line_bytes` | §4.4 stage 1b cap |
 | `stage1b-record-len-16384.json` | GENERATED — records at exactly `max_record_bytes` (cap boundary, still eligible); line 81926 B | §4.4 stage 1b cap |

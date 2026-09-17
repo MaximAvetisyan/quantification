@@ -54,7 +54,7 @@ done
 # far below max_record_bytes. 3072 records cycling three shapes.
 shape() { # $1=key $2=value1 $3=key2 $4=value2 -> one escaped record
     printf '%s' "{" "$E" "$1" "$E" ":" "$E" "$2" "$E" "," \
-        "$E" "$3" "$E" ":" "$4" "$E" "}"
+        "$E" "$3" "$E" ":" "$E" "$4" "$E" "}"
 }
 out="$edges/single-line-tool-dump-overcap.json"
 {
@@ -71,6 +71,7 @@ out="$edges/single-line-tool-dump-overcap.json"
     done
     printf ']%s\n' "$suffix"
 } > "$out"
+check_size "$out" $((51 + 128001 + 4 + 1))
 
 # --- stage1b-no-separator-overcap.json ---------------------------------------
 # One line > max_line_bytes with zero "},{" occurrences: must stay verbatim.
