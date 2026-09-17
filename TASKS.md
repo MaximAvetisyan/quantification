@@ -45,6 +45,25 @@ exit criteria. Gates M1–M4 are blocking milestones.
   400 MB/s floor on real escaped-heavy payloads.
   **Gate M1**: pass ⇒ continue; fail ⇒ redesign §4.1 before anything else.
 
+### S1 verification (2026-09-17)
+
+- Escape-aware locator scanner (`crates/core/src/s1/locator.rs`, throwaway,
+  exported under `quantification_core::locator`) measured on 8 MiB
+  escaped-heavy chat/tool JSON fixtures (`s1/benches.rs`: trace lines with
+  `\"`/`\\`/`\u000A`/`\t` escapes; single-line tool dumps mixing `\n` and
+  `\u000A`), warm, pinned core (`taskset -c 2`, i7-9700K, 4.6 GHz):
+  escaped_chat_lines 8 389 356 B, p50 5.61 ms = 1496 MB/s, p99 5.64 ms;
+  escaped_tool_dumps 8 390 630 B, p50 5.82 ms = 1443 MB/s, p99 5.84 MB/s.
+  Three repeat pinned runs agree within 0.1%. **Gate M1 passes**: ≥3.6× the
+  §8 400 MB/s go/no-go floor on both fixtures, within the ≤20 ms locate
+  budget with headroom. Warm-cache, single-span payloads (1 eligible span
+  per 8 MiB); fuzz wiring and 200k-run soak remain W0.4/W4.2 scope.
+- Correctness examples (`crates/core/examples/s1_correctness.rs`, 17 checks
+  green): role classification (assistant excluded, tool vs user), truncated
+  document pass-through, malformed degradation, whitespace/BOM tolerance,
+  8 MiB span boundaries. Workspace tests (9) and `cargo fmt`/`clippy`
+  --all-targets clean. Spike modules are additive; no Wave 1 code.
+
 ## Wave 1 — core primitives (all six parallel; deps W0 + M1)
 
 - **W1.1 Schema sniff + span locator** (§4.1) — eligibility map, degradation
