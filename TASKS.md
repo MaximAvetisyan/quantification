@@ -18,6 +18,16 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W0.4 Fuzz scaffold** — cargo-fuzz targets stubbed for sniff / locator /
   splitter. Exit: one clean run each.
 
+### W0 verification (2026-09-17)
+
+- W0.1 licensing fix: workspace packages are explicitly unpublished;
+  `deny.toml` exempts private packages only. No license was assigned.
+  cargo-deny 0.20.2 reports `licenses ok`, `advisories ok`, `sources ok`.
+  Full check exposed a separate path-dependency wildcard ban to fix next.
+- Baseline `cargo build --workspace` and `cargo test --workspace` pass
+  (9 config tests). W0.2 defaults/option resolution are covered; this is
+  not evidence for any Wave 1 functionality.
+
 ## Wave 0.5 — go/no-go spike (sequential, blocks Wave 1)
 
 - **S1 Locator perf spike** (§8) — throwaway escape-aware scanner vs the

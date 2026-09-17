@@ -2,3 +2,4 @@
 name = "quantification-core"
 version.workspace = true
 edition.workspace = true
+publish = false

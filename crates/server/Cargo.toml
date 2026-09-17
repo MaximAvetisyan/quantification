@@ -2,6 +2,7 @@
 name = "quantification-server"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 quantification-core = { path = "../core" }
