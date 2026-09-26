@@ -81,6 +81,7 @@ pub fn repeated_blocks(
         &scratch.ids,
         min,
         max,
+        CommitKind::Block,
         &mut same_bytes,
         &mut scratch.work,
     )
@@ -143,6 +144,7 @@ pub(crate) fn windowed_blocks(
     ids: &[Option<usize>],
     min_block_lines: usize,
     max_block_lines: usize,
+    kind: CommitKind,
     same_bytes: &mut impl FnMut(usize, usize, usize) -> bool,
     work: &mut Work,
 ) -> StageStats {
@@ -166,11 +168,9 @@ pub(crate) fn windowed_blocks(
                 if same_bytes(at, at + length, length) {
                     let copies = copies(ids, at, length, room, same_bytes, work);
                     let group = at..at + copies * length;
-                    if let CommitOutcome::Committed(commit) = ledger.try_commit(Proposal::repeat(
-                        group.clone(),
-                        length,
-                        CommitKind::Block,
-                    )) {
+                    if let CommitOutcome::Committed(commit) =
+                        ledger.try_commit(Proposal::repeat(group.clone(), length, kind))
+                    {
                         stats.bump(commit.kind);
                         next = group.end;
                     }

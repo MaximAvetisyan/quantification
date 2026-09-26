@@ -1208,6 +1208,144 @@ exit criteria. Gates M1–M4 are blocking milestones.
   pre-sizing. Frozen because §5.7 freezes behaviour per release.
 - **W2.8 Stage 7 templated blocks** — after W2.4 + W2.5 (template-id scan,
   min period 1).
+  Status: **complete** (2026-09-26). Stage 7 is
+  `quantification_core::detect::templ_blocks::templated_blocks(templated: &templ::Templated,
+  ledger: &mut Ledger, max_block_lines: u32, scratch: &mut Scratch) -> StageStats`, plus
+  `templ_blocks::Scratch` (caller-owned, as W2.4's: `new`, `with_capacity(units)`,
+  `Default`, `reserved() -> usize` = the id-sequence capacity, and `work() ->
+  detect::blocks::Work`), and the module is declared by the one added line
+  `pub mod templ_blocks;` in `crates/core/src/detect/mod.rs` (inserted after
+  `pub mod templ;`; no existing line reordered or removed). The **whole stage-6
+  handoff is the argument**, not just its `Forms`, so the §4.4.6 degradation
+  signal cannot be ignored by accident: `templated.degraded == true` returns
+  default `StageStats` **before** the id sequence is built, i.e. zero commits,
+  no ids, no work, and W2.9 passes the span through (`Scratch::reserved()` is
+  still `0`). The stage takes **no `span`**: every byte it needs is in
+  `Forms`, and the anchor is a unit range the ledger derives, so a stage-7
+  anchor is structurally always raw original bytes (the module contains no
+  `span`, no `mask_into` and no `normalize_into` — asserted by a source scan).
+  Algorithm — the stage-5 walker, not a second one: `load` copies
+  `Forms::id(i).0` into a dense `Vec<Option<usize>>` (`Some` only for
+  `eligible` units, so an over-cap `eligible == false` record is a wall that is
+  never hashed, never compared and never folded; the tail beyond
+  `Forms::len()` stays `None`, which bounds the walk without an index check),
+  and then calls W2.4's `pub(crate) windowed_blocks(ledger, ids, min = 1, max,
+  CommitKind::TemplatedBlock, same_bytes, work)`. `min` is the module constant
+  `MIN_PERIOD = 1` (§4.4.7's "minimum period lowered to 1", so an adjacent
+  match now means "different lines, same template") and `max` is
+  `config::MAX_BLOCK_LINES`, passed as an argument exactly as W2.4 takes it
+  (§7 has no `RawOptions` field for it). The comparison domain is §4.4's
+  **template ids** for candidate selection and **one memcmp of the two
+  blocks' masked-form bytes** for the join: the closure slices `Forms::bytes`
+  from the first member's `masked.start` to the last member's `masked.end` on
+  each side — the two blocks' masked forms are each one contiguous arena
+  range because `Forms` is dense and index-aligned with the ledger (W2.5's
+  reading (c)) — so a join costs exactly one slice comparison, not one per
+  line, and the residual-only guarantee again makes every member a
+  participant. The chain extension, the leftmost-then-longest `(i asc, L desc)`
+  order, the "resume after the committed region, otherwise advance one unit and
+  do not retry a shorter `L`" rejection rule and the `O(N · max_block_lines)`
+  cap are W2.4's, written once. The commit itself is
+  `Proposal::repeat(group, anchor_units = L, CommitKind::TemplatedBlock)`
+  inside `windowed_blocks` (see the W2.4 seam extension below), hence
+  `count = copies - 1` (§4.7), the marker `⟪templated block ×N⟫` (§4.5, `N = 0`
+  never rendered) and a §4.4 gate priced at the emitted count's exact decimal
+  width. **Frozen readings:** (a) **W2.4's seam needed one added parameter.**
+  `windowed_blocks` hard-coded `CommitKind::Block` in its `Proposal::repeat`,
+  so a stage-7 commit would have carried stage 5's kind and marker; the
+  function now takes `kind: CommitKind` and `repeated_blocks` passes
+  `CommitKind::Block`. That is the whole change to `blocks.rs` (a signature
+  parameter, the one call site, and the constant replaced by the parameter) —
+  the scan, the closure signature, the `Work` meter and the ordering are
+  untouched, and `min = 1` needed no other relaxation (`min_block_lines.max(1)`
+  already admits it, and stage 5's own tests still pass unchanged).
+  (b) The `TemplateId` (low 64 bits of the masked form's xxh3-128) is compared
+  as a `usize`, which is exact on the 64-bit targets §5.8's determinism gate
+  runs; on a 32-bit target the cast is a truncation and can only make two
+  unequal templates look equal, which the mandatory memcmp then rejects — a
+  missed merge, never a wrong one (§4.4.2's residual-collision property), and
+  still a pure integer comparison on the output path (§5.3). (c) The minimum
+  period is `1` and the maximum stays `MAX_BLOCK_LINES`: §4.4.7 lowers only the
+  minimum, so a block period is still capped at §7's 64 lines while the number
+  of *copies* is not (W2.4's reading (c)), and the leftmost-then-longest
+  consequence is inherited — `a b a b c a b c` commits only the 2-line block at
+  0, not the 3-line block at 2. (d) The chain is extended while the next
+  adjacent copy matches and the gate alone decides: a below-threshold block
+  claims nothing, stays free and residual, and the scan advances by one unit
+  (W2.4's reading (a)). (e) `degraded` is consumed inside the stage rather than
+  returned as a second flag, because there is no stage-7-specific degradation
+  to report: `Forms` has no cap of its own, and the only degradation that can
+  reach stage 7 is W2.5's table fill. (f) The `Work` meter is W2.4's,
+  diagnostic only (§6.2's `Stats` is untouched): it makes "one memcmp per
+  join" and the capped work bound testable. Integer-only, ascending-index
+  discovery only, no hash table on the output path and therefore no iteration
+  order anywhere in it (§5.1, §5.4), no clock, RNG or env (§5.3, §5.5).
+  Tests: 15 integration tests in `crates/core/tests/detect_templ_blocks.rs`
+  (core total 281 = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1
+  locator-alloc + 9 mask + 11 render + 10 splice + 16 sniff + 31 splitter + 8 ws
+  + 14 exact runs + 13 ws runs + 17 template groups + 19 block runs + 15
+  templated blocks; workspace total 291, of which 10 are W2.5's and 10 W1.6's
+  proto unit tests). Exit criteria met: a three-role **access-log burst**
+  (9 lines: `GET`/`<- 200`/`pool`, all three roles sharing a template across
+  entries and differing only in timestamp, IP, uuid, duration and counters, so
+  the per-line templates are pinned to their exact `<ts>…<ip>…` masked forms)
+  is refused by `exact_runs`, `ws_runs` and `repeated_blocks` and by
+  `template_groups` on the same span, and collapses through stage 7 alone into
+  one `TemplatedBlock` over `0..8` with `count = 2`, a three-line anchor equal
+  to the raw first entry and a 32-byte marker; a **stack trace differing only
+  in addresses** (three `at com.example.Svc.<role>(Svc.java:<n>) pc=0x…` frames
+  per trace, three traces) likewise commits as one 3-line anchor with `count =
+  2`, with the first trace's three 16-hex addresses asserted present in the
+  anchor and the two dropped traces' addresses asserted absent, the masked form
+  pinned (`…pc=<num>x<hex>`, i.e. the frozen mask list's own output for `0x…`)
+  and the spliced output equal to anchor + marker; an **interleaved
+  request/response pair** (six lines, two distinct templates alternating)
+  collapses at period 2 with a 2-line anchor and `count = 2`; the **min-period-1
+  case fires** — a single adjacent same-template pair that stage 6 refuses at
+  `min_group_size` 3 commits as `count = 1` with a 1-line anchor and the marker
+  pinned byte-for-byte to `⟪templated block ×1 ·1701⟫` (`marker_len` 32 at one
+  digit, 33 at two); the anchor is asserted byte-identical to the raw first
+  occurrence with its own `10.0.0.0`, uuid, `bytes 900` and `receipt 00-0`
+  present, to differ from the concatenation of the two blocks' masked forms, and
+  the dropped copies' lines to be absent from the spliced output; a **join is
+  rejected when the ids match but the masked bytes differ** — a hand-built
+  `Forms` (the type is fully public, so the collision-safety path is testable
+  without a hash break) with two colliding ids and disagreeing masked bytes
+  commits nothing, re-splices to the input byte for byte and performs exactly
+  one verification memcmp, while the same ids with agreeing bytes commit the
+  2-line block with a raw anchor, so the rejection is the memcmp and not a
+  grouping failure; a **below-threshold** pair (`a 1`/`a 2`, one masked form, 3-byte
+  lines) claims nothing, stays free and residual, is byte-identical after
+  splicing, has `profitable(.., TemplatedBlock, 1, 3, 8) == false`, and its
+  100-byte-line twin commits; **`degraded` is a no-op** both as a hand-built
+  `Templated { degraded: true, forms: <forms that would commit> }` (default
+  stats, zero work, `reserved() == 0`, span byte-identical) and end to end on a
+  200 000-distinct-template span that stage 6 degrades; **leftmost-then-longest**
+  is pinned twice on a ten-line span (the 2-line block at 0 wins over the
+  3-line block at 4, and the tail alone commits the 3-line block with `count =
+  1`); a block **never straddles a committed region** (a hand-committed
+  `1..2` leaves the residual `[0, 3, 4, 5]`-shaped fragment and commits only
+  `3..6`); an **over-cap record wall** splits a 413-record stage-1b dump's
+  templated blocks into `200..205` and `207..212` (each `count = 2`,
+  `removed = 6 records + 5 commas`) with the wall unclaimed and free, while 400
+  distinct-template filler records commit nothing; a 280-line generated span
+  (40 header groups of three committed by stage 6 + 40 interleaved pairs) is
+  byte-identical across two ledgers and two differently-sized scratches —
+  40 `template_groups` + 40 `templated_blocks`, identical `commits()`, identical
+  spliced output, and a re-run on the committed ledger a no-op — with every
+  commit asserted against the removal rule and the gate; empty, single-unit and
+  over-cap-line spans commit nothing; determinism and banned-input invariants
+  are source-scanned. Deviations from DESIGN: none — §4.4.7's algorithm, its
+  "verified by one memcmp of the two blocks' masked-form bytes", the
+  comparison-domain paragraph, the anchor rule, the stage ordering, §4.4.1b's
+  removal rule, the §4.4 profitability gate, §4.7's omitted-copies count and
+  §4.5's `⟪templated block ×N⟫` shape are implemented as written and DESIGN.md
+  is not amended; the single addition outside this task's files is the `kind`
+  parameter of W2.4's already-`pub(crate)` walker, which changes no stage-5
+  behaviour. The readings in (a)–(f) resolve the points §4.4.7/§7 leave to the
+  implementation (the walker seam, the id width, the caps, rejection handling,
+  the degradation shape and the work meter), frozen here because §5.7 freezes
+  behaviour per release. No new dependencies.
 - **W2.9 Pipeline orchestration + Stats assembly** (§3, §4.5) — after
   W2.2–W2.8. **Gate M2**: chat golden outputs byte-stable ×1000.
 
