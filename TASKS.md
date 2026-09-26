@@ -1348,6 +1348,246 @@ exit criteria. Gates M1–M4 are blocking milestones.
   behaviour per release. No new dependencies.
 - **W2.9 Pipeline orchestration + Stats assembly** (§3, §4.5) — after
   W2.2–W2.8. **Gate M2**: chat golden outputs byte-stable ×1000.
+  Status: **complete** (2026-09-26). The module is
+  `quantification_core::pipeline`; the one added line is `pub mod pipeline;` in
+  `crates/core/src/lib.rs` (no existing line reordered or removed) and the
+  pipeline is the only new source file. Public API, frozen for W3.1/W3.3/W3.4:
+  `ALGO_VERSION: &str = "0.1.0"` (the §5.7 behaviour version, exposed so callers
+  can detect a cross-release output change; it is a frozen constant, never
+  derived from the clock, the environment or the input);
+  `Stats { bytes_in, bytes_out, approx_tokens_in, approx_tokens_out,
+  groups_collapsed, exact_runs, ws_runs, block_repeats, template_groups,
+  degraded, noop_reason: Option<locator::NoopReason>, elapsed_detect_ns,
+  elapsed_compact_ns, elapsed_splice_ns, algo_version: &'static str,
+  templated_blocks, options_echo: String, record_splits }` — the §6.2 `Stats`
+  message **field-for-field and in §6.2's wire-number order** (1…18) so W3.3 maps
+  it 1:1 and mechanically, with two typed deviations: `noop_reason` is
+  `Option<locator::NoopReason>` (W1.1's frozen mapping: `degraded =
+  noop_reason.is_some()` and `noop_reason.map(as_str)` at the transport edge,
+  `""` when compressed) and `algo_version` is the `&'static` frozen constant
+  (`.to_string()` at the proto edge). §6.2 field 19 `restore_ids` is
+  deliberately **absent**: v1 compression never stores originals, so W3.4 adds
+  it (flag-gated, §9) together with the `commits()` walk it derives the ids
+  from;
+  `trait Clock { fn now_ns(&self) -> u64 }` + `MonotonicClock` (`new`,
+  `Default`, `impl Clock` — `Instant`-based, monotonic, read only to fill the
+  three `elapsed_*` fields);
+  `Compressor { new, with_clock(impl Clock + 'static), Default,
+  commits() -> &[ledger::Commit], compress(&[u8], &ResolvedOptions, &mut Vec<u8>)
+  -> Stats }`. The entry point takes **resolved** options (W0.2's `config::resolve`
+  is the option-resolution seam W3.1 wraps) and a **caller-owned output buffer**,
+  exactly the buffer contract W2.7 froze, so one `Compressor` plus one `Vec`
+  serves a whole request stream with no per-call output allocation;
+  `commits()` exposes the merged, anchor-offset-ascending whole-payload commit
+  list of the last call (valid until the next `compress`) — it is what makes the
+  "output = input outside the patched ranges" property testable, and it is what
+  W3.4 walks in marker output order for §9's `restore_ids` (§9 forbids parsing
+  markers). The flow is §3's diagram literally: `sniff::sniff` → `locate_into`
+  (the caller-owned-span-vector form, so the span list is reused across calls)
+  → per eligible span `resolve_style` → `stage1::split_span_counted` (stages
+  1+1b, `record_splits` filled) → `exact_runs` → `ws_runs` (skipped entirely when
+  `normalize_ws == false`) → `repeated_blocks` → `template_groups` →
+  `templated_blocks` (skipped with stage 6 when `template_dedup == false`) →
+  one `splice::splice_into` over the whole payload. Stages run in the §4.4
+  normative order on the residual the ledger leaves, and every commit decision
+  still belongs to `Ledger::try_commit`, so earlier-stage commitments win all
+  overlaps exactly as in W2.1–W2.8. Frozen readings: (a) **spans compact with
+  span-relative unit ranges and the commits are shifted on the way out** — the
+  detectors index `span[unit.range]`, so the pipeline compacts the payload
+  sub-slice `&payload[span.start..span.end]` and adds `span.start` to each
+  `Commit::anchor`/`Commit::removed` when merging, which is the whole of the
+  absolute-offset contract W1.1 froze and needs no change to any detector; (b)
+  **the splice style is the one the spans agree on**: `resolve_style` runs per
+  span (W2.6's frozen contract, and it must precede `Ledger::new` because
+  `marker_bytes` is style-dependent), and because W2.7's `splice_into` takes a
+  *single* style for the whole commit list, the pipeline splices with the spans'
+  unanimous resolution when they agree and with `resolve_style(marker_style,
+  payload)` (the whole buffer) when they do not. The two can only diverge in
+  one direction — a span resolved `Ascii` inside a payload that resolves
+  `Unicode` — and since the ascii marker is always 4–5 bytes *longer* than the
+  unicode one, the rendered marker is then never longer than the §4.4 gate
+  priced, so the divergence can only make a commit more conservative, never
+  wrong. (Any span that resolves `Unicode` forces the whole payload to
+  `Unicode`, so the reverse cannot occur.) (c) **A per-span fingerprint-table
+  `Full` degrades that span to verbatim pass-through, not the request** (§7,
+  §3): the pipeline records the merged commit length before the span, and on
+  `blocks::Scratch::degraded()` or `templ::Templated::degraded` it truncates that
+  span's commits back to the recorded length and drops the span's `StageStats`
+  entirely, so the degraded span's bytes are copied verbatim — *including* the
+  commits stages 3–5 had already made in it, which is the conservative reading
+  of §3's "always safe to skip" and is the reading W2.9's brief states. W2.4
+  (e)/W2.5 (d) are unaffected: they only promise that the *stage* cannot roll
+  back or truncate-prefix its own decision. `Stats.degraded` becomes `true` for
+  it while `noop_reason` stays `None`, because the request *was* served (other
+  spans are still compressed) — so `degraded` is no longer exactly
+  `noop_reason.is_some()`; it is `noop_reason.is_some() || any span degraded`,
+  and the counters always describe the emitted output. A whole-request
+  `Malformed`/`UnknownSchema` locator pass-through is untouched: input verbatim,
+  `degraded = true`, the matching `noop_reason`, zero commits. The request never
+  fails. (d) `approx_tokens_*` are `bytes / 4` integer division (§4.5's
+  approximate, reporting-only heuristic; the field names carry the `approx_`
+  prefix and DESIGN.md is not amended). (e) `elapsed_detect_ns` covers
+  sniff + locate, `elapsed_compact_ns` the whole per-span loop, `elapsed_splice_ns`
+  the single `splice_into`; the clock is read exactly four times (pinned by a
+  source scan) with `saturating_sub`, and a timing value can reach nothing but
+  those three fields — `timings_never_reach_the_payload` compresses the same
+  payload with a constant clock, a counting clock and the default monotonic
+  clock and asserts byte-identical payloads and identical commit lists.
+  (f) **Scratch reuse**: the four detector scratches (`wsruns`, `templ`,
+  `blocks`, `templ_blocks`), the span vector, the merged commit vector and the
+  output vector are owned by the `Compressor` and reused across spans *and*
+  across calls; `Stages::reserve` only re-allocates a scratch when the span
+  needs more than the capacity already there (so a smaller span after a large
+  one reuses it), and the inner loops allocate nothing per line. Two
+  allocations per span are inherent to the frozen upstream APIs and are left
+  alone: `stage1::split_span_counted`'s unit vector (W1.2 has no caller-owned
+  form) and `Ledger::new`'s `claimed` + `commits`. §8's budget buys that
+  simplicity. (g) A committed commit list is ascending and disjoint by
+  construction (spans are ascending and disjoint per W1.1, per-span ledgers are
+  ascending per W2.1), asserted by a `debug_assert!` before the splice and by
+  the splicer's own per-commit assert. No hash map, no RNG, no env, no float, no
+  wall clock and no sort anywhere in the module (source-scanned like every other
+  core module); the only `Instant` is inside `MonotonicClock`. The source scan
+  also pins the **normative order textually** — the first occurrence of
+  `stage1::split_span_counted(bytes)`, `exact::exact_runs(`,
+  `wsruns::ws_runs(`, `blocks::repeated_blocks(`,
+  `templ::template_groups(`, `templ_blocks::templated_blocks(` must appear
+  left-to-right in that order, `compact_span` must be called before
+  `splice_into(payload`, and both after `let detect_start` — swapping the
+  stage-3 and stage-4 blocks in the source makes the test fail (verified, then
+  reverted), so §4.4's ordering rule is a checked invariant of the module, not a
+  convention.
+  Tests: 41 integration tests in `crates/core/tests/pipeline.rs` (core total 322
+  = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 11 render + 10 splice + 16 sniff + 31 splitter + 8 ws + 14 exact runs
+  + 13 ws runs + 17 template groups + 19 block runs + 15 templated blocks + 41
+  pipeline; workspace total **332**, of which 10 are W1.6's proto unit tests;
+  1 test is `#[ignore]`d, the golden generator). Twelve golden expected-output
+  files were added under `crates/core/tests/fixtures/golden/` (one per chat
+  corpus entry: `chat-minified.json`, `chat-pretty.json`, `chat-content-null.json`,
+  `chat-mixed-parts.json`, `sniff-overlap-chat-responses.json`, `bom-chat.json`,
+  `dup-keys-last-wins.json`, `escaped-structural-keys.json`,
+  `newlines-u000a-only.json`, `prior-markers.json`,
+  `profitability-below-threshold.json`, `single-line-tool-dump-small.json`),
+  regenerated by the ignored `write_the_chat_goldens` test
+  (`cargo test --test pipeline -- --ignored write_the_chat_goldens`) and
+  reproduced byte-for-byte by `the_chat_goldens_are_reproduced_byte_for_byte`
+  on every ordinary run; they are the regression net for M2 and W4. They were
+  inspected by hand before being committed: the minified and pretty chat
+  variants keep byte-identical envelopes and collapse the 8-line burst to
+  `2026-08-25T10:00:01Z INFO hc 10.0.0.1 ok` + `[... x7 rows, template c651 ...]`;
+  `bom-chat.json` keeps its `EF BB BF`; `newlines-u000a-only.json` collapses
+  across `\u000A`/`\u000a` boundaries; `escaped-structural-keys.json` and
+  `dup-keys-last-wins.json` collapse only the last-wins eligible content;
+  `chat-mixed-parts.json` leaves the `image_url` part alone;
+  `sniff-overlap-chat-responses.json` leaves the root `input` alone;
+  `profitability-below-threshold.json` and `single-line-tool-dump-small.json`
+  (a single under-cap unit) are byte-for-byte pass-throughs, which is what those
+  two W0.3 fixtures exist to pin; and `prior-markers.json` round-trips all three
+  prior-marker texts (unicode ×2, ascii ×1) verbatim while its two adjacent
+  log lines collapse to `⟪templated block ×1 ·e18b⟫` — the span is non-ASCII, so
+  it resolves to the unicode style while the input's ascii marker is *copied*,
+  never re-rendered. Exit criteria met: one payload with a compressing span and
+  a non-compressing span; three spans merging into one ascending commit list
+  with the untouched envelope between commits proven to be exactly
+  `"},{"role":"user","content":"`; a 200 004-line unique-line flood in the second
+  user span degrading that span alone (its own stage-3 run of 4 identical lines
+  survives verbatim) while the first span still collapses, with `degraded` set
+  and `noop_reason` `None`; `normalize_ws=false` giving `ws_runs == 0` and the
+  same span collapsing through stage 6 instead (and nothing at all with
+  `template_dedup=false` as well); `template_dedup=false` zeroing both
+  `template_groups` and `templated_blocks` for a payload only stage 6/7 can
+  collapse; `min_group_size` 3 vs 4 on a three-line run; the scope policy
+  selecting a `tool` span only under `user_and_tools`; R4 with a system prompt
+  and an assistant message whose content is byte-identical in the output and
+  marker-free; idempotence over the whole 26-fixture corpus
+  (`recompress(output) == output` with `groups_collapsed == 0` on the second
+  pass) including `prior-markers.json`; every JSON output parsed by a test-local
+  strict validator (no new dependency — see the deviation note below); the
+  output equal to the input outside the patched ranges for all 26 fixtures, with
+  every marker matched against an independent oracle built from the frozen
+  `framing`/`core`/`marker_checksum` pieces and valid UTF-8 with no added
+  backslash pair; every `Stats` field pinned; `record_splits` 1/0/1/1 over the
+  four stage-1b fixtures, with the 128 057-byte over-cap dump collapsing 33×
+  (128 057 → 3 854 bytes, two `block_repeats`) and the 16385-byte over-cap
+  record acting as a wall; `algo_version` pinned; the `options_echo` string and
+  both forced marker styles reaching the output; a full `Stats` reproduced 1000×
+  under a constant clock; warm-vs-fresh compressors and output-buffer capacity
+  across 64 calls; and a check through `commits()` that a span never bleeds into its
+  neighbour. Six degenerate payloads (empty, whitespace, `null`, `{}`, `[]`, a
+  bare JSON string) are asserted to pass through byte-identically without a
+  panic, so §3's "never fail the request" holds for the whole input range, not
+  just the interesting shapes.
+  Deviations from DESIGN: none in the pipeline's behaviour — §3's architecture,
+  §4.4's stage ordering/comparison domains/removal rule/profitability gate,
+  §4.5's splicing and stats list, §4.7's contract, §5.1–§5.9, §6.2's `Stats`,
+  §7's table-cap degradation and §12's test list are implemented as written and
+  DESIGN.md is not amended. Two points are recorded here rather than in
+  DESIGN.md, and two are inherited readings that later waves should know:
+  (1) **R3 is asserted with a test-local strict JSON validator** (recursive
+  descent: exact `true`/`false`/`null`, JSON number grammar, `\uXXXX`-style
+  escape validation, no raw control byte in a string, no trailing bytes, depth
+  capped at 64, leading BOM tolerated) rather than a third-party parser, because
+  adding a dev-dependency for one property test is not worth it; W4.1 may swap in
+  `serde_json` if it prefers an independent parser, and the *structural* proof
+  (output = input outside the patched ranges, plus the fuzz locator's
+  "no unescaped quote or control byte inside a span" invariant) is
+  implementation-independent. (2) `degraded` is widened from
+  `noop_reason.is_some()` to "a pass-through happened anywhere", which is §6.2's
+  own field comment ("pass-through happened"); a caller that needs the stronger
+  "the whole request was untouched" test must check `noop_reason`.
+  (3) **Inherited observation, not a change**: with `template_dedup = true` a
+  stage-4 ws run and a stage-6 template group are never *distinguishable* in
+  their group selection, because stage 6 masks the ws-normalized form, so every
+  ws-equal pair is also template-equal and every template run is also a
+  stage-7 candidate at minimum period 1. `min_group_size` therefore bounds
+  stages 3/4/6 only — stage 7's minimum is a *period* (§4.4.7), so a caller who
+  raises `min_group_size` to be conservative still gets two-member collapses
+  from stage 7 (pinned by
+  `min_group_size_does_not_gate_the_templated_block_stage`). This is what
+  DESIGN.md says, so it is recorded as an observation for W3.1's option
+  documentation and W4.1's property tests, not as a deviation. (4) The
+  corruption hardening §4.4's idempotence argument relies on is load-bearing and
+  observed to work: emitted markers are distinguishable under stages 6/7's
+  comparison domains (the 4-hex `CCCC` differs per anchor), so three adjacent
+  emitted markers do **not** form a group, which is why the whole 26-fixture
+  corpus is a fixed point. W4.1 should keep property-testing that, because a
+  4-hex collision between two adjacent emitted markers would open a
+  collapse-further hole.
+  **Gate M2 passes** — measured 2026-09-26, debug build, i7-9700K:
+  - *in-process ×1000*: `gate_m2_chat_outputs_are_byte_stable_over_1000_runs`
+    compresses the 12-entry chat golden corpus (2 820 input bytes total; 9 of the
+    12 entries change, 3 are the deliberate pass-throughs) once per run — **12 000
+    compressions** — and asserts every run's output is byte-identical to run 0's
+    for all 12 entries. **0.86 s** debug (12 000 compressions ≈ 72 µs each),
+    **77 ms** release. Companion test
+    `the_stats_are_byte_stable_over_1000_runs_with_a_fixed_clock` runs the same
+    1 000 iterations under an injected constant clock and asserts the **entire
+    `Stats` struct** (including the three `elapsed_*` fields) is equal every
+    time: 0.88 s debug / 75 ms release.
+  - *cross-process*: `gate_m2_outputs_are_identical_across_processes_and_environments`
+    re-executes the test binary twice as a **child process** (so each run has a
+    fresh OS-seeded `RandomState`), under two deliberately different
+    environments — profile A `RUST_BACKTRACE=0 RAYON_NUM_THREADS=1
+    RUST_TEST_THREADS=1 LC_ALL=C TZ=UTC`, profile B `RUST_BACKTRACE=full
+    RAYON_NUM_THREADS=8 RUST_TEST_THREADS=4 LC_ALL=C.UTF-8
+    TZ=Pacific/Auckland` — and each child writes its 12 output buffers plus a
+    fingerprint of its process `RandomState` key
+    (`RandomState::new().build_hasher()` over one byte) to a report file. The
+    parent asserts (i) the two seed fingerprints **differ** (e.g. observed
+    `21dfeb2643dfb7ce` vs `69afff959d060535` on one run; three further manual
+    child launches gave `dccf1a75047d7f72`, `fe3a0f9a221d579c`,
+    `9496a741d8916633` — all distinct), (ii) both children's 12 buffers are
+    byte-identical to each other **and** to the parent's own in-process
+    compressions, and (iii) at least 4 entries actually changed, so the gate is
+    not vacuous. 10 ms wall for both children. The comparison is load-bearing:
+    injecting a single extra byte into one child's report makes the gate fail
+    (verified, then reverted). The child invocation uses the same
+    `--exact <test> --nocapture` libtest argument shape that CI's
+    `cargo nextest run` itself uses, and the report path carries the parent's
+    pid, so the gate works under both runners; nextest is not installed in this
+    environment, so the recorded run is `cargo test` (libtest) — CI's nextest
+    job will re-exercise it.
 
 ## Wave 3 — API & transports (deps W2.9)
 
