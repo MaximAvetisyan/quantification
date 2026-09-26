@@ -1,4 +1,5 @@
 pub mod config;
+pub mod fingerprint;
 mod s1;
 pub mod stage1;
 pub mod stage1b;

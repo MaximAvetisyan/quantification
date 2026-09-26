@@ -166,6 +166,56 @@ exit criteria. Gates M1–M4 are blocking milestones.
   DESIGN.md is not amended. No new dependencies.
 - **W1.4 Hashing facade** — xxh3-128/64 fixed-seed wrappers; open-address
   fingerprint table, length→hash→memcmp order, hard caps (§4.4.2, §7).
+  Status: **complete** (2026-09-26). `fingerprint::fingerprint(bytes) -> u128`
+  is xxh3-128 through the fixed seed `HASH_SEED = 0` (§5.1; frozen per
+  release) and `fingerprint::marker_checksum(bytes) -> u16` is the low 16 bits
+  of xxh3-64 over the same seed, i.e. exactly the §4.5 `CCCC` source (W2.6
+  renders the four hex chars). `FingerprintTable` is a hand-rolled
+  open-address table with linear probing over `(byte length, u128 hash)` keys
+  plus the representative's key range and unit index; it never iterates, so
+  there is no iteration-order dependency to leak into output, and it uses no
+  `HashMap`/`RandomState` and no floats (§5.1). Every lookup is verified in the
+  normative order **byte-length → fingerprint → memcmp**: the probe compares
+  `len` first, then `hash`, then the key bytes, and a length-equal /
+  hash-equal / bytes-different candidate is *rejected* and the probe
+  continues, so such a pair coexists in the table (linear probing requires it)
+  and a later real match is still found. Keys live in a caller-owned buffer
+  (`keys: &[u8]` + a `Range`), so the same table serves all three comparison
+  domains of §4.4: raw bytes for stage 3, a ws-normalized arena for stages
+  4/5, a masked-form arena for stages 6/7. `insert` returns
+  `Insert::{New, Duplicate(rep), Full}`; `find`/`insert_hashed`/`find_hashed`
+  also accept a caller-supplied fingerprint so residual fingerprints are never
+  recomputed. Caps are frozen in code: `for_keys(key_bytes)` pre-sizes to
+  `key_bytes / 16` slots (smallest plausible unit), clamped to
+  `MIN_SLOTS = 64` and `MAX_SLOTS = 262_144` (§7's "pre-sized from span
+  bytes; hard cap"); growth doubles below the cap at a 75% load factor and
+  rehashes in slot order, and at the cap `insert` returns `Full` and
+  `is_full()` reports it, which is the §7 signal for W2 to degrade a
+  pathological unique-line flood to pass-through with bounded memory
+  (≈12 MiB worst case, independent of span size).
+  Tests: 5 unit tests in `fingerprint.rs` (the crate-private probe returns the
+  rejecting stage, which pins the order: `Absent` / `Hash` / `Length` /
+  `Memcmp` for constructed single-entry tables, plus memcmp-separated
+  coexistence, duplicate-representative, `low 16 bits` of xxh3-64, and
+  all-entries-still-findable across every growth step) and 8 integration tests
+  in `crates/core/tests/fingerprint.rs` (fixed-seed golden vectors for
+  xxh3-128/xxh3-64, 1000 distinct fingerprints, pre-sizing/clamping table,
+  hard-cap saturation with no growth past `MAX_SLOTS` and no entry loss,
+  insertion-order independence, raw-domain and ws-domain grouping over real
+  stage-1 units, and zero-length keys). Core total 60
+  (9 config + 5 fingerprint unit + 8 fingerprint + 30 splitter + 8 ws).
+  Dependency: `twox-hash 2.1.2` (`default-features = false`, features
+  `std`, `xxhash3_128`, `xxhash3_64`), chosen over hand-rolling XXH3 and over
+  `xxhash-rust`, whose BSD-2-Clause is outside the `deny.toml` allow list.
+  MIT, no transitive dependencies (`rand`/`serde` are optional and off), and
+  its runtime SSE2/AVX2/NEON dispatch is bit-exact for xxh3, which §5.9
+  explicitly accepts; the scalar path is the reference. `Cargo.lock` is
+  committed here because the new dependency requires it — note the file also
+  picks up the pending W1.6 proto entries left unstaged by that commit.
+  Deviations from DESIGN: none. DESIGN.md is not amended; the only judgement
+  calls are the frozen numbers §7 leaves open (`16` bytes per unit, the
+  `64`/`262_144` slot bounds, the 75% load factor) and `CCCC` using the same
+  fixed seed as the fingerprints.
 - **W1.5 Mask automata** (§4.6) — six masks, priority order,
   leftmost-longest. Exit: golden mask vectors.
 - **W1.6 Proto crate** (§6.2) — corrected .proto compiles; tonic codegen;

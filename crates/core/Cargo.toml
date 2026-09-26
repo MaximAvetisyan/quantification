@@ -3,3 +3,10 @@ name = "quantification-core"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[dependencies]
+twox-hash = { version = "2.1.2", default-features = false, features = [
+    "std",
+    "xxhash3_128",
+    "xxhash3_64",
+] }
