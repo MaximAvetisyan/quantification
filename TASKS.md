@@ -218,6 +218,52 @@ exit criteria. Gates M1–M4 are blocking milestones.
   fixed seed as the fingerprints.
 - **W1.5 Mask automata** (§4.6) — six masks, priority order,
   leftmost-longest. Exit: golden mask vectors.
+  Status: **complete** (2026-09-26). `MASK_LIST` is the frozen
+  `{ts} {ip} {uuid} {hex} {dur} {num}` order and `Mask::placeholder()` returns
+  the §4.6 placeholders `<ts> <ip> <uuid> <hex> <dur> <num>`, all `[a-z<>]`
+  only. `mask(ws_line)` / `mask_into(ws_line, out)` consume a **ws-normalized
+  line** (§4.2 / W1.3) in one left-to-right pass and allocate nothing on the
+  scratch path: at each position the six masks are tried in listed priority
+  order and the first match wins, taking that mask's longest match at that
+  position, so the resolution rule is *leftmost, then priority, then
+  longest*; the masked range is emitted as the placeholder and the scan
+  resumes after it, so nothing is ever re-scanned. No regex engine, no
+  backtracking, integer comparisons only (§4.6). Escape units are opaque:
+  a complete `\uXXXX` (or any 2-byte escape, truncated tails included, clamped
+  exactly as stage 1 clamps) is copied verbatim, so `{num}` never eats the
+  digits of `\u0031` and the §4.2 rule that obliquely-encoded escapes are
+  invisible to masking holds. The masked form is a plain byte string that
+  stage 6 fingerprints and stage 7 memcmps; it is never emitted (the anchor
+  stays the original escaped bytes, §4.6/§4.5).
+  Informal §4.6 patterns resolved and frozen (as golden vectors): `{ts}` =
+  `\d{4}-\d{2}-\d{2}` with an optional `T|t|space` time
+  `\d{2}:\d{2}:\d{2}`, optional `.\d+` fraction and optional `Z|z|+hh:mm|-hhmm`
+  offset, **or** the syslog `Xyz dd hh:mm:ss` form (any upper+2 lower month
+  letters, 1–2 digit day, one or more spaces, so it also works on
+  un-normalized input); `{ip}` = dotted quad with 1–3 digit octets ≤255, or
+  IPv6 with 1–4 hex-digit groups, at most one `::`, an optional trailing IPv4
+  (`::ffff:192.168.1.1`), 8 groups when uncompressed and ≥1 compressed group
+  otherwise (`::` alone and zone ids are not matched); `{uuid}` = 8-4-4-4-12
+  hex groups exactly, case-insensitive (a 32-hex dashless id is `{hex}`, as
+  the priority order requires); `{hex}` = a maximal run of ≥`HEX_MIN_RUN = 16`
+  hex chars, case-insensitive; `{dur}` = `\d+([.]\d+)?` plus `ns|us|ms|s|m|h`
+  (2-char units tried before 1-char, `u` alone is not a unit);
+  `{num}` = `\d+([.]\d+)?` with no sign and no exponent. Consequence pinned
+  by test: at one position priority beats the lower-priority mask, so
+  `12345678901234567ms` is `<hex>ms` (`{hex}` is 4, `{dur}` is 5) while
+  `5ms` is `<dur>` and `1.2.3.4.5` is `<ip>.<num>`.
+  Tests: 9 integration tests in `crates/core/tests/mask.rs` (frozen list and
+  placeholder charset, 61 golden vectors grouped per mask, rejected forms
+  never producing their placeholder, escape-unit opacity, leftmost-longest
+  resolution, idempotence of the mask list over its own output for every
+  golden plus 400 LCG-generated lines, and a ws-normalized stage-1 span whose
+  masked forms memcmp-equal across near-duplicate lines and differ on a real
+  field change). Core total 69 (14 lib unit + 8 fingerprint + 9 mask +
+  30 splitter + 8 ws).
+  Deviations from DESIGN: none — the §4.6 table is implemented as written and
+  DESIGN.md is not amended. The pattern details above are the resolutions of
+  §4.6's explicitly informal column, frozen here because §4.6 freezes the
+  list per release. No new dependencies.
 - **W1.6 Proto crate** (§6.2) — corrected .proto compiles; tonic codegen;
   shared types. Independent of core.
 
