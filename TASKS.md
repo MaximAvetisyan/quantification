@@ -2065,6 +2065,169 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W3.2 HTTP/axum** (§6.1) ∥ **W3.3 gRPC/tonic unary** (§6.2) ∥
   **W3.4 CCR store + Restore** (§9, flag-gated) — all parallel behind W3.1;
   W3.2 implements `X-Stats-*` naming verbatim.
+  Status: **complete** (2026-09-27). `crates/server` is now a lib plus a thin
+  bin: `src/lib.rs` (router, handlers, error mapping, Prometheus counters),
+  `src/options.rs` (query parser + option mapping, the only place a §6.1 option
+  is spelled), `src/headers.rs` (`Stats` → `X-Stats-*`), `src/main.rs`
+  (`axum::serve` on `QUANT_HTTP_ADDR`, default `127.0.0.1:8080`). Public
+  surface: `app(State) -> Router`, `State::{new, default}`,
+  `CCR_ENABLED`, `SPAN_PREVIEW_LIMIT = 64`. The transport only calls W3.1 —
+  `Compressor::new`/`compress`, `api::reserve`, `Request`/`RawOptions`/`ApiError`,
+  `ContentType::parse`, plus `config::REQUEST_BODY_LIMIT`, `config::resolve` and
+  `locator::locate` for `/v1/detect`; `crates/core` and `crates/proto` are
+  untouched.
+  **Endpoints** (every status below is asserted in `tests/http.rs`):
+
+  | Method | Path | Success | Failures |
+  |---|---|---|---|
+  | POST | `/v1/compress` | 200, spliced bytes verbatim, `X-Stats-*`, `Content-Type` echoed from the request (else `application/json`) | 400/413/422 |
+  | POST | `/v1/compress?envelope=json` | 200, `{payload, stats}` as JSON, **no** `X-Stats-*` | 400/413/422 |
+  | POST | `/v1/detect` | 200, `{schema, degraded, noop_reason, scope_policy, span_count, spans_truncated, spans[]}` | 400/413 |
+  | POST | `/v1/restore` | — | 501 always in this build (see below) |
+  | GET | `/healthz` `/readyz` | 200, `{"status":…}` | — |
+  | GET | `/metrics` | 200, Prometheus text | — |
+
+  **Header naming is §6.1 lines 559-567 verbatim.** The single-compress path
+  emits `X-Stats-Bytes-In`, `-Bytes-Out`, `-Approx-Tokens-In`,
+  `-Approx-Tokens-Out`, `-Groups-Collapsed`, `-Exact-Runs`, `-Ws-Runs`,
+  `-Block-Repeats`, `-Template-Groups`, `-Templated-Blocks`, `-Record-Splits`,
+  `-Degraded` (`true`/`false`), `-Noop-Reason` (only when
+  `Stats.noop_reason` is `Some`, i.e. **absent value ⇒ absent header**) and
+  `-Algo-Version`; `the_stats_header_names_are_verbatim_and_the_values_are_exact`
+  asserts the served set is exactly those names, that each is reachable under the
+  normative Camel-Case spelling, and that every value equals the `Stats` field.
+  They are *stored* lowercase because `http::HeaderName` rejects any other case
+  (`from_static` panics on `X-Stats-…`, and HTTP/2 requires lowercase anyway), so
+  the `http_body_util`-served wire form is the lowercase rendering; §6.1 itself
+  says "names are case-insensitive (RFC 9110)", and
+  `the_header_names_are_case_insensitive` pins that `X-Stats-Bytes-In`,
+  `x-stats-bytes-in` and `X-STATS-BYTES-IN` all resolve. **Timings,
+  `options_echo` and `restore_ids` never become headers** — they are
+  envelope-only, asserted both by the exact-name-set assertion and by
+  `envelope_only_never_reach_the_single_compress_headers`, which additionally
+  rejects any header whose name contains `timing`/`elapsed`/`options`/`echo`/
+  `restore`. The envelope path carries no `X-Stats-*` at all.
+  **Options** come from the query on the bare path and from the JSON envelope on
+  `?envelope=json`, and are mapped onto `RawOptions` so that `config::resolve`
+  does the validating: `scope_policy`, `min_group_size` (int ≥ 2), `normalize_ws`,
+  `template_dedup`, `reversible` are `true`/`false` only, `marker_style` is
+  `auto|ascii|unicode`, all with the §6.1/§7 defaults. The query parser is
+  hand-rolled (percent- and `+`-decoding, first key wins, deterministic
+  iteration, no `HashMap`/`RandomState` anywhere on the path), and it is
+  **strict**: an unknown key, a garbage value, a reserved `scope_policy`
+  (`all_messages`, `explicit_paths` — parsed through so `resolve` refuses it) and
+  `min_group_size=1` are all 400 with a message that names the parameter
+  (`every_invalid_option_is_a_400`, 13 cases). Booleans accept only `true`/
+  `false`, not `1`/`0`. `envelope=json` accepts **only** `envelope` in the query —
+  an option there is a 400 telling the caller it belongs in the body — and any
+  other `envelope` value is a 400.
+  **Error mapping** (§3): `ApiError::ContentTypeMismatch` is the *only* 422,
+  reachable only through an explicit `content_type` pin (query `content_type=` or
+  the envelope's `content_type`, one of `chat|responses|messages|text`); every
+  other outcome of a compress call is a 200 pass-through with stats. `ApiError::
+  Options` ⇒ 400 `invalid_options`, `ApiError::Malformed` ⇒ 400 `malformed`
+  (only reachable in a `strict_validate` build), query/envelope faults ⇒ 400
+  `invalid_argument`; a body over `request_body_limit` ⇒ **413** from axum's
+  `DefaultBodyLimit::max(config::REQUEST_BODY_LIMIT)`, a real transport guard
+  (a 64 MiB + 1 body is 413 on all three POST routes, and a 3 MiB body is served,
+  proving axum's 2 MiB default was replaced); `/v1/restore` ⇒ 501. The only 5xx
+  is a panicking `spawn_blocking` task (`internal_error`), which is a server bug,
+  not a compression outcome.
+  **Core purity.** The compression runs inside `tokio::task::spawn_blocking`
+  (so a 64 MiB body never occupies an async worker) and touches nothing but
+  W3.1: output bytes cannot depend on tokio, the wall clock or the thread count.
+  The `elapsed_*` fields come from W3.1's `Clock` seam — `Compressor::new()`
+  installs `MonotonicClock` — and tokio is used only to schedule. A fresh
+  `Compressor` and a fresh `Vec` pre-sized with `api::reserve` are built per
+  request; see deviation (1).
+  **`/v1/restore` is flag-gated and stores nothing.** The cargo feature `ccr` is
+  off by default and `CCR_ENABLED` is `cfg!(feature = "ccr")`; both feature
+  states answer 501 `not_implemented` (the message says "disabled" vs "not
+  implemented yet"), because §9's store is W3.4's and this wave invents none. The
+  same holds for `reversible=true`: it is parsed, resolved and echoed, changes
+  no output byte, and returns no `restore_ids`
+  (`reversible_is_accepted_and_reserved`).
+  **`/v1/detect`** is the §6.1 debugging aid: `locator::locate` with the
+  `scope_policy` option (`scope_policy` is its only accepted query key; a
+  reserved policy is a 400), reporting the sniffed schema, the degradation and
+  the first `SPAN_PREVIEW_LIMIT = 64` eligible spans as
+  `{start, end, class}` **absolute byte offsets**, plus `span_count` and
+  `spans_truncated` so a truncated preview can never be read as the whole set.
+  §13.3's per-span savings stays open — the span preview is the answer for now.
+  **Metrics** are four Prometheus families, hand-rendered, deterministic order
+  (`BTreeMap` keyed by route and status, §5.2):
+  `quantification_http_requests_total{route,status}`,
+  `quantification_payload_bytes_total{direction}`, `quantification_pass_through_total`
+  and `quantification_build_info{algo_version,ccr}`. `/healthz`, `/readyz` and
+  `/metrics` are not themselves counted, so a scrape cannot move a counter.
+  Tests: **11 unit** (9 in `options.rs` for the parser/envelope mapping, 2 in
+  `lib.rs` for the Prometheus rendering and for serving after the metrics mutex
+  is poisoned — §12's "poisoned buffers" spirit, since a per-request output
+  buffer leaves no state to poison) and **25 integration** in
+  `crates/server/tests/http.rs`. The integration suite drives the real router
+  (`tower::ServiceExt::oneshot`, so routing, extractors, the body limit and the
+  response are all live) and, in
+  `the_wire_format_is_a_real_http_response`, a real server on an ephemeral port
+  over a raw `tokio::net::TcpStream`, asserting the `HTTP/1.1 200 OK` status
+  line, the `x-stats-*` header lines as hyper writes them and the body. It also
+  pins byte-identity with the core (the bare body **is** `compress`'s output and
+  the envelope's `payload` is the same bytes), every detector through its
+  option, both scope policies on a `tool_result` payload, pass-through +
+  `X-Stats-Noop-Reason` for `unknown_schema` and `malformed`, the 400/413/422
+  paths, `restore`'s 501, the envelope's 18 stats fields and exact
+  `options_echo`, the span preview and its truncation, and that eight identical
+  requests answer with byte-identical status, headers **and** body (no timing
+  leaks into a header). Workspace total 371 → **407** (36 server tests);
+  `cargo test --workspace` **407 green** (408 collected, the one `#[ignore]`d
+  golden generator), **409** with `--features quantification-core/strict_validate`
+  (the malformed-document test asserts the strict build's 400 there), 36 green
+  with `--features ccr`. `cargo fmt --all --check` clean and
+  `cargo clippy --workspace --all-targets -- -D warnings` clean in the default,
+  `strict_validate` and `ccr` states. Dependencies added: `axum` 0.8 (default
+  features), `tokio` 1 (`macros`, `net`, `rt-multi-thread`; `io-util` for the
+  test), `serde` 1 + `serde_json` 1, and `tower` 0.5 (`util`) as a dev-dependency
+  — `Cargo.lock` therefore gained 7 entries (`serde`, `serde_json`,
+  `serde_path_to_error`, `serde_urlencoded`, `form_urlencoded`, `ryu`, `zmij`),
+  all MIT / MIT-OR-Apache-2.0 / Apache-2.0-OR-BSL-1.0, so no `deny.toml` change
+  is needed; axum, tokio, hyper, http and tower were already in the graph via
+  tonic. `deny.toml` itself is untouched.
+  **Deviations from DESIGN: three, recorded here rather than in DESIGN.md.**
+  (1) **One `Compressor` per request, not per stream.** W3.1 notes that "one
+  `Compressor` plus one reserved `Vec<u8>` serves a whole request stream with no
+  per-call output allocation", but `api::Compressor` holds
+  `Box<dyn Clock + 'static>` (W3.1's injectable seam), which is **not `Send`**,
+  so it cannot live in an `Arc<Mutex<…>>` shared state — axum requires
+  `State: Send + Sync`. Each request therefore builds its `Compressor` inside its
+  `spawn_blocking` task, which keeps the state `Send` and the core untouched; the
+  per-request output buffer is still pre-sized with `api::reserve`, so the splice
+  still performs a single allocation. Nothing about the output bytes changes, and
+  §5.5 (no thread-count influence on output) is satisfied trivially. Making the
+  seam `Send` would be a `crates/core` change (W3.1's owner), and is the obvious
+  follow-up if per-stream buffer reuse is ever worth measuring.
+  (2) **`content_type` is a transport-level addition.** §6.1's HTTP table and
+  options table never mention a content-type parameter, yet §3 reserves the 422
+  for a caller who "explicitly pins `content_type`" — so the transport must
+  expose one. It is an optional `content_type` query parameter (bare path) and
+  an optional `content_type` envelope field, accepting exactly the four schema
+  names of W3.1's `ContentType::parse`; absent means auto. The *decision* of when
+  a pin contradicts a payload is W3.1's, untouched.
+  (3) **The envelope's `payload` is a JSON string.** §6.1 says
+  `{payload, options} → {payload, stats}` without saying how bytes are carried,
+  and a JSON *value* would have to be re-serialized, which §4.5 forbids
+  ("no JSON reserialization") and which would break R3's "output = input except
+  spliced ranges" for untouched bytes. `payload` is therefore a string in and a
+  string out — the exact bytes the core produced, JSON-escaped once by
+  `serde_json` — and a non-string `payload` is a 400 with a message that says so.
+  The bare path carries raw bytes in both directions and is unaffected. Two
+  smaller readings are frozen alongside it, both unpinned by §6.1: the
+  single-compress response echoes the request's `Content-Type` (falling back to
+  `application/json`), because the output is the input's bytes outside the
+  spliced ranges; and a non-UTF-8 payload is reachable only on the bare path.
+  DESIGN.md §6.1 should be amended to state both, and to state that
+  `?envelope=json` and the bare path are the only two shapes. §3, §4.5, §6.1's
+  endpoint table, §6.1's options table, §6.1's header naming, §7's
+  `request_body_limit` and §9's flag-gating are otherwise implemented as
+  written, and gRPC and the CCR store remain W3.3's and W3.4's.
 
 ## Wave 4 — verification & perf (overlaps Waves 2–3 where noted)
 
