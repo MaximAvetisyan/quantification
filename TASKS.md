@@ -403,6 +403,97 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W2.1 Commit ledger + profitability gate** (§4.4) — removal rule (member
   union + joiners), anchor-offset emit ordering, stats counters. Deps:
   W1.2, W1.4. Defines the interface every detector commits through.
+  Status: **complete** (2026-09-26). The ledger is
+  `quantification_core::ledger`; a detector never touches bytes, it proposes a
+  group and the ledger answers with a `Commit` or a rejection reason. Public
+  API, frozen for W2.2–W2.9:
+  `CommitKind {ExactRun, WsRun, Block, TemplateGroup, TemplatedBlock}` +
+  `core(style) -> (prefix, suffix)` (the §4.5 `CORE` halves, both styles) and
+  the §6.2 counter mapping; `framing(style) -> (OPEN, SEP, CLOSE)`;
+  `decimal_width(u64) -> usize`; `marker_len(style, kind, count) -> usize`
+  (exact rendered width, the 4 hex checksum bytes included);
+  `profitable(style, kind, count, anchor_bytes, removed_bytes) -> bool`, the
+  one normative gate all five detectors share, strict `<`;
+  `removal_range(&[Unit], Range<usize>) -> Range<usize>` (the normative
+  removal rule); `Proposal {group, anchor_units, count, kind}` with
+  `Proposal::new(..)` and `Proposal::run(group, kind)`;
+  `Commit {kind, first, last, count, anchor, removed}` + `members()`;
+  `CommitOutcome {Committed(Commit), InvalidGroup, InvalidAnchor,
+  InvalidCount, Ineligible, Overlapped, BelowThreshold}`;
+  `Ledger::new(&[Unit], MarkerStyle)`, `units()`, `marker_style()`,
+  `commits()` (already in emit order), `is_committed(unit)`,
+  `is_free(group)`, `residual() -> impl Iterator<Item = (usize, &Unit)>`,
+  `try_commit(Proposal) -> CommitOutcome`; `StageStats {groups_collapsed,
+  exact_runs, ws_runs, block_repeats, template_groups, templated_blocks,
+  record_splits}` (plain data + `bump(kind)` + `merge(&StageStats)`, filled by
+  the W2.9 pipeline; no clock, no I/O — elapsed timings stay W2.9). Frozen
+  semantics: (a) **the removal range is derived from indices into the
+  immutable full unit list**, never from a filtered residual, so the W1.2
+  joiner hazard cannot inflate `removed_bytes` — `removal_range(a..b)` is
+  `units[a].range.start..units[b-1].range.end`, which *is* the member union
+  plus the inter-member joiners (the line-boundary escape runs resp. the
+  single `,` bytes) and nothing else; the joiners of surviving neighbours
+  stay outside it, so a marker replaces exactly that range and the
+  neighbours remain one line/record apart. (b) Anchor = the first member for
+  stages 3/4/6 (`anchor_units = 1`) and the whole first occurrence for stages
+  5/7 (`anchor_units = L`); `anchor ⊆ removed` always, so W2.7 emits
+  `anchor bytes + marker` over `removed` — the anchor is a sub-range of the
+  range it replaces, not a separate edit. (c) Check order in `try_commit`:
+  `InvalidGroup` → `InvalidAnchor` → `InvalidCount` → `Ineligible` (a
+  member with `eligible == false`, i.e. an over-cap record, can never be
+  committed) → `Overlapped` → `BelowThreshold`; a rejected proposal claims
+  nothing, so a below-threshold group stays verbatim *and* remains available
+  to later stages. (d) **Overlap ownership** is per unit
+  (`claimed: Vec<bool>` over the full list): any claimed member rejects the
+  whole proposal, which is exactly the §4.4 "earlier-stage commitments own
+  their lines and win all overlaps" rule and also makes a residual run that
+  straddles a committed region impossible to express. (e) **Emit ordering** is
+  maintained structurally: a commit is inserted at
+  `commits.partition_point(|c| c.anchor.start < new.anchor.start)`, so
+  `commits()` is ascending by anchor byte offset whatever the discovery
+  order — no sort at the end, no hash-table iteration anywhere. (f)
+  `Proposal::run` derives `count` from the group length, so the emitted
+  `N` is the number of copies **including the anchor** (frozen reading of the
+  §4.5 `×N` wording, which leaves the anchor in/out unstated); `count == 0`
+  and `anchor_units == 0` are rejected. (g) `MarkerStyle::Auto` is refused by
+  `Ledger::new` — the caller (W2.9) resolves auto/ascii per span first,
+  because the gate's `marker_bytes` depends on the style. Tests: 31
+  integration tests in `crates/core/tests/ledger.rs` (core total 167 =
+  23 lib unit + 8 fingerprint + 31 ledger + 41 locator + 1 locator-alloc +
+  9 mask + 16 sniff + 30 splitter + 8 ws; workspace total 177, unchanged
+  proto/server 10). Exit criteria met:
+  removal-rule ranges are pinned for `\n`/2-byte, 6-byte `\u000A`/`\u000a`,
+  concatenated-boundary and `,` joiners, for multi-member and single-member
+  groups, for groups at the very start and the very end of a span, and for a
+  span that mixes line units and stage-1b record units in one group sequence;
+  an `assert_removal_invariant` helper re-derives every range as
+  Σ member bytes + Σ inter-member gaps and runs over each commit;
+  the threshold is exercised at exact equality (11 + 26 = 37 = removed ⇒
+  `BelowThreshold`, both unicode and the 32-byte ascii `ws-equal` shape) and
+  one byte either side; `decimal_width` is pinned against
+  `u64::to_string().len()` for 0/1/9/10/99/100/999/1000/9999/10000/10^6/
+  `u64::MAX` and `marker_len` is pinned for all ten kind×style shapes (with
+  the width carry at 10, 100 and 1000); emit order is asserted for a
+  back-to-front discovery order and for three orderings of the same span;
+  overlap rejection covers a proposal overlapping from the left, the right,
+  both sides, a span crossing a committed region, an adjacent (legal)
+  neighbour commit, and `is_committed`/`is_free`/`residual` afterwards. The
+  hazard W1.2 warned about is pinned numerically rather than by panic: after
+  `6..9` commits, the residual joiner of the unit before the committed region
+  measures 98 bytes where the honest gap is 2, and a proposal spanning the
+  committed region is `Overlapped` while `3..6` still measures exactly
+  3×30 + 2×2. A source-scan test asserts the module contains no `HashMap`,
+  `RandomState`, `BTreeMap`, clock, env, RNG, float or sort
+  (`ledger_path_has_no_forbidden_determinism_inputs`), matching §5.1–§5.5;
+  the ledger is integer-only and allocation happens once per span
+  (`claimed`) plus once per commit (`Vec::insert`). Deviations from DESIGN:
+  none — §4.4's removal rule, strict profitability gate, stage ordering,
+  anchor-offset emit order and the §6.2 counter set are implemented as
+  written and DESIGN.md is not amended. The readings frozen in (a)–(g) above
+  resolve points §4.4/§4.5 leave to the implementation, frozen here because
+  §5.7 freezes behaviour per release; the one worth a second reader's eye is
+  (f), the `N`-includes-the-anchor convention, which W2.2–W2.8 inherit for
+  free. No new dependencies.
 - **W2.2 Stage 3 exact runs** ∥ **W2.3 Stage 4 ws-runs** ∥
   **W2.4 Stage 5 repeated blocks** (ws-normalized domain) ∥
   **W2.5 Stage 6 template groups** — all after W2.1
