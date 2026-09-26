@@ -137,6 +137,33 @@ exit criteria. Gates M1–M4 are blocking milestones.
   stays a W4.3 bench item.
 - **W1.3 WS-normalization transform** (§4.2) — escape-unit collapse, trim.
   Exit: golden vectors incl. mixed `\n` / `\u000A`.
+  Status: **complete** (2026-09-26). `wsnorm::normalize_into(raw, &mut out)`
+  is the transform (allocation-free, reuses the caller's scratch buffer so W2
+  detectors normalize without a per-line allocation) and `wsnorm::normalize(raw)`
+  is the owning wrapper. One left-to-right walk over the raw escaped bytes:
+  every position is consumed as a whole escape unit (2-byte simple escape, or
+  6-byte `\uXXXX` clamped to what is left, matching stage 1's walk), the
+  collapse sources `\t` / `\n` / `\r` and the literal space each set a
+  *pending* flag, and the flag emits exactly one space only when a
+  non-collapsing unit follows **and** the output is non-empty — that single
+  mechanism gives both run collapse and edge trimming, with no second pass.
+  A pending flag is therefore dropped at a leading/trailing edge and kept
+  between literals. Pinned consequences (goldens): `\u000A` / `\u000a` /
+  `\u0009` / `\u0041` and every other escape unit stay literal byte-for-byte
+  (so `\u000A` inside a line is *not* a collapse source — it is a line
+  boundary cut by stage 1), a raw TAB/CR/LF byte is literal (only escape
+  units collapse, per §4.2), `\\` followed by `n` stays `\\n` (the `\\` unit is
+  not a collapse source), truncated tails (`\`, `\u`, `\u0`, `a\`) stay
+  literal, and `\n`/`\r` collapse even though stage 1 removes them first
+  (a stage-1b record or any other input slice still transforms correctly).
+  The transform is idempotent and never grows the input, both asserted over
+  the 22-vector golden table and over 200 LCG-generated spans.
+  Cross-check against W1.2: a span whose lines are separated by `\n` and the
+  same span with `\u000A` / `\u000a` separators produce *equal* ws-normalized
+  per-line forms. Tests: 8 integration tests in `crates/core/tests/wsnorm.rs`
+  (core total 47 = 9 config unit + 30 splitter + 8 ws-normalization).
+  Deviations from DESIGN: none — §4.2 bullet 3 is implemented as written and
+  DESIGN.md is not amended. No new dependencies.
 - **W1.4 Hashing facade** — xxh3-128/64 fixed-seed wrappers; open-address
   fingerprint table, length→hash→memcmp order, hard caps (§4.4.2, §7).
 - **W1.5 Mask automata** (§4.6) — six masks, priority order,
