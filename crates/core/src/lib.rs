@@ -1,15 +1,18 @@
 pub mod config;
 pub mod fingerprint;
+mod keys;
+pub mod locator;
 pub mod mask;
 mod s1;
+pub mod sniff;
 pub mod stage1;
 pub mod stage1b;
 pub mod wsnorm;
 
-pub use s1::{Role, Span};
 pub mod benches {
     pub use crate::s1::benches::*;
 }
-pub mod locator {
-    pub use crate::s1::locator::*;
+
+pub mod spike {
+    pub use crate::s1::{Role, Span, locator};
 }

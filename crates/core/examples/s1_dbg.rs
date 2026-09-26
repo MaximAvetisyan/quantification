@@ -1,4 +1,4 @@
-use quantification_core::locator;
+use quantification_core::spike::locator;
 
 fn main() {
     let cases: Vec<(&str, usize)> = vec![

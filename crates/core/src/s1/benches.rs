@@ -1,4 +1,4 @@
-use crate::locator;
+use crate::s1::locator;
 
 pub const TARGET_BYTES: usize = 8 << 20;
 

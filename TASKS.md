@@ -69,6 +69,137 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W1.1 Schema sniff + span locator** (§4.1) — eligibility map, degradation
   routing, depth/span caps, BOM skip, decoded-key matching, last-wins keys.
   Exit: locator fixtures green; hot loop allocation-free (asserted).
+  Status: **complete** (2026-09-26). The normative locator is
+  `quantification_core::locator`, the sniff is
+  `quantification_core::sniff`; the S1 spike is untouched and still reachable as
+  the perf harness under `quantification_core::spike` (its `s1/` path, benches
+  and examples are unchanged apart from that re-export). Public API, frozen for
+  W3.1/W3.3:
+  `sniff::Schema {Chat, Responses, Messages, Text}` (+ `as_str`/`parse`, the
+  fixed `CANDIDATE_ORDER`, `SNIFF_PREFIX_BYTES`),
+  `sniff::sniff(&[u8]) -> Option<Schema>`,
+  `locator::locate(&[u8], ScopePolicy) -> Located` (sniffs, then locates),
+  `locator::locate_as(&[u8], Schema, ScopePolicy) -> Located` (caller-pinned
+  content type — the hook W3.1's `422` rule and W3.3's proto enum need),
+  `locator::locate_into(&[u8], Schema, ScopePolicy, &mut Vec<Span>) ->
+  Option<NoopReason>` (caller-owned output buffer, allocation-free),
+  `Located { schema: Option<Schema>, spans: Vec<Span>, noop_reason:
+  Option<NoopReason> }` + `degraded()`, `Span { start, end, class:
+  SpanClass{User,Tool} }` (private bookkeeping fields), `NoopReason
+  {Malformed, UnknownSchema}` + `as_str()` → `"malformed"` /
+  `"unknown_schema"`. W3.3 must map the proto `ContentType` enum (left
+  unmapped by W1.6) onto `sniff::Schema`: `AUTO` ⇒ `sniff`, `CHAT` ⇒
+  `locate_as(.., Schema::Chat, ..)`, etc.; Stats map as `degraded =
+  noop_reason.is_some()` and `noop_reason = noop_reason.map(|r| r.as_str())`.
+  **BOM offset contract (pinned, previously unpinned per the S1 review): span
+  offsets are absolute byte offsets into the buffer exactly as passed in.** A
+  leading `EF BB BF` occupies bytes 0..3, is never part of any span, and the
+  splicer (W2.7) can therefore copy the input buffer and patch recorded ranges
+  with no coordinate shift; `content_type=text` yields the single span
+  `3..len` on a BOM payload. Asserted by
+  `bom_offsets_are_absolute_in_the_original_buffer` (the span is located by
+  index inside the post-BOM slice and its start is proved to be that index
+  `+ 3`, with quotes on both sides). Sniff: one escape-aware pass over at most
+  `SNIFF_PREFIX_BYTES = 64 KiB` collecting **root** (depth-1) keys, then the
+  fixed candidate order decides. Frozen discriminators (§4.1 leaves them to the
+  sniff): `Chat` = object root with `messages` and no Anthropic marker;
+  `Responses` = object root with `input` and no `messages`; `Messages` =
+  object root with `messages` and an Anthropic marker; `Text` = first non-ws
+  byte is not `{ [ "` (so a chat↔Responses overlap resolves to Chat, per the
+  fixture README). The Anthropic marker is a root `max_tokens` or root
+  `system` (`max_tokens` is required by the Messages API; `system` is its
+  top-level prompt) — `max_tokens` is therefore a tenth structural key, decoded
+  like the other nine but never eligibility-relevant. A JSON-shaped payload
+  with no candidate stays `None` ⇒ `noop_reason="unknown_schema"` (§3
+  pass-through), not text. Locator: one pass, no tree, nothing unescaped — a
+  string state machine (`\"`, `\\`, any 2-byte escape, `\uXXXX` consumed
+  opaquely, raw control byte `< 0x20` ⇒ malformed) drives a fixed 64-frame
+  state stack (`json_depth_cap`; depth 64 accepted, 65 degrades) carrying the
+  bounded message-object state machine; spans are `(byte_start, byte_end)` of
+  string *interiors* only, raw escaped bytes end-to-end. Eligibility map
+  implemented exactly as the §4.1 table: chat `messages[i].content` +
+  `content[j].text` where `type=="text"`; Responses root `input` string,
+  `input[i]` message items as in chat, and `function_call_output.output`;
+  Messages `messages[i].content`, `type=="text"` parts, and `tool_result`
+  blocks whose `content` is a string or `[{type:"text",text}]` parts. Class is
+  resolved bottom-up at container close: a part/block frame decides
+  `type=="text"` / `type=="tool_result"`, the message frame resolves `role`
+  (exact, case-sensitive) and the `function_call_output` item type, and the
+  W0.2 `ScopePolicy` filters at the same point (`user_content` ⇒ `User` spans
+  only, `user_and_tools` adds `Tool`). Frozen readings: `tool_result` ⇒ `Tool`
+  regardless of the enclosing role, per the normative table's "regardless of
+  enclosing message role"; the schemas do not borrow each other's keys (a
+  Responses-pinned payload ignores `messages`, a Chat/Messages-pinned payload
+  ignores root `input`, and root `system` is never eligible anywhere). Also
+  frozen: an empty string value yields no span, a value longer than
+  `max_span_bytes` is passed through (not a degrade), string escapes and number
+  literals are consumed leniently (`\u` with non-hex or truncated bytes is
+  opaque, so it can never produce a wrong range), and every one of the 26 W0.3
+  fixtures is re-validated as a whole document. Duplicate object keys are
+  **last occurrence wins** for both scalars (`role`, `type`) and candidate
+  values, including nested ones (`content` → array → part `text`): the
+  earlier occurrence's spans are removed when the later key is seen, keyed on
+  the `(frame, key)` member that lexically encloses them, and the frame's
+  output-index marks are re-derived in the same pass — not an error, not a
+  degrade. Both S1-review defects are fixed and pinned by test: (a) every
+  failure path clears the output vector, so a document truncated *after* a
+  valid prefix can never emit a partial span set
+  (`a_truncated_document_never_emits_a_partial_span_set` walks all 60-odd
+  prefixes of a two-message payload), and (b) `run()` requires a fully closed
+  root document — trailing bytes, a second document, or an unclosed container
+  all degrade. Degradation covers every §4.1 acceptance-envelope trigger:
+  unquoted identifiers, raw control characters (in keys or values), truncated
+  documents/strings, trailing commas, bad literals, depth > cap ⇒ whole-request
+  pass-through with `degraded=true`, `noop_reason="malformed"`, zero spans.
+  §5 on the hot path: integer-only, no `HashMap`/`RandomState`, no clock, RNG,
+  env or float anywhere in the three new modules; the frame stack, the key
+  decode buffer and the number scan are all fixed-size stack state, so the only
+  allocation is the caller's output `Vec`. Tests: 7 unit tests in `keys.rs`, 4
+  in `sniff.rs`, 41 integration tests in `crates/core/tests/locator.rs` (all
+  W0.3 fixtures across `schemas/`, `shapes/`, `edges/` — chat/messages/
+  responses minified+pretty, text-plain, content-null, mixed-parts,
+  function-call-output, input-string, anthropic-system-top, anthropic-tool-result,
+  sniff-overlap, bom-chat, dup-keys-last-wins, escaped-structural-keys,
+  newlines-u000a-only, prior-markers, profitability-below-threshold and the
+  single-line/stage-1b dumps — plus the eligibility map, both scope policies,
+  exact role matching, caps, and 17 malformed/degradation vectors × 3 schemas ×
+  2 policies), 16 in `crates/core/tests/sniff.rs`, and
+  `crates/core/tests/locator_alloc.rs`, whose counting global allocator
+  **asserts the hot loop allocates zero times** across six measured calls (a
+  400-message/16 000-line payload under both policies and all three schemas,
+  plus a >1 MB single-span payload and the text degenerate case) with the
+  output vector pre-sized so even a growth would be counted. Core total 136
+  (23 lib unit + 8 fingerprint + 41 locator + 1 locator-alloc + 9 mask +
+  16 sniff + 30 splitter + 8 ws); workspace total 146. Fuzz (W0.4 targets, now
+  wired to the real code): `fuzz_sniff` asserts the candidate invariant
+  (a JSON schema requires an object root, `Text` requires a non-JSON first
+  byte, unknown requires a JSON-shaped payload) and determinism;
+  `fuzz_locator` runs every payload through all four pinned schemas and both
+  policies and asserts the invariants R3 depends on — spans ascending and
+  disjoint, in bounds, never covering the BOM, always delimited by quotes with
+  no unescaped `"` or raw control byte inside (the splicer can therefore never
+  produce invalid JSON), no `Tool` span under `user_content`, no span at all
+  when degraded, and byte-identical repeat runs. One clean run each on
+  2026-09-26, corpus seeded with all 26 W0.3 fixtures plus Anthropic-tool-result,
+  Responses `function_call_output`, duplicate-key and BOM seeds: 200 000 runs,
+  exit 0, zero crashes, 411 coverage points / 1416 features on the locator.
+  Toolchain deviation: nightly is still unreachable (static.rust-lang.org
+  connection timeout), so both runs used the documented W0.4 fallback — stable
+  1.98.0 with `RUSTC_BOOTSTRAP=1` and `cargo fuzz run --sanitizer none` (no
+  ASan, which stable cannot enable). The nightly+ASan CI configuration is
+  unchanged and must be exercised when nightly is reachable; corpus
+  minimization stays W4.5 scope. Throughput sanity check (not a gate): the same
+  8 MiB escaped-heavy S1 fixtures that the spike measured at 1495/1441 MB/s
+  locate in 5.34 ms / 5.58 ms p50 = **1571 / 1501 MB/s** (pinned core, warm,
+  `--release`), i.e. ≈3.9× the §8 400 MB/s floor. `fuzz/Cargo.lock` is
+  regenerated by cargo-fuzz (it needs the `twox-hash` entry W1.4 added to
+  core) and was therefore left unstaged. Deviations from DESIGN: none — §4.1's
+  eligibility map, last-wins, decoded-key and acceptance-envelope rules are
+  implemented as written and DESIGN.md is not amended; the sniff
+  discriminators, `SNIFF_PREFIX_BYTES`, the BOM offset contract, the
+  lenient-escape/number reading and the empty/oversized-span rules above are
+  resolutions of details §4.1 explicitly leaves to the implementation, frozen
+  here because §4.1/§5.7 freeze behavior per release. No new dependencies.
 - **W1.2 Unit splitter** (§4.4 stages 1+1b) — line split; normative record
   segmentation `u_head`/`u_i`/`u_tail`; caps. Exit: property test — units +
   joiners reassemble to the original span byte-for-byte.

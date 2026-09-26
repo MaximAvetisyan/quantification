@@ -1,4 +1,4 @@
-use crate::{Role, Span};
+use crate::s1::{Role, Span};
 
 pub fn locate(data: &[u8]) -> Vec<Span> {
     let data = if data.len() >= 3 && data[..3] == [0xEF, 0xBB, 0xBF] {

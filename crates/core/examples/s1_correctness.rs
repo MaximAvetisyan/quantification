@@ -1,4 +1,4 @@
-use quantification_core::{Role, locator};
+use quantification_core::spike::{Role, locator};
 
 fn check(label: &str, cond: bool) {
     if !cond {
