@@ -8,6 +8,7 @@ pub mod mask;
 pub mod render;
 mod s1;
 pub mod sniff;
+pub mod splice;
 pub mod stage1;
 mod stage1b;
 pub mod wsnorm;

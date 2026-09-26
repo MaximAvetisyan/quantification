@@ -791,6 +791,70 @@ exit criteria. Gates M1–M4 are blocking milestones.
   No new dependencies.
 - **W2.7 Splicer** (§4.5) — copy buffer + patch recorded ranges; buffer-
   reuse robustness hook for §12 poisoned-buffer test. Parallel with detectors.
+  Status: **complete** (2026-09-26). The module is
+  `quantification_core::splice`. Public API, frozen for W2.9:
+  `spliced_len(input_len, MarkerStyle, &[Commit]) -> usize` (the exact output
+  length, so a caller can size a buffer before splicing),
+  `splice_into(&[u8], MarkerStyle, &[Commit], &mut Vec<u8>) -> &[u8]` (the
+  general form) and `splice_ledger(&[u8], &Ledger, &mut Vec<u8>) -> &[u8]`,
+  which reads `marker_style()` and `commits()` straight off the ledger so the
+  rendered style can never diverge from the one the §4.4 gate priced. The
+  **output buffer is caller-owned and reusable**: `out.clear()` then a single
+  `out.reserve(spliced_len(..))` and a forward cursor of `extend_from_slice`
+  ranges — one allocation, memcpy-only, and every returned `&[u8]` is the
+  freshly written prefix, so a shorter result over a longer previous one cannot
+  expose a stale byte (§12's poisoned-buffer requirement, and the ≤10 ms §8
+  splice budget's "single output allocation, memcpy ranges"). Assembly is
+  exactly §4.5's "copy input buffer, overwrite recorded ranges": **no JSON
+  reserialization**, which is why R3 holds trivially. Each commit is applied
+  over its `removed` range by emitting `input[commit.anchor]` (the original
+  raw anchor bytes, `anchor ⊆ removed`) followed by the W2.6 marker, so
+  surviving neighbours end up directly adjacent to the marker; the `,` /
+  line-boundary joiners *inside* `removed` are consumed with it and the
+  joiners of surviving neighbours are copied verbatim. Commits are consumed in
+  the ledger's frozen emit order (ascending anchor byte offset) and are
+  **absolute** offsets into `input` exactly as W1.1 pinned them, so a leading
+  BOM in bytes 0..3 and every untouched byte outside a span ride along
+  unchanged; a per-commit assert rejects any other order (pinned by
+  `commits_out_of_emit_order_are_refused`) and `spliced_len` is total
+  (`saturating_sub`) so a bogus order cannot underflow before that assert.
+  No new dependencies, no clock, no allocation beyond the caller's buffer.
+  Tests: 10 integration tests in `crates/core/tests/splice.rs` (core total
+  203 = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc
+  + 9 mask + 11 render + 16 sniff + 10 splice + 31 splitter + 8 ws; workspace
+  total 213, of which proto/server 10). Exit criteria met: exact output bytes
+  are pinned for a multi-commit span (`head\n` + 5 copies of a 40-byte line +
+  `\ntail` ⇒ anchor + `⟪×4 identical ·81cc⟫` and nothing else, i.e. the four
+  inter-member `\n` joiners are inside the removed range), for two commits in
+  one span discovered back-to-front (the ledger's emit order is what the splicer
+  consumes, and it is the splicer that must not sort), and for a 5-record
+  stage-1b dump where the middle records' `,` joiners stay outside the marker
+  while the `,` between the surviving head and tail records is preserved; the
+  no-commit case is asserted byte-for-byte equal to the input on three inputs
+  (multi-line, JSON-shaped, empty) into a pre-poisoned 128-byte buffer, with
+  `spliced_len == input.len()`; a commit at byte 0 and a commit whose range
+  ends 2 bytes before the buffer end are pinned with the trailing `\n` escape
+  unit surviving; a BOM payload splices the whole buffer and asserts bytes
+  0..3, the `{\"content\":\"` prefix, the `\n\"}` tail and the ascii marker are
+  byte-identical to the input's, which is the W1.1 absolute-offset contract
+  end to end; the **poisoned-buffer reuse test** first writes a 458-byte
+  passthrough into the buffer, then refills the buffer's whole capacity with
+  `0x00`, then splices a 70-byte result (shorter than the previous one) and
+  asserts no poison byte reaches the output and the length is exactly
+  `spliced_len`; a property test over 64 LCG-generated spans walks the output
+  and the input in lockstep and asserts every copied range is byte-identical
+  to the input, every anchor is the input's own bytes and every marker equals
+  an independently `format!`-built oracle (it commits more than 32 groups, so
+  it is not vacuous), and a final pass pins that 64 reuses of one buffer keep
+  the same capacity.
+  Deviations from DESIGN: none — §4.5's "copy the input buffer, overwrite
+  recorded ranges" is implemented as written and DESIGN.md is not amended. The
+  readings frozen here are the ones §4.5 leaves to the implementation: the
+  splicer takes **one** commit list over the whole payload buffer (all spans at
+  once, absolute offsets) rather than splicing per span, the commit list must
+  already be in emit order (W2.9 merges the per-span ledgers by anchor offset
+  before calling), and `spliced_len` is exposed as part of the surface for
+  pre-sizing. Frozen because §5.7 freezes behaviour per release.
 - **W2.8 Stage 7 templated blocks** — after W2.4 + W2.5 (template-id scan,
   min period 1).
 - **W2.9 Pipeline orchestration + Stats assembly** (§3, §4.5) — after
