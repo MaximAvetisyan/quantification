@@ -656,6 +656,63 @@ exit criteria. Gates M1–M4 are blocking milestones.
   (W2.4 also needs W1.3; W2.5 also needs W1.5).
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
+  Status: **complete** (2026-09-26). The module is
+  `quantification_core::render`; it renders the §4.5
+  `MARKER := OPEN CORE SEP CCCC CLOSE` grammar from the frozen W2.1 pieces and
+  nothing else. Public API, frozen for W2.7/W2.9:
+  `resolve_style(MarkerStyle, &[u8]) -> MarkerStyle`,
+  `render(MarkerStyle, CommitKind, u64, &[u8]) -> Vec<u8>` (owning) and
+  `render_into(&mut Vec<u8>, MarkerStyle, CommitKind, u64, &[u8])` (appends to
+  a caller buffer, so the splicer emits a marker without a per-commit
+  allocation; it asserts its own byte delta). `MarkerStyle::Auto` is **refused**
+  by both entry points (assert), exactly as W2.1's `Ledger::new` refuses it.
+  **Style resolution (frozen, W2.9 contract):** `resolve_style` is called by the
+  pipeline **per eligible span, before `Ledger::new`**, on the span's raw bytes —
+  `Auto` ⇒ `Ascii` iff every byte of the span is ASCII, else `Unicode`;
+  `Ascii`/`Unicode` are returned unchanged whatever the span contains. The
+  resolution must precede `Ledger::new` because W2.1's `marker_bytes` and hence
+  the §4.4 profitability gate are style-dependent, and because the splicer
+  renders with the same resolved style; the pipeline must pass that one resolved
+  style both to `Ledger::new` and to W2.7 (`splice_ledger` reads it back from
+  `ledger.marker_style()`, so the two can never diverge). The `CCCC` is written
+  nibble-wise from `fingerprint::marker_checksum` (bits 0–15 of fixed-seed
+  `xxh3-64` over the **raw** anchor bytes — the original escaped bytes, never a
+  ws-normalized or masked form) and the count is written digit-wise, with
+  `ledger::decimal_width` asserting the width and `ledger::marker_len` asserting
+  the total: `render(...).len() == marker_len(...)` holds for every kind, style
+  and count (asserted in `render_into`, so it is checked on the splicer's path
+  too). No duplicated framing/core/checksum arithmetic anywhere.
+  Tests: 11 integration tests in `crates/core/tests/render.rs` (core total 193 =
+  23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 11 render + 16 sniff + 31 splitter + 8 ws; workspace total 203).
+  Exit criteria met: golden vectors pin all five kinds × both styles at
+  `N = 200` (`⟪×200 identical ·0751⟫`, `⟪×200 rows, ws-equal ·0751⟫`,
+  `⟪block ×200 ·0751⟫`, `⟪×200 rows, template ·0751⟫`,
+  `⟪templated block ×200 ·0751⟫` and the five ascii twins), the exact `CCCC` is
+  pinned for seven known anchor byte strings (including the empty anchor,
+  `a`, and a `café` + `\\u0041` raw-escape anchor) and two anchors whose
+  **ws-normalized forms are equal** are proven to hash differently, which is
+  the raw-bytes-not-normalized rule; the width invariant runs over nine counts
+  (0, 1, 9, 10, 99, 100, 199, 1000, 12345) and the counts are pinned as plain
+  decimal up to `u64::MAX`; auto resolution is asserted both ways (four
+  all-ASCII spans ⇒ `Ascii`, three spans with non-ASCII bytes ⇒ `Unicode`) plus
+  the forced-style pass-through and the `Auto` panic; escape safety is asserted
+  over every kind × both styles × every count — no `"`, no `\`, no control byte,
+  valid UTF-8, and a raw marker embedded between two `\u0041` escapes adds
+  exactly zero backslashes, which is the §4.2 "valid in any JSON string
+  without re-escaping" rule and what makes R3 hold downstream; a source-scan
+  test asserts the renderer contains no `HashMap`/`RandomState`/`BTreeMap`/
+  clock/env/RNG/float/`format!` (§5.1–§5.5, and no formatting machinery on the
+  hot path at all).
+  Deviations from DESIGN: none — §4.5's exact rendering, both framing sets, the
+  ten `CORE` halves, the `CCCC` definition and the §4.2 escape-safety property
+  are implemented as written and DESIGN.md is not amended. The one reading
+  §4.5 leaves to the implementation is **where** `Auto` is resolved (the
+  "span contains no non-ASCII bytes" predicate is pinned as *the whole span's
+  raw bytes*, not just the anchor, and resolution is per span rather than per
+  payload); frozen here because §5.7 freezes behaviour per release, and it
+  matches W2.1's requirement that `Ledger::new` never sees `Auto`.
+  No new dependencies.
 - **W2.7 Splicer** (§4.5) — copy buffer + patch recorded ranges; buffer-
   reuse robustness hook for §12 poisoned-buffer test. Parallel with detectors.
 - **W2.8 Stage 7 templated blocks** — after W2.4 + W2.5 (template-id scan,

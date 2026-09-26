@@ -4,6 +4,7 @@ mod keys;
 pub mod ledger;
 pub mod locator;
 pub mod mask;
+pub mod render;
 mod s1;
 pub mod sniff;
 pub mod stage1;
