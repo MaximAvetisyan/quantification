@@ -3,7 +3,7 @@ package compressor.v1;
 
 service Compressor {
   rpc Compress(CompressRequest) returns (CompressResponse);
-  rpc Restore(RestoreRequest)   returns (RestoreResponse);
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
 }
 
 enum ScopePolicy {
@@ -12,47 +12,68 @@ enum ScopePolicy {
   ALL_MESSAGES = 2;
   EXPLICIT_PATHS = 3;
 }
-enum MarkerStyle { AUTO = 0; ASCII = 1; UNICODE = 2; }
+
+enum MarkerStyle {
+  MARKER_STYLE_AUTO = 0;
+  MARKER_STYLE_ASCII = 1;
+  MARKER_STYLE_UNICODE = 2;
+}
+
+enum ContentType {
+  CONTENT_TYPE_AUTO = 0;
+  CONTENT_TYPE_CHAT = 1;
+  CONTENT_TYPE_RESPONSES = 2;
+  CONTENT_TYPE_MESSAGES = 3;
+  CONTENT_TYPE_TEXT = 4;
+}
 
 message CompressRequest {
-  bytes       payload      = 1;
+  bytes payload = 1;
   ContentType content_type = 2;
   ScopePolicy scope_policy = 3;
-  Options     options      = 4;
+  Options options = 4;
 }
-enum ContentType { AUTO = 0; CHAT = 1; RESPONSES = 2; MESSAGES = 3; TEXT = 4; }
 
 message Options {
-  uint32      min_group_size = 1;
-  bool        normalize_ws   = 2;
-  bool        reversible     = 3;
-  MarkerStyle marker_style   = 4;
-  bool        template_dedup = 5;
+  uint32 min_group_size = 1;
+  optional bool normalize_ws = 2;
+  optional bool reversible = 3;
+  MarkerStyle marker_style = 4;
+  optional bool template_dedup = 5;
 }
 
 message CompressResponse {
   bytes payload = 1;
-  Stats stats   = 2;
+  Stats stats = 2;
 }
 
 message Stats {
-  uint64 bytes_in           = 1;
-  uint64 bytes_out          = 2;
-  uint64 approx_tokens_in   = 3;
-  uint64 approx_tokens_out  = 4;
-  uint64 groups_collapsed   = 5;
-  uint64 exact_runs         = 6;
-  uint64 ws_runs            = 7;
-  uint64 block_repeats      = 8;
-  uint64 template_groups    = 9;
-  bool   degraded           = 10;
-  string noop_reason        = 11;
-  uint64 elapsed_detect_ns  = 12;
+  uint64 bytes_in = 1;
+  uint64 bytes_out = 2;
+  uint64 approx_tokens_in = 3;
+  uint64 approx_tokens_out = 4;
+  uint64 groups_collapsed = 5;
+  uint64 exact_runs = 6;
+  uint64 ws_runs = 7;
+  uint64 block_repeats = 8;
+  uint64 template_groups = 9;
+  bool degraded = 10;
+  string noop_reason = 11;
+  uint64 elapsed_detect_ns = 12;
   uint64 elapsed_compact_ns = 13;
-  uint64 elapsed_splice_ns  = 14;
-  string algo_version       = 15;
-  uint64 templated_blocks   = 16;
-  string options_echo       = 17;
-  uint64 record_splits      = 18;
+  uint64 elapsed_splice_ns = 14;
+  string algo_version = 15;
+  uint64 templated_blocks = 16;
+  string options_echo = 17;
+  uint64 record_splits = 18;
   repeated string restore_ids = 19;
+}
+
+message RestoreRequest {
+  bytes payload = 1;
+  string restore_id = 2;
+}
+
+message RestoreResponse {
+  bytes original = 1;
 }
