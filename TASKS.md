@@ -938,6 +938,149 @@ exit criteria. Gates M1–M4 are blocking milestones.
   implementation (group contiguity, id derivation, coverage width, the shape of
   the degradation, and the walker), frozen here because §5.7 freezes behaviour
   per release. No new dependencies.
+  Status (W2.4): **complete** (2026-09-26). Stage 5 is
+  `quantification_core::detect::blocks::repeated_blocks(span: &[u8], ledger: &mut
+  Ledger, min_block_lines: u32, max_block_lines: u32, scratch: &mut Scratch) ->
+  StageStats`, plus `blocks::Scratch` (caller-owned, as W2.3's:
+  `with_capacity(span_bytes, unit_bytes)`, `Default`, and
+  `reserved() -> (usize, usize)` = the ws-arena and staging-buffer capacities)
+  and the work meter `blocks::Work { pub compares: u64, pub verifications: u64,
+  pub scanned: u64 }` with `Scratch::work() -> Work` and `Scratch::degraded() ->
+  bool`. `span` and `ledger` are W2.2's arguments unchanged (the **full** stage-1/1b
+  unit list of the span, so W2.1's index-derived `removal_range` and W1.2's
+  joiner hazard stay inapplicable); `min_block_lines` / `max_block_lines` are
+  taken as arguments, exactly as W2.2/W2.3 take `min_group_size`, and the
+  pipeline passes `config::MIN_BLOCK_LINES` (2) and `config::MAX_BLOCK_LINES`
+  (64) — §7 has no `RawOptions` field for them, so the consts are the only
+  source. The returned `StageStats` holds only this stage's commits
+  (`block_repeats == groups_collapsed`, all other counters 0) and W2.9 merges it
+  with `StageStats::merge`. Algorithm — one load pass, one capped windowed scan,
+  no superlinear path: (i) **load**: every *residual* (`!is_committed`) and
+  `eligible` unit is ws-normalized once (`wsnorm::normalize_into`, W1.3) into a
+  contiguous arena in `Scratch` and inserted into W1.4's
+  `FingerprintTable::for_keys(span.len())` with the fingerprint computed once
+  (`fingerprint::fingerprint` + the `pub(crate) insert_hashed`, so §4.4.2's
+  byte-length → xxh3-128 → memcmp order is the table's own probe and the hash is
+  never recomputed); the per-unit `Insert::{New, Duplicate(rep)}` outcome is
+  frozen into an integer **representative id** `ids[i]`, so a fingerprint-sequence
+  compare in the scan is one integer equality and no hash table is on the output
+  path at all (§5.1, §5.4). The table never iterates, and the arena is laid out in
+  ascending unit index, so any run of residual eligible units is contiguous in the
+  arena and a block's ws-normalized bytes are one slice. (ii) **scan**: for each
+  start `i` ascending, `L` descends from `min(max, room/2)` to `min`, where
+  `room` is the count of consecutive residual eligible units from `i`; a
+  candidate is accepted when `ids[i+k] == ids[i+L+k]` for all `k < L`, then
+  verified **once** by `memcmp` of the two blocks' ws-normalized arena slices,
+  then the chain is extended (one fingerprint compare + one memcmp per
+  extension, stopping at the first mismatch), then committed with
+  `Proposal::repeat(group, anchor_units = L, CommitKind::Block)` — hence
+  `count = copies - 1` (§4.7) and the §4.4 gate prices the emitted count at its
+  exact decimal width. `room` is tracked with one monotonically advancing cursor,
+  not recomputed per start, so the whole stage is `O(N · max_block_lines)`
+  fingerprint compares plus `O(N)` free-run probes. The **anchor** is the whole
+  first occurrence as **raw original bytes** (W2.7 emits `span[anchor]`), and
+  only `eligible` units are ever loaded, so an over-cap record is a wall that is
+  never normalized, never hashed and never folded. Frozen readings: (a) the
+  commit decision is left entirely to `Ledger::try_commit`; on `Committed` the
+  scan **resumes after the committed region** (`i = group.end`) and on any
+  rejection (in practice `BelowThreshold`) it advances by one unit and does
+  **not** retry a shorter `L` at the same start, mirroring W2.2's (a) — a
+  sub-range has strictly smaller `removed_bytes` and a no-larger marker, so it
+  can never be more profitable. (b) `min`/`max` are clamped to ≥ 1, and a
+  `min > max` pair is the empty candidate range (nothing commits) rather than a
+  silent swap. (c) The chain is capped by `room` only — the number of *copies* is
+  not bounded by `max_block_lines`, which caps the *period* `L` as §7 says, so a
+  long repeat is one commit whose anchor is `L` lines and whose count is
+  `copies - 1`. (d) The `FingerprintTable` is allocated per call (one per span;
+  `FingerprintTable` has no `clear`, and W1.4's §7 cap makes its worst case
+  ≈12 MiB independent of span size), and the arena / `norm` / `ids` vectors keep
+  their capacity across spans because they live in the caller-owned `Scratch`.
+  (e) **`Insert::Full` degrades the whole span to pass-through**: the load is
+  abandoned, `ids`/`norm` are reset to all-`None`, the stage returns default
+  stats (zero commits, the span byte-identical, every unit still free and
+  residual for stages 6–7) and `Scratch::degraded()` reports `true` — it never
+  panics and never commits a truncated prefix. `Insert::Full` is W1.4's
+  `is_full()` condition evaluated at the insert that would cross the cap, so no
+  span is degraded that could still have been served; a `degraded` span is *not*
+  re-served by a later stage because the next stage builds its own table.
+  (f) The windowed scan itself is the `pub(crate)` seam
+  `windowed_blocks(ledger, ids: &[Option<usize>], min, max, same_bytes: &mut
+  impl FnMut(usize, usize, usize) -> bool, work: &mut Work) -> StageStats`, so
+  W2.8 re-runs the *same* leftmost-then-longest walker over W2.5's
+  `Forms::id` sequence with `min = 1` and a memcmp closure over
+  `Forms::masked` — the ordering, chain-extension and commit rules are written
+  once. (g) `Work` is diagnostic only (§6.2's `Stats` is untouched): it makes
+  the §4.4 "no superlinear path" claim *testable* rather than a prose promise.
+  Tests: 19 integration tests in `crates/core/tests/detect_blocks.rs` (core
+  total 266 = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1
+  locator-alloc + 9 mask + 11 render + 10 splice + 16 sniff + 31 splitter + 8 ws +
+  14 exact runs + 13 ws runs + 17 template groups + 19 block runs; workspace
+  total 276, of which 10 are W2.5's and 10 W1.6's proto unit tests). Exit
+  criteria met: a 2-line block behind **two header lines** commits as one
+  `Block` (count 2, anchor = both header-less first-occurrence lines, `removed` =
+  the six members plus joiners, headers left residual) on a span where
+  `exact_runs` and `ws_runs` both commit nothing — the exact rev-3 → rev-4 case
+  that the failure-function formulation missed; **leftmost-then-longest** is
+  pinned twice: `a b a b c a b c` commits only `0..4` (the 3-line block starting
+  at 2 is proven block-equal in the normalized domain and is nevertheless lost),
+  and the same six units *alone* commit the 3-line block, while `a b` × 4
+  commits one `L = 4` group with a four-line anchor and `count = 1` — the `L = 2`
+  reading would have emitted `count = 3`; the chain-extension test
+  (`a b a b a b a ≠b`) commits three copies with `count = 2` and leaves the
+  divergent pair verbatim; the single-memcmp path is pinned by
+  `work().verifications == 1` for a two-copy block, `== 2` for the
+  three-copy-then-divergent chain (verification + the failing extension) and `== 0`
+  when no candidate ever matches; a below-threshold block (a
+  4-unit `L = 2` block of 4–5-byte lines, `anchor = 10`, `removed = 24`, so
+  `10 + 22 ≥ 24`) claims nothing, stays free and residual, re-splices to the
+  input byte for byte, and its 30-byte-line twin commits; the gate boundary is pinned to the
+  **emitted** count (8 alternating 1-byte lines ⇒ `count 3`, `!profitable`, 10
+  lines ⇒ `count 4`, `profitable`); the anchor is byte-identical to the raw
+  first occurrence of a block whose members differ **only in padding** (`\t` vs
+  ` \t ` vs `\t\t`, unequal raw lengths, equal normalized forms), is asserted
+  `!=` its own normalized form, and the spliced output is pinned to
+  `anchor bytes + marker` exactly; `min_block_lines` 3 and 9 refuse a 2-line
+  block, and a 3×70-line block is **invisible** at `max_block_lines = 64` (no
+  `L ≤ 64` is a multiple of the 70-line period) and commits at 128 with a
+  70-line anchor; stage-1b record blocks are committed over `,` joiners
+  (`removed = 6·200 + 5`, anchor = the two raw first-occurrence records) and an
+  over-cap record splits them into two commits while staying unclaimed and free,
+  with the same dump minus the wall committing as one `L = 4` group; blocks never
+  straddle a region committed by stages 3–4 or by this stage (a hand-committed
+  `2..4` leaves the residual `[0,1,4,5]` and a 12-unit span then commits
+  `4..12`); a **unique-line flood of 200 004 units** returns default stats, zero
+  commits, a byte-identical span, `degraded() == true` and `verifications == 0`
+  — and because the block sits at the *front* of that span, the zero commits also
+  pin that the degradation is whole-span rather than a truncated prefix — while an
+  8-line control span still commits through the same scratch; the
+  **KMP-adversarial payload** (a period of 129 = `2·max_block_lines + 1` lines —
+  highly repetitive, and the worst case for a periodicity formulation, since no
+  `L ≤ 64` is a period) over 40 000 units commits nothing, performs **zero**
+  verification memcmps and stays inside the capped work bound
+  (`compares ≤ 63·N`, `scanned ≤ N`, `compares + scanned ≤ 65·N`, and the same
+  work for twice the units within `2·(half) + 2·max²`), and the same payload
+  with a 4-line block prepended still commits that block after the adversarial
+  prefix; a generated 60-group span is byte-identical across two ledgers and two
+  differently-sized scratches (identical `commits()` and spliced output), a
+  re-run on a committed ledger is a no-op, the scratch keeps its capacities
+  across a following small span, and the module is source-scanned for the
+  §5.1–§5.5 banned inputs. Deviations from DESIGN: none — §4.4.5's windowed
+  scan, its comparison domain, the stage ordering, the anchor rule, §4.4.1b's
+  removal rule, the §4.4 profitability gate and §7's table-cap degradation are
+  implemented as written and DESIGN.md is not amended. One consequence of the
+  normative order is recorded rather than worked around: because the candidate
+  length is bounded but the **chain is not**, a 4-copy 2-line repeat is committed
+  as the longest admissible period (`L = 4`, one 4-line anchor, `count = 1`)
+  rather than as `L = 2` with `count = 3` — same anchor bytes preserved, same
+  bytes destroyed, and the §4.4 gate prefers the larger `removed_bytes` anyway.
+  Likewise the gate's decimal-width carry is *unreachable* for block shapes (a
+  commit needs `P·count > 22 + width(count)` for a per-copy cost `P ≥ 3`, and no
+  integer `P` puts `count = 9` and `count = 10` on opposite sides of it), so the
+  width itself stays pinned by `ledger::marker_len` rather than by a block
+  fixture. The readings in (a)–(g) resolve the points §4.4/§7/§8 leave to the
+  implementation (rejection handling, parameter clamping, chain extent, table
+  lifetime, the degradation shape, the W2.8 seam, and the work meter), frozen
+  here because §5.7 freezes behaviour per release. No new dependencies.
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
   Status: **complete** (2026-09-26). The module is
