@@ -730,6 +730,91 @@ exit criteria. Gates M1–M4 are blocking milestones.
   profitability gate are implemented as written and DESIGN.md is not amended.
   The readings in (a)–(d) resolve points §4.4 leaves to the implementation,
   frozen here because §5.7 freezes behaviour per release. No new dependencies.
+  Status (W2.3): **complete** (2026-09-26). Stage 4 is
+  `quantification_core::detect::wsruns::ws_runs(span: &[u8], ledger: &mut
+  Ledger, min_group_size: u32, scratch: &mut Scratch) -> StageStats`, plus
+  `wsruns::Scratch` (`#[derive(Default)]`, `Scratch::with_capacity(head, next)`
+  and `Scratch::reserved() -> (usize, usize)` for introspection). `span`,
+  `ledger` and `min_group_size` are W2.2's arguments unchanged, so the two
+  stages differ in exactly one thing: the comparison. Stage 4's comparison
+  domain is the §4.2 **ws-normalized** form of each unit, produced by
+  `wsnorm::normalize_into` (W1.3) into the two caller-owned `Scratch` buffers,
+  and the equality claim is verified in the same normative order — normalized
+  byte-length → xxh3-128 of the normalized form → `memcmp` of the normalized
+  bytes (`fingerprint::fingerprint`) — so a pair that is equal normalized but
+  differs raw is merged, exactly as §4.4's comparison-domain paragraph
+  prescribes. The **anchor is always the raw original escaped bytes** (the
+  ledger's anchor range is a sub-range of the removal range and W2.7 emits
+  `span[anchor]`, never a normalized or masked form), so a merged group's
+  marker checksum and echoed line are the first member verbatim. Everything
+  else is inherited literally from W2.2 by construction: both stages call the
+  same `pub(crate) detect::exact::walk_runs`, hence the same residual-only walk
+  (an unclaimed unit is the only candidate, so a run can never straddle an
+  earlier stage's committed region), the same `eligible`-only rule (an over-cap
+  record is a verbatim wall that is never normalized, never grouped and never
+  committed), the same `min_group_size.max(2)` floor, the same maximal-run
+  proposal, the same "skip a rejected run whole" rule, the same
+  `Proposal::run(group, CommitKind::WsRun)` commit (hence the removal rule and
+  the §4.4 gate, with the omitted-copy count priced at its exact decimal
+  width), and the same ascending-index discovery order — leftmost-first with no
+  hash table on the path (§5.1, §5.4). Frozen readings: (a) the `Scratch` is
+  **caller-owned and reused**, so the pipeline allocates it once per compaction
+  pass and hands the same `&mut Scratch` to every span; `with_capacity` is
+  sized by the longest unit of the span (the normalized form never grows, so
+  the buffers never reallocate) and `default()` grows to at most 2× that;
+  `reserved()` exposes the capacities so the property is assertable — this is
+  the "no per-line allocation" requirement, pinned by test over 2000 lines
+  rather than by a global-allocator harness. (b) The run head is
+  re-normalized into `Scratch::head` for every candidate instead of being
+  cached, which keeps the walker free of per-run state and the total work
+  linear in span bytes; the same reading as W2.2 (b). (c) The stage-4 gate
+  flag is **not** a parameter: `normalize_ws = false` means the pipeline skips
+  stage 4 altogether (there is nothing to configure per call), which is why
+  W2.2's raw-domain detector must not and does not know the option. (d) No
+  `FingerprintTable` here either, for W2.2's reason (c).
+  Tests: 13 integration tests in `crates/core/tests/detect_wsruns.rs` (core total
+  230 = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 11 render + 16 sniff + 10 splice + 31 splitter + 8 ws + 14 exact runs
+  + 13 ws runs; workspace total 240, of which 10 are W2.7's and 10 W1.6's proto
+  unit tests).
+  Exit criteria met: a four-line span whose raw lengths all differ
+  (`\t` = 31 B, five spaces = 34 B, mixed = 34 B, plain = 30 B) and whose
+  normalized forms are equal is committed by **stage 4 alone** — the same span
+  and ledger through `exact_runs` yields zero commits — as one `WsRun` with
+  count 3, `removed` = Σ raw lengths + `2*3`, marker length 31; the anchor is
+  pinned to the raw `\t` bytes and asserted to differ from its own normalized
+  form (so the anchor is raw, not normalized); a 3×raw-identical run followed by
+  a 3×ws-equal run commits as `ExactRun 0..2` then `WsRun 3..5`, i.e. stage 4
+  only ever sees the residual; a below-threshold ws run (three 7–8-byte padded
+  forms) claims nothing, stays free and residual, and the same shape with
+  31-byte lines commits, so the rejection is the gate and not a grouping
+  failure; `min_group_size` 3 refuses a two-member ws group and 2 commits it
+  (`count = 1`, 31-byte marker), 4 refuses a three-member one; an over-cap
+  record in the middle of a 401-record dump splits two ws runs, is itself never
+  normalized into a group (`is_free`, unclaimed), leaves the bracket-carrying
+  `u_head`/`u_tail` verbatim, and the same dump commits nothing through
+  `exact_runs`; a 400-record single-line tool dump whose records differ only in
+  `\t` vs `\r` padding (equal normalized, unequal raw, and no two adjacent raw
+  forms equal) commits as one ws run over the 398 middle records with
+  `removed` = `398*200 + 397` and a normalized-equal anchor/member pair; a ws
+  run never straddles a committed exact run (with `2..4` claimed by stage 3 the
+  ws detector commits only `0..1`, the residual `[0,1,4,5]`-style fragment and
+  unit 4 stay verbatim, and the same ledger pre-committed by hand gives the
+  identical two commits); leading/trailing/interior padding collapses to one
+  form and the anchor keeps its edge whitespace; the scratch is asserted to
+  stay at its pre-sized capacity across a 2000-line span and a subsequent
+  small span, a `default()` scratch stays within 2× the longest unit, and both
+  produce identical commits; empty, single-unit and single-over-cap-line spans
+  commit nothing; determinism is checked over two 400-line LCG spans with
+  random padding (two ledgers and two differently-initialised scratches ⇒
+  identical `commits()` and byte-identical spliced output assembled in-test),
+  and a re-run on a committed ledger changes nothing; determinism inputs are
+  source-scanned. Deviations from DESIGN: none — §4.4.4, §4.2's escape-unit
+  collapse, the comparison-domain paragraph, the removal rule and the
+  profitability gate are implemented as written and DESIGN.md is not amended.
+  The readings in (a)–(d) resolve points §4.4/§8 leave to the implementation
+  (scratch ownership and where the `normalize_ws` switch lives), frozen here
+  because §5.7 freezes behaviour per release. No new dependencies.
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
   Status: **complete** (2026-09-26). The module is
