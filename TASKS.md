@@ -544,7 +544,9 @@ exit criteria. Gates M1–M4 are blocking milestones.
   one normative gate all five detectors share, strict `<`;
   `removal_range(&[Unit], Range<usize>) -> Range<usize>` (the normative
   removal rule); `Proposal {group, anchor_units, count, kind}` with
-  `Proposal::new(..)` and `Proposal::run(group, kind)`;
+  `Proposal::new(..)`, `Proposal::run(group, kind)` (line groups, stages
+  3/4/6) and `Proposal::repeat(group, anchor_units, kind)` (block groups,
+  stages 5/7);
   `Commit {kind, first, last, count, anchor, removed}` + `members()`;
   `CommitOutcome {Committed(Commit), InvalidGroup, InvalidAnchor,
   InvalidCount, Ineligible, Overlapped, BelowThreshold}`;
@@ -580,15 +582,25 @@ exit criteria. Gates M1–M4 are blocking milestones.
   `commits.partition_point(|c| c.anchor.start < new.anchor.start)`, so
   `commits()` is ascending by anchor byte offset whatever the discovery
   order — no sort at the end, no hash-table iteration anywhere. (f)
-  `Proposal::run` derives `count` from the group length, so the emitted
-  `N` is the number of copies **including the anchor** (frozen reading of the
-  §4.5 `×N` wording, which leaves the anchor in/out unstated); `count == 0`
-  and `anchor_units == 0` are rejected. (g) `MarkerStyle::Auto` is refused by
+  **The marker count is the number of copies omitted, not the group size.**
+  DESIGN.md:493 glosses the grammar as `⟪… ×N⟫` ≈ "N omitted identical rows",
+  and §4.7's information-loss table puts the count on the *destroyed* side
+  ("first copy verbatim + count" kept / "every other copy in full"
+  destroyed); §1's worked example agrees (one literal line plus
+  `...(x200 more)...` ⇒ `⟪×200 rows, template⟫`, i.e. 201 total). Hence
+  `Proposal::run` derives `count = group.len() - 1` for stages 3/4/6 and
+  `Proposal::repeat` derives `count = copies - 1` for stages 5/7
+  (`copies = group.len() / anchor_units`) — the `-1` is applied where the
+  count is **derived**, not at render time, so the §4.4 gate prices the
+  exact decimal width of the count actually emitted (a 200-copy run emits
+  `×199`, a 10-member run `×9`, an 11-member run `×10`); `count == 0` and
+  `anchor_units == 0` are rejected, so a 2-member run is `N = 1` and commits
+  whenever it is profitable. (g) `MarkerStyle::Auto` is refused by
   `Ledger::new` — the caller (W2.9) resolves auto/ascii per span first,
-  because the gate's `marker_bytes` depends on the style. Tests: 31
-  integration tests in `crates/core/tests/ledger.rs` (core total 175 =
-  23 lib unit + 8 fingerprint + 31 ledger + 48 locator + 1 locator-alloc +
-  9 mask + 16 sniff + 31 splitter + 8 ws; workspace total 185, of which
+  because the gate's `marker_bytes` depends on the style. Tests: 38
+  integration tests in `crates/core/tests/ledger.rs` (core total 182 =
+  23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 16 sniff + 31 splitter + 8 ws; workspace total 192, of which
   proto/server 10). Exit criteria met:
   removal-rule ranges are pinned for `\n`/2-byte, 6-byte `\u000A`/`\u000a`,
   concatenated-boundary and `,` joiners, for multi-member and single-member
@@ -601,8 +613,21 @@ exit criteria. Gates M1–M4 are blocking milestones.
   one byte either side; `decimal_width` is pinned against
   `u64::to_string().len()` for 0/1/9/10/99/100/999/1000/9999/10000/10^6/
   `u64::MAX` and `marker_len` is pinned for all ten kind×style shapes (with
-  the width carry at 10, 100 and 1000); emit order is asserted for a
-  back-to-front discovery order and for three orderings of the same span;
+  the width carry at 10, 100 and 1000); the omitted-count semantics are
+  pinned on the rendered marker *bytes* (assembled in-test from the frozen
+  `framing`/`core`/`decimal_width`/`CCCC` pieces) for 2-, 10-, 11- and
+  200-member exact runs and for block groups of 2×3 and 3×2 units —
+  `⟪×1 identical ·4141⟫`, `⟪×9 identical ·72bf⟫`, `⟪×10 identical ·72bf⟫`,
+  `⟪×199 identical ·72bf⟫`, `⟪block ×1 ·1c69⟫`, `⟪block ×2 ·0e13⟫` and
+  their ascii twins (`[... x1 identical 4141 ...]`, `[... x9 identical
+  72bf ...]`, `[... x10 identical 72bf ...]`, `[... x199 identical 72bf
+  ...]`, `[... block x1 1c69 ...]`, `[... block x2 0e13 ...]`); the gate is
+  pinned on the *emitted* count's width at the decimal carry: a 10-member run
+  of 1-byte lines commits (1 + 26 < 28) exactly where pricing `N = 10` would
+  have rejected it, an 11-member run emits the 2-digit `×10`
+  (1 + 27 < 29), and `marker_len(10) - marker_len(9) == 1`; emit order is
+  asserted for a back-to-front discovery order and for three orderings of
+  the same span;
   overlap rejection covers a proposal overlapping from the left, the right,
   both sides, a span crossing a committed region, an adjacent (legal)
   neighbour commit, and `is_committed`/`is_free`/`residual` afterwards. The
@@ -619,9 +644,12 @@ exit criteria. Gates M1–M4 are blocking milestones.
   anchor-offset emit order and the §6.2 counter set are implemented as
   written and DESIGN.md is not amended. The readings frozen in (a)–(g) above
   resolve points §4.4/§4.5 leave to the implementation, frozen here because
-  §5.7 freezes behaviour per release; the one worth a second reader's eye is
-  (f), the `N`-includes-the-anchor convention, which W2.2–W2.8 inherit for
-  free. No new dependencies.
+  §5.7 freezes behaviour per release. (f) is no longer a judgement call: it is
+  pinned to DESIGN.md:493, which §4.7's table and §1's worked example both
+  corroborate, so the `N`-includes-the-anchor reading the first W2.1 commit
+  froze is corrected — W2.2–W2.8 inherit the omitted-copy convention for free
+  by calling `Proposal::run` / `Proposal::repeat` instead of counting
+  themselves. No new dependencies.
 - **W2.2 Stage 3 exact runs** ∥ **W2.3 Stage 4 ws-runs** ∥
   **W2.4 Stage 5 repeated blocks** (ws-normalized domain) ∥
   **W2.5 Stage 6 template groups** — all after W2.1

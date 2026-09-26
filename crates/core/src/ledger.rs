@@ -104,8 +104,12 @@ impl Proposal {
     }
 
     pub fn run(group: Range<usize>, kind: CommitKind) -> Self {
-        let count = group.len() as u64;
-        Self::new(group, 1, count, kind)
+        Self::repeat(group, 1, kind)
+    }
+
+    pub fn repeat(group: Range<usize>, anchor_units: usize, kind: CommitKind) -> Self {
+        let copies = group.len().checked_div(anchor_units).unwrap_or(0);
+        Self::new(group, anchor_units, copies.saturating_sub(1) as u64, kind)
     }
 }
 

@@ -1,9 +1,10 @@
 use std::ops::Range;
 
 use quantification_core::config::{MAX_LINE_BYTES, MAX_RECORD_BYTES, MarkerStyle};
+use quantification_core::fingerprint::marker_checksum;
 use quantification_core::ledger::{
-    Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, decimal_width, marker_len,
-    profitable, removal_range,
+    Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, decimal_width, framing,
+    marker_len, profitable, removal_range,
 };
 use quantification_core::stage1::{Unit, joiner, split_span};
 
@@ -49,6 +50,21 @@ fn committed(outcome: CommitOutcome) -> Commit {
         CommitOutcome::Committed(commit) => commit,
         other => panic!("expected a commit, got {other:?}"),
     }
+}
+
+fn render(style: MarkerStyle, kind: CommitKind, count: u64, anchor: &[u8]) -> String {
+    let (open, sep, close) = framing(style);
+    let (prefix, suffix) = kind.core(style);
+    let marker = format!(
+        "{open}{prefix}{count}{suffix}{sep}{:04x}{close}",
+        marker_checksum(anchor)
+    );
+    assert_eq!(marker.len(), marker_len(style, kind, count));
+    marker
+}
+
+fn commit_of(units: &[Unit], proposal: Proposal) -> Commit {
+    committed(ledger(units).try_commit(proposal))
 }
 
 fn assert_removal_invariant(units: &[Unit], group: &Range<usize>, removed: &Range<usize>) {
@@ -179,7 +195,7 @@ fn removal_range_handles_line_and_record_joiners_in_one_span() {
     let mut ledger = ledger(&units);
     let lines = committed(ledger.try_commit(Proposal::run(0..3, CommitKind::WsRun)));
     let records = committed(ledger.try_commit(Proposal::run(5..8, CommitKind::Block)));
-    let head = committed(ledger.try_commit(Proposal::new(3..5, 1, 2, CommitKind::Block)));
+    let head = committed(ledger.try_commit(Proposal::repeat(3..5, 1, CommitKind::Block)));
     assert_eq!(lines.removed, 0..units[2].range.end);
     assert_eq!(lines.removed.len(), 3 * 30 + 2 * 2);
     assert_eq!(records.removed.len(), 3 * 200 + 2);
@@ -267,7 +283,9 @@ fn ledger_never_inflates_removed_bytes_after_earlier_commits() {
 
 #[test]
 fn gate_rejects_exact_equality() {
-    let marker = marker_len(UNICODE, CommitKind::ExactRun, 3);
+    let count = Proposal::run(0..3, CommitKind::ExactRun).count;
+    assert_eq!(count, 2);
+    let marker = marker_len(UNICODE, CommitKind::ExactRun, count);
     let span = line_span(3, 11);
     let units = split_span(&span);
     assert_eq!(span.len(), 3 * 11 + 2 * 2);
@@ -280,14 +298,14 @@ fn gate_rejects_exact_equality() {
     assert!(!profitable(
         UNICODE,
         CommitKind::ExactRun,
-        3,
+        count,
         11,
         span.len()
     ));
     assert!(profitable(
         UNICODE,
         CommitKind::ExactRun,
-        3,
+        count,
         11,
         span.len() + 1
     ));
@@ -297,7 +315,8 @@ fn gate_rejects_exact_equality() {
 
 #[test]
 fn gate_commits_one_byte_below_equality_and_keeps_verbatim_above() {
-    let marker = marker_len(UNICODE, CommitKind::ExactRun, 3);
+    let count = Proposal::run(0..3, CommitKind::ExactRun).count;
+    let marker = marker_len(UNICODE, CommitKind::ExactRun, count);
     assert_eq!(marker, 26);
     let wide = split_span(&line_span(3, 12));
     let mut wide_ledger = ledger(&wide);
@@ -319,7 +338,8 @@ fn gate_commits_one_byte_below_equality_and_keeps_verbatim_above() {
 
 #[test]
 fn gate_boundary_holds_for_the_ascii_style_too() {
-    let marker = marker_len(ASCII, CommitKind::WsRun, 3);
+    let count = Proposal::run(0..3, CommitKind::WsRun).count;
+    let marker = marker_len(ASCII, CommitKind::WsRun, count);
     assert_eq!(marker, 32);
     let exact = split_span(&line_span(3, 14));
     assert_eq!(14 + marker, 3 * 14 + 4);
@@ -470,9 +490,9 @@ fn marker_len_is_pinned_for_every_kind_and_style() {
 fn emitted_order_follows_anchor_offsets_not_discovery_order() {
     let units = split_span(&line_span(6, 40));
     let mut ledger = ledger(&units);
-    let last = committed(ledger.try_commit(Proposal::new(4..6, 1, 2, CommitKind::Block)));
-    let first = committed(ledger.try_commit(Proposal::new(0..2, 1, 2, CommitKind::ExactRun)));
-    let middle = committed(ledger.try_commit(Proposal::new(2..4, 1, 2, CommitKind::WsRun)));
+    let last = committed(ledger.try_commit(Proposal::new(4..6, 1, 1, CommitKind::Block)));
+    let first = committed(ledger.try_commit(Proposal::new(0..2, 1, 1, CommitKind::ExactRun)));
+    let middle = committed(ledger.try_commit(Proposal::new(2..4, 1, 1, CommitKind::WsRun)));
     assert_eq!(
         ledger.commits(),
         [first.clone(), middle.clone(), last.clone()]
@@ -521,34 +541,184 @@ fn emitted_order_is_stable_across_repeated_detector_orders() {
 fn block_anchors_cover_the_whole_first_occurrence() {
     let units = split_span(&line_span(6, 30));
     let mut ledger = ledger(&units);
-    let commit = committed(ledger.try_commit(Proposal::new(0..6, 2, 3, CommitKind::Block)));
+    let commit = committed(ledger.try_commit(Proposal::repeat(0..6, 2, CommitKind::Block)));
     assert_eq!(commit.anchor, removal_range(&units, 0..2));
     assert_eq!(commit.removed, removal_range(&units, 0..6));
     assert_eq!(commit.members(), 6);
-    assert_eq!(commit.count, 3);
+    assert_eq!(commit.count, 2);
     assert!(commit.anchor.start >= commit.removed.start && commit.anchor.end <= commit.removed.end);
     assert!(profitable(
         UNICODE,
         CommitKind::Block,
-        3,
+        2,
         2 * 30 + 2,
         commit.removed.len()
     ));
 }
 
 #[test]
-fn run_proposals_derive_the_repeat_count_from_the_group() {
+fn run_proposals_derive_the_omitted_count_from_the_group() {
     let units = split_span(&line_span(5, 20));
     let proposal = Proposal::run(1..4, CommitKind::WsRun);
     assert_eq!(proposal.anchor_units, 1);
-    assert_eq!(proposal.count, 3);
+    assert_eq!(proposal.count, 2);
     let mut ledger = ledger(&units);
     let commit = committed(ledger.try_commit(proposal));
-    assert_eq!(commit.count, 3);
+    assert_eq!(commit.count, 2);
     assert_eq!(commit.members(), 3);
     assert_eq!(commit.kind, CommitKind::WsRun);
     assert_eq!(commit.first, 1);
     assert_eq!(commit.last, 3);
+    assert_eq!(Proposal::run(0..1, CommitKind::ExactRun).count, 0);
+    assert_eq!(
+        ledger.try_commit(Proposal::run(4..5, CommitKind::ExactRun)),
+        CommitOutcome::InvalidCount
+    );
+}
+
+#[test]
+fn a_two_member_run_renders_one_omitted_copy() {
+    let span = line_span(2, 30);
+    let units = split_span(&span);
+    let anchor = &span[units[0].range.clone()];
+    let commit = commit_of(&units, Proposal::run(0..2, CommitKind::ExactRun));
+    assert_eq!(commit.count, 1);
+    assert_eq!(commit.members(), 2);
+    assert_eq!(decimal_width(commit.count), 1);
+    assert_eq!(
+        render(UNICODE, CommitKind::ExactRun, commit.count, anchor),
+        "\u{27ea}\u{d7}1 identical \u{b7}4141\u{27eb}"
+    );
+    assert_eq!(
+        render(ASCII, CommitKind::ExactRun, commit.count, anchor),
+        "[... x1 identical 4141 ...]"
+    );
+}
+
+#[test]
+fn a_ten_member_run_renders_nine_omitted_copies() {
+    let span = line_span(10, 20);
+    let units = split_span(&span);
+    let anchor = &span[units[0].range.clone()];
+    let commit = commit_of(&units, Proposal::run(0..10, CommitKind::ExactRun));
+    assert_eq!(commit.count, 9);
+    assert_eq!(commit.members(), 10);
+    assert_eq!(decimal_width(commit.count), 1);
+    assert_eq!(
+        render(UNICODE, CommitKind::ExactRun, commit.count, anchor),
+        "\u{27ea}\u{d7}9 identical \u{b7}72bf\u{27eb}"
+    );
+    assert_eq!(
+        render(ASCII, CommitKind::ExactRun, commit.count, anchor),
+        "[... x9 identical 72bf ...]"
+    );
+}
+
+#[test]
+fn an_eleven_member_run_renders_ten_omitted_copies_across_the_width_carry() {
+    let span = line_span(11, 20);
+    let units = split_span(&span);
+    let anchor = &span[units[0].range.clone()];
+    let commit = commit_of(&units, Proposal::run(0..11, CommitKind::ExactRun));
+    assert_eq!(commit.count, 10);
+    assert_eq!(commit.members(), 11);
+    assert_eq!(decimal_width(commit.count), 2);
+    assert_eq!(
+        render(UNICODE, CommitKind::ExactRun, commit.count, anchor),
+        "\u{27ea}\u{d7}10 identical \u{b7}72bf\u{27eb}"
+    );
+    assert_eq!(
+        render(ASCII, CommitKind::ExactRun, commit.count, anchor),
+        "[... x10 identical 72bf ...]"
+    );
+}
+
+#[test]
+fn a_two_hundred_copy_run_renders_one_hundred_ninety_nine() {
+    let span = line_span(200, 20);
+    let units = split_span(&span);
+    let anchor = &span[units[0].range.clone()];
+    let commit = commit_of(&units, Proposal::run(0..200, CommitKind::ExactRun));
+    assert_eq!(commit.count, 199);
+    assert_eq!(commit.members(), 200);
+    assert_eq!(commit.anchor.len(), 20);
+    assert_eq!(commit.removed.len(), 200 * 20 + 2 * 199);
+    assert_eq!(
+        render(UNICODE, CommitKind::ExactRun, commit.count, anchor),
+        "\u{27ea}\u{d7}199 identical \u{b7}72bf\u{27eb}"
+    );
+    assert_eq!(
+        render(ASCII, CommitKind::ExactRun, commit.count, anchor),
+        "[... x199 identical 72bf ...]"
+    );
+}
+
+#[test]
+fn a_block_group_of_two_three_unit_copies_renders_one_omitted_copy() {
+    let span = line_span(6, 20);
+    let units = split_span(&span);
+    let anchor = &span[removal_range(&units, 0..3)];
+    let commit = commit_of(&units, Proposal::repeat(0..6, 3, CommitKind::Block));
+    assert_eq!(commit.count, 1);
+    assert_eq!(commit.members(), 6);
+    assert_eq!(commit.anchor.len(), 3 * 20 + 2 * 2);
+    assert_eq!(
+        render(UNICODE, CommitKind::Block, commit.count, anchor),
+        "\u{27ea}block \u{d7}1 \u{b7}1c69\u{27eb}"
+    );
+    assert_eq!(
+        render(ASCII, CommitKind::Block, commit.count, anchor),
+        "[... block x1 1c69 ...]"
+    );
+}
+
+#[test]
+fn a_block_group_of_three_two_unit_copies_renders_two_omitted_copies() {
+    let span = line_span(6, 20);
+    let units = split_span(&span);
+    let anchor = &span[removal_range(&units, 0..2)];
+    let commit = commit_of(&units, Proposal::repeat(0..6, 2, CommitKind::Block));
+    assert_eq!(commit.count, 2);
+    assert_eq!(commit.members(), 6);
+    assert_eq!(commit.anchor.len(), 2 * 20 + 2);
+    assert_eq!(
+        render(UNICODE, CommitKind::Block, commit.count, anchor),
+        "\u{27ea}block \u{d7}2 \u{b7}0e13\u{27eb}"
+    );
+    assert_eq!(
+        render(ASCII, CommitKind::Block, commit.count, anchor),
+        "[... block x2 0e13 ...]"
+    );
+}
+
+#[test]
+fn the_gate_prices_the_width_of_the_emitted_omitted_count() {
+    let ten = split_span(&line_span(10, 1));
+    let ten_commit = commit_of(&ten, Proposal::run(0..10, CommitKind::ExactRun));
+    assert_eq!(ten_commit.count, 9);
+    assert_eq!(ten_commit.anchor.len(), 1);
+    assert_eq!(ten_commit.removed.len(), 10 + 2 * 9);
+    assert_eq!(marker_len(UNICODE, CommitKind::ExactRun, 9), 26);
+    assert!(!profitable(UNICODE, CommitKind::ExactRun, 9, 1, 27));
+    assert!(profitable(UNICODE, CommitKind::ExactRun, 9, 1, 28));
+    assert!(!profitable(UNICODE, CommitKind::ExactRun, 10, 1, 28));
+    let eleven = split_span(&line_span(11, 1));
+    let eleven_commit = commit_of(&eleven, Proposal::run(0..11, CommitKind::ExactRun));
+    assert_eq!(eleven_commit.count, 10);
+    assert_eq!(eleven_commit.anchor.len(), 1);
+    assert_eq!(eleven_commit.removed.len(), 11 + 2 * 10);
+    assert_eq!(marker_len(UNICODE, CommitKind::ExactRun, 10), 27);
+    assert!(!profitable(UNICODE, CommitKind::ExactRun, 10, 1, 28));
+    assert!(profitable(UNICODE, CommitKind::ExactRun, 10, 1, 29));
+    assert_eq!(
+        marker_len(UNICODE, CommitKind::ExactRun, 10)
+            - marker_len(UNICODE, CommitKind::ExactRun, 9),
+        1
+    );
+    assert_eq!(
+        render(UNICODE, CommitKind::ExactRun, ten_commit.count, b"x").len() + 1,
+        render(UNICODE, CommitKind::ExactRun, eleven_commit.count, b"x").len()
+    );
 }
 
 #[test]
@@ -640,6 +810,14 @@ fn invalid_groups_and_anchors_are_rejected() {
     );
     assert_eq!(
         ledger.try_commit(Proposal::new(0..3, 1, 0, CommitKind::ExactRun)),
+        CommitOutcome::InvalidCount
+    );
+    assert_eq!(
+        ledger.try_commit(Proposal::repeat(0..3, 0, CommitKind::Block)),
+        CommitOutcome::InvalidAnchor
+    );
+    assert_eq!(
+        ledger.try_commit(Proposal::repeat(0..3, 3, CommitKind::Block)),
         CommitOutcome::InvalidCount
     );
     assert_eq!(ledger.commits().len(), 0);
@@ -792,7 +970,7 @@ fn stage_stats_from_ledger_commits_cover_every_detector() {
         (4..6, CommitKind::Block),
         (6..8, CommitKind::TemplateGroup),
     ] {
-        stats.bump(committed(ledger.try_commit(Proposal::new(group, 1, 2, kind))).kind);
+        stats.bump(committed(ledger.try_commit(Proposal::new(group, 1, 1, kind))).kind);
     }
     assert_eq!(stats.groups_collapsed, 4);
     assert_eq!(stats.exact_runs, 1);
