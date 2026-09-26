@@ -28,3 +28,9 @@ name = "fuzz_splitter"
 path = "fuzz_targets/fuzz_splitter.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_pipeline"
+path = "fuzz_targets/fuzz_pipeline.rs"
+test = false
+doc = false

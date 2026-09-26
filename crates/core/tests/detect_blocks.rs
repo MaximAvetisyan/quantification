@@ -307,9 +307,9 @@ fn the_longest_candidate_at_a_start_wins() {
     let mut scratch = Scratch::default();
     assert_eq!(stage(&span, &mut ledger, &mut scratch).block_repeats, 1);
     let commit = &ledger.commits()[0];
-    assert_eq!((commit.first, commit.last, commit.count), (0, 7, 1));
-    assert_eq!(commit.anchor, units[0].range.start..units[3].range.end);
-    assert_eq!(&span[commit.anchor.clone()], lines_span(&[L0, L1, L0, L1]));
+    assert_eq!((commit.first, commit.last, commit.count), (0, 7, 3));
+    assert_eq!(commit.anchor, units[0].range.start..units[1].range.end);
+    assert_eq!(&span[commit.anchor.clone()], lines_span(&[L0, L1]));
     assert_eq!(marker_len(UNICODE, commit.kind, commit.count), 22);
     assert!(profitable(
         UNICODE,
@@ -599,10 +599,10 @@ fn a_block_never_folds_an_over_cap_record() {
         1
     );
     let commit = &whole_ledger.commits()[0];
-    assert_eq!((commit.first, commit.last, commit.count), (200, 207, 1));
+    assert_eq!((commit.first, commit.last, commit.count), (200, 207, 3));
     assert_eq!(
         commit.anchor,
-        whole_units[200].range.start..whole_units[203].range.end
+        whole_units[200].range.start..whole_units[201].range.end
     );
     assert_removal_invariant(&whole_units, commit);
 }
@@ -640,7 +640,7 @@ fn a_block_never_straddles_a_committed_region() {
     ));
     assert_eq!(stage(&span, &mut ledger, &mut scratch).block_repeats, 1);
     let commit = &ledger.commits()[1];
-    assert_eq!((commit.first, commit.last, commit.count), (4, 11, 1));
+    assert_eq!((commit.first, commit.last, commit.count), (4, 11, 3));
     for commit in ledger.commits() {
         assert_removal_invariant(&units, commit);
     }
@@ -675,6 +675,36 @@ fn stage_five_commits_only_what_stages_three_and_four_left() {
     for commit in ledger.commits() {
         assert_removal_invariant(&units, commit);
     }
+}
+
+#[test]
+fn a_block_whose_anchor_itself_repeats_is_never_committed() {
+    let lines: [&[u8]; 10] = [L0, L1, C0, L1, C0, L0, L1, C0, L1, C0];
+    let span = lines_span(&lines);
+    let units = split_span(&span);
+    assert_eq!(units.len(), 10);
+    assert_eq!(
+        norm_block(&span, &units, 0, 5),
+        norm_block(&span, &units, 5, 5),
+        "the five-line candidate is a real repeat"
+    );
+    let mut ledger = new_ledger(&units);
+    let mut scratch = Scratch::default();
+    assert_eq!(stage(&span, &mut ledger, &mut scratch).block_repeats, 2);
+    assert_eq!(
+        ledger
+            .commits()
+            .iter()
+            .map(|commit| (commit.first, commit.last, commit.count))
+            .collect::<Vec<_>>(),
+        [(1, 4, 1), (6, 9, 1)],
+        "the hidden two-line match inside the five-line anchor wins instead"
+    );
+    for commit in ledger.commits() {
+        assert_eq!(&span[commit.anchor.clone()], lines_span(&[L1, C0]));
+        assert_removal_invariant(&units, commit);
+    }
+    assert_eq!(scratch.work().verifications, 4, "two refusals, two commits");
 }
 
 #[test]
@@ -886,14 +916,19 @@ fn the_blocks_module_has_no_forbidden_determinism_inputs() {
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(!source.contains(banned), "blocks must not use {banned}");
+        assert!(
+            !source
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == banned),
+            "blocks must not use {banned}"
+        );
     }
     assert!(source.contains("normalize_into"));
     assert!(source.contains("FingerprintTable"));

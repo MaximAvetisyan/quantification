@@ -165,7 +165,9 @@ pub(crate) fn windowed_blocks(
         while length >= min {
             if equal(ids, at, at + length, length, work) {
                 work.verifications += 1;
-                if same_bytes(at, at + length, length) {
+                if same_bytes(at, at + length, length)
+                    && anchor_is_match_free(ids, at, length, min, same_bytes, work)
+                {
                     let copies = copies(ids, at, length, room, same_bytes, work);
                     let group = at..at + copies * length;
                     if let CommitOutcome::Committed(commit) =
@@ -182,6 +184,32 @@ pub(crate) fn windowed_blocks(
         at = next;
     }
     stats
+}
+
+fn anchor_is_match_free(
+    ids: &[Option<usize>],
+    at: usize,
+    length: usize,
+    min: usize,
+    same_bytes: &mut impl FnMut(usize, usize, usize) -> bool,
+    work: &mut Work,
+) -> bool {
+    let end = at + length;
+    let mut start = at;
+    while start < end {
+        let mut period = (end - start) / 2;
+        while period >= min {
+            if equal(ids, start, start + period, period, work) {
+                work.verifications += 1;
+                if same_bytes(start, start + period, period) {
+                    return false;
+                }
+            }
+            period -= 1;
+        }
+        start += 1;
+    }
+    true
 }
 
 fn equal(ids: &[Option<usize>], first: usize, second: usize, len: usize, work: &mut Work) -> bool {

@@ -116,6 +116,7 @@ impl Proposal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
     pub kind: CommitKind,
+    pub style: MarkerStyle,
     pub first: usize,
     pub last: usize,
     pub count: u64,
@@ -236,7 +237,7 @@ impl<'u> Ledger<'u> {
         if proposal.anchor_units == 0 || proposal.anchor_units > group.len() {
             return CommitOutcome::InvalidAnchor;
         }
-        if proposal.count == 0 {
+        if proposal.count == 0 || !group.len().is_multiple_of(proposal.anchor_units) {
             return CommitOutcome::InvalidCount;
         }
         let members = &self.units[group.clone()];
@@ -262,6 +263,7 @@ impl<'u> Ledger<'u> {
         }
         let commit = Commit {
             kind: proposal.kind,
+            style: self.marker_style,
             first: group.start,
             last: group.end - 1,
             count: proposal.count,

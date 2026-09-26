@@ -1081,6 +1081,70 @@ exit criteria. Gates M1–M4 are blocking milestones.
   implementation (rejection handling, parameter clamping, chain extent, table
   lifetime, the degradation shape, the W2.8 seam, and the work meter), frozen
   here because §5.7 freezes behaviour per release. No new dependencies.
+  Status (W2.4, W2 review 2026-09-27): **reading (h) added — a commit refuses a
+  candidate whose own anchor hides a repeat.** The W2 review found the normative
+  idempotence claim (DESIGN.md:344-346, §12's property at 733) **false**, and the
+  defect lives in this stage's walker, which stage 7 (W2.8) reuses, so one change
+  repairs both. Defect: a commit's own anchor can contain a shorter-period match
+  that the `(i asc, L desc)` scan skipped because it committed at a longer `L`
+  first. The exact 6-line repro (six log lines whose **template ids** are
+  `[R,R,C,R,R,C]`) took `L = 3` at `i = 0`, emitted the three-line anchor with the
+  marker glued to its **last** line, and the second pass then collapsed the hidden
+  `R R` pair — 422 → 348 B before the fix, and 722 → 573 → 573 B (a fixed point)
+  after it. The anchor is the only part of a commit that survives, so a *re-run of
+  the same scan over the anchor alone* is exactly the set of groups the output
+  still contains: `anchor_is_match_free(ids, at, length, min, same_bytes, work)`
+  re-runs the identical windowed comparison — same `equal` fingerprint compare,
+  same one `memcmp` verification, same integer-only arithmetic — over
+  `[at, at + length)` at every local start, with every period from
+  `(length - s)/2` down to `min`, and one verified match inside the anchor
+  **rejects the candidate, and the descent continues** to the next smaller `L`.
+  Two consequences, which are what the review asked for:
+  (i) *leftmost-then-longest is intact for genuine non-overlapping repeats* — the
+  start order, the `L` order and the scan are untouched, and a candidate is only
+  rejected when its own anchor is collapsible, in which case the leftmost group
+  *inside* that anchor is committed instead of the anchor itself. For the
+  reviewed repro the primitive period wins, so `[R,R,C]×2` now commits the two
+  `R R` pairs (two one-line-anchor `⟪templated block ×1⟫` groups) instead of one
+  three-line block; on the 12-entry chat golden corpus **nothing changes** and
+  every golden is still reproduced byte-for-byte, and the savings either improve
+  or stay equal on every shape the tests pin.
+  (ii) *the emitted output stops hiding a group from the next pass* — a second
+  pass can only find a group the first pass could have found, except for a match
+  inside an anchor (this check) or across the boundary of two adjacent commits
+  (the marker-mask residual recorded in the W2.9 hunk). The check must cover
+  **every** local start, not only the anchor's own: a period-`p` match at local
+  start `s ≥ 1` with `s + 2p < length` does not touch the marker-bearing last
+  line, so it survives into the output and the second pass finds it —
+  `[A,B,C,B,C]×2` with `p = 2`, `s = 1` is the counterexample that kills the
+  weaker "primitive at its start" reading. Cost: integer-only, no allocation, no
+  clock/RNG/hash table, and the check runs **only after** a candidate has already
+  passed a full `equal` + `memcmp` match, so the §4.4 "no superlinear path" claim
+  is untouched in the adversarial case — the 129-period payload still performs
+  `verifications == 0` with the same `compares + scanned` as before. The added
+  term is at most `L²/4` fingerprint compares per *confirmed* candidate
+  (`L ≤ max_block_lines`) and a refused candidate stops at the first match it
+  finds, so the amortised total is `O(N · max_block_lines)`; **stated
+  honestly**, the worst case is `O(N · max_block_lines²)` for a span where a
+  different matching period survives at almost every start, which no measured
+  corpus reaches and which is not proven impossible — W4.3's criterion gate is
+  where it is re-measured on 8 MiB. Reading (h) refines the candidate set rather
+  than the scan order, frozen here because §5.7 freezes behaviour per release.
+  The three stage-5 tests that pinned "the longest `L` wins" are re-pinned to the
+  new, strictly smaller output: `a b ×4` (previously `L = 4`, a four-line anchor,
+  `count = 1`) now commits `L = 2` with a two-line anchor and `count = 3`, because
+  the four-line anchor `a b a b` is itself a period-2 repeat; likewise
+  `a_block_never_straddles_a_committed_region` and
+  `a_block_never_folds_an_over_cap_record`. The new
+  `a_block_whose_anchor_itself_repeats_is_never_committed` pins the refusal:
+  `[L0,L1,C0,L1,C0]×2` is a real five-line repeat, the five-line candidate is
+  refused because its anchor hides a period-2 match at local start 1, and the two
+  two-line groups `1..5` and `6..10` commit instead, with `verifications == 4`
+  (two candidate verifications, two inside the check). The over-cap tool dump
+  gains from the same rule: `edges/single-line-tool-dump-overcap.json` now commits
+  **one** block with `count = 1022` (128 057 → **333** B, previously 3 854 B in two
+  commits) and is a fixed point. Tests: 20 integration tests in
+  `crates/core/tests/detect_blocks.rs` (was 19). No new dependencies.
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
   Status: **complete** (2026-09-26). The module is
@@ -1397,18 +1461,26 @@ exit criteria. Gates M1–M4 are blocking milestones.
   sub-slice `&payload[span.start..span.end]` and adds `span.start` to each
   `Commit::anchor`/`Commit::removed` when merging, which is the whole of the
   absolute-offset contract W1.1 froze and needs no change to any detector; (b)
-  **the splice style is the one the spans agree on**: `resolve_style` runs per
-  span (W2.6's frozen contract, and it must precede `Ledger::new` because
-  `marker_bytes` is style-dependent), and because W2.7's `splice_into` takes a
-  *single* style for the whole commit list, the pipeline splices with the spans'
-  unanimous resolution when they agree and with `resolve_style(marker_style,
-  payload)` (the whole buffer) when they do not. The two can only diverge in
-  one direction — a span resolved `Ascii` inside a payload that resolves
-  `Unicode` — and since the ascii marker is always 4–5 bytes *longer* than the
-  unicode one, the rendered marker is then never longer than the §4.4 gate
-  priced, so the divergence can only make a commit more conservative, never
-  wrong. (Any span that resolves `Unicode` forces the whole payload to
-  `Unicode`, so the reverse cannot occur.) (c) **A per-span fingerprint-table
+  **the splice style is per commit, because `Commit` carries it** (rewritten by
+  the W2 review 2026-09-27; the previous "one style for the whole commit list"
+  reading contradicted §4.5 and is withdrawn). `resolve_style` runs per span
+  — W2.6's frozen contract, and it must precede `Ledger::new` because
+  `marker_bytes` is style-dependent — and `Ledger::try_commit` stamps its own
+  resolved style onto every `Commit` it returns. `pipeline::shift` carries the
+  field across the span-relative → absolute shift, so
+  `splice::splice_into(input, commits, out)` and `spliced_len(input_len, commits)`
+  no longer take a style argument and render every commit in **its own** span's
+  resolved style. §4.5 pins the unit of resolution as the *span* ("when the span
+  contains no non-ASCII bytes"), and the withdrawn reading resolved `auto` once
+  **per payload**, so a pure-ASCII span inside a payload that held any non-ASCII
+  byte anywhere was rendered with a `⟪...⟫` marker. The §4.4 gate was
+  never wrong (each span's ledger already priced its own style), but the
+  *rendering* could disagree with the price; the rendered bytes are now
+  byte-identical to the priced bytes by construction, in both directions. The
+  ascii marker is **exactly 1 byte longer** than the unicode one for all ten
+  kind×style shapes (`"[... "` + `" ...]"` is 5+5 bytes against `⟪` + `⟫` at
+  3+3; the `CORE` halves and the `SEP` cancel) — not the "4–5 bytes" this hunk
+  previously claimed. (c) **A per-span fingerprint-table
   `Full` degrades that span to verbatim pass-through, not the request** (§7,
   §3): the pipeline records the merged commit length before the span, and on
   `blocks::Scratch::degraded()` or `templ::Templated::degraded` it truncates that
@@ -1457,12 +1529,18 @@ exit criteria. Gates M1–M4 are blocking milestones.
   stage-3 and stage-4 blocks in the source makes the test fail (verified, then
   reverted), so §4.4's ordering rule is a checked invariant of the module, not a
   convention.
-  Tests: 41 integration tests in `crates/core/tests/pipeline.rs` (core total 322
-  = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
-  9 mask + 11 render + 10 splice + 16 sniff + 31 splitter + 8 ws + 14 exact runs
-  + 13 ws runs + 17 template groups + 19 block runs + 15 templated blocks + 41
-  pipeline; workspace total **332**, of which 10 are W1.6's proto unit tests;
-  1 test is `#[ignore]`d, the golden generator). Twelve golden expected-output
+  Tests: 41 integration tests in `crates/core/tests/pipeline.rs` at this point,
+  **45 after the W2 review** (core total 322 → 326, workspace total 332 → **340**;
+  the four new ones are the anchor-hides-a-shorter-period repro, the generated
+  idempotence property test
+  (`generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_anchor`),
+  the mixed-style per-span render test and the `reversible` pin — see the W2 review record at the end of this hunk; the
+  other three are W2.4's, ledger's and splice's; 10 of the workspace total are
+  W1.6's proto unit tests, and 1 test is `#[ignore]`d, the golden generator).
+  Breakdown after the review: 23 lib unit + 8 fingerprint + 39 ledger + 48
+  locator + 1 locator-alloc + 9 mask + 11 render + 12 splice + 16 sniff + 31
+  splitter + 8 ws + 14 exact runs + 13 ws runs + 17 template groups + 20 block
+  runs + 15 templated blocks + 45 pipeline. Twelve golden expected-output
   files were added under `crates/core/tests/fixtures/golden/` (one per chat
   corpus entry: `chat-minified.json`, `chat-pretty.json`, `chat-content-null.json`,
   `chat-mixed-parts.json`, `sniff-overlap-chat-responses.json`, `bom-chat.json`,
@@ -1508,9 +1586,10 @@ exit criteria. Gates M1–M4 are blocking milestones.
   every marker matched against an independent oracle built from the frozen
   `framing`/`core`/`marker_checksum` pieces and valid UTF-8 with no added
   backslash pair; every `Stats` field pinned; `record_splits` 1/0/1/1 over the
-  four stage-1b fixtures, with the 128 057-byte over-cap dump collapsing 33×
-  (128 057 → 3 854 bytes, two `block_repeats`) and the 16385-byte over-cap
-  record acting as a wall; `algo_version` pinned; the `options_echo` string and
+  four stage-1b fixtures, with the 128 057-byte over-cap dump collapsing 1023×
+  (128 057 → **333** bytes, one `block_repeats` with `count = 1022` — W2.4 reading
+  (h) replaced the previous 3 854 bytes in two commits) and the 16385-byte
+  over-cap record acting as a wall; `algo_version` pinned; the `options_echo` string and
   both forced marker styles reaching the output; a full `Stats` reproduced 1000×
   under a constant clock; warm-vs-fresh compressors and output-buffer capacity
   across 64 calls; and a check through `commits()` that a span never bleeds into its
@@ -1518,13 +1597,33 @@ exit criteria. Gates M1–M4 are blocking milestones.
   bare JSON string) are asserted to pass through byte-identically without a
   panic, so §3's "never fail the request" holds for the whole input range, not
   just the interesting shapes.
-  Deviations from DESIGN: none in the pipeline's behaviour — §3's architecture,
-  §4.4's stage ordering/comparison domains/removal rule/profitability gate,
-  §4.5's splicing and stats list, §4.7's contract, §5.1–§5.9, §6.2's `Stats`,
-  §7's table-cap degradation and §12's test list are implemented as written and
-  DESIGN.md is not amended. Two points are recorded here rather than in
+  Deviations from DESIGN: **three**, all recorded here rather than in DESIGN.md,
+  which this review did not amend. §3's architecture, §4.4's stage
+  ordering/removal rule/profitability gate, §4.5's splicing and stats list,
+  §4.7's contract, §5.1–§5.9, §6.2's `Stats`, §7's table-cap
+  degradation and §12's test list are otherwise implemented as written:
+  (0) **`§4.4.5`/`§4.4.7` gain one admission rule** (W2.4 reading (h)): a block
+  candidate whose own anchor contains a windowed match is refused and the
+  descent continues. §4.4.5's `(i asc, L desc)` order is untouched and
+  leftmost-then-longest is intact for genuine non-overlapping repeats; the spec
+  does not say what a commit must do when its own anchor is itself collapsible,
+  so this is a resolution of a gap rather than a contradiction, but it does change
+  the set of emitted blocks (and shrinks the output on every shape it touches).
+  (1) **`§4.4`'s idempotence claim is not yet established** for arbitrary input —
+  see item (6) below for the measured residual (9.36% of a generated corpus, all
+  of it one named mechanism) and the two DESIGN-level fixes it needs.
+  (2) **`§6.2`'s `reversible` is resolved and echoed but not honoured.**
+  `config::resolve` accepts `reversible: true`, `options_echo` reports it, and
+  compression output is byte-identical either way (pinned by the new
+  `reversible_is_echoed_but_still_not_honoured`). The recommended fix is to
+  **reject it exactly like the reserved `AllMessages` scope policy** — a new
+  `ResolveError::UnsupportedReversible`, so the option cannot be accepted and
+  then ignored — but that is `config.rs`, which is the W0.2 owner's file and
+  outside this review's ownership, so it is **not** done here; until W3.4 lands
+  the transport must document the option as reserved. W3.1/W3.3 must not present
+  it as working. Two further points are recorded here rather than in
   DESIGN.md, and two are inherited readings that later waves should know:
-  (1) **R3 is asserted with a test-local strict JSON validator** (recursive
+  (3) **R3 is asserted with a test-local strict JSON validator** (recursive
   descent: exact `true`/`false`/`null`, JSON number grammar, `\uXXXX`-style
   escape validation, no raw control byte in a string, no trailing bytes, depth
   capped at 64, leading BOM tolerated) rather than a third-party parser, because
@@ -1532,11 +1631,11 @@ exit criteria. Gates M1–M4 are blocking milestones.
   `serde_json` if it prefers an independent parser, and the *structural* proof
   (output = input outside the patched ranges, plus the fuzz locator's
   "no unescaped quote or control byte inside a span" invariant) is
-  implementation-independent. (2) `degraded` is widened from
+  implementation-independent. (4) `degraded` is widened from
   `noop_reason.is_some()` to "a pass-through happened anywhere", which is §6.2's
   own field comment ("pass-through happened"); a caller that needs the stronger
   "the whole request was untouched" test must check `noop_reason`.
-  (3) **Inherited observation, not a change**: with `template_dedup = true` a
+  (5) **Inherited observation, not a change**: with `template_dedup = true` a
   stage-4 ws run and a stage-6 template group are never *distinguishable* in
   their group selection, because stage 6 masks the ws-normalized form, so every
   ws-equal pair is also template-equal and every template run is also a
@@ -1546,15 +1645,66 @@ exit criteria. Gates M1–M4 are blocking milestones.
   from stage 7 (pinned by
   `min_group_size_does_not_gate_the_templated_block_stage`). This is what
   DESIGN.md says, so it is recorded as an observation for W3.1's option
-  documentation and W4.1's property tests, not as a deviation. (4) The
-  corruption hardening §4.4's idempotence argument relies on is load-bearing and
-  observed to work: emitted markers are distinguishable under stages 6/7's
-  comparison domains (the 4-hex `CCCC` differs per anchor), so three adjacent
-  emitted markers do **not** form a group, which is why the whole 26-fixture
-  corpus is a fixed point. W4.1 should keep property-testing that, because a
-  4-hex collision between two adjacent emitted markers would open a
-  collapse-further hole.
-  **Gate M2 passes** — measured 2026-09-26, debug build, i7-9700K:
+  documentation and W4.1's property tests, not as a deviation. (6)
+  **Idempotence — the previous evidence in this hunk was wrong and is replaced
+  (W2 review 2026-09-27).** The withdrawn claim was that "emitted markers are
+  distinguishable under stages 6/7's comparison domains (the 4-hex `CCCC` differs
+  per anchor), so three adjacent emitted markers do not form a group". Markers
+  *are* distinguishable as bytes, and idempotence still failed, because the
+  comparison domain is not raw bytes: §4.4.7's domain is the **masked form**,
+  and the frozen §4.6 mask list turns an all-decimal 4-hex checksum into
+  `<num>`. Two emitted markers of the same kind and count whose checksums are both
+  decimal (`5161` and `9616`, `4c01` and `9c17`, … — about 15% of checksums are
+  all-decimal, and roughly 3% of marker pairs) therefore have **byte-equal
+  masked forms**, so the second pass's stage 7 merges them as a "templated
+  block". The true mechanisms are two, and only one of them is in scope here:
+  * **A (fixed here, in W2.4 reading (h))**: a commit hid a shorter-period match
+    inside its own anchor, because the `(i asc, L desc)` descent had already
+    committed at a longer `L`. This is the reviewed 6-line repro. See the W2.4
+    hunk for the fix, the reading, the cost bound and the three re-pinned
+    stage-5 tests.
+  * **B (measured, **not** fixed, out of this review's scope)**: the
+    marker-mask collision above. Measured on 20 000 deterministic generated
+    log-burst payloads (1–3 spans, header + patterned entry groups, per-line
+    ts/ip/uuid/duration/counters, random `\t`/space padding, some verbatim
+    line repeats; the same LCG constants as `tests/stage1_split.rs`):
+    **80.06% (16 011/20 000) were not fixed points before the fix and 9.36%
+    (1 872/20 000) after it**, and **all 1 872 residual cases are mechanism B**,
+    classified mechanically: every second-pass commit's removed range contains an
+    emitted marker (`" ...]"`), and the merge is a masked-domain-only merge (the
+    two halves are neither raw-equal nor ws-equal). Zero of 20 000 payloads needed
+    a third recompression to stabilise, before or after the fix. A smaller corpus
+    (2 000 payloads, the one the test runs) measures 3.15% (63/2 000), the ceiling
+    the test pins.
+    B **cannot be fixed in code** without amending §4.5: the marker grammar and
+    the `CCCC = 4 lowercase hex chars of xxh3-64(anchor)` definition are normative,
+    and `render.rs` is not this review's file. The two candidate fixes are (i) a
+    checksum that cannot be masked away (a non-decimal prefix, e.g. `0a3f`), which
+    changes the §4.5 grammar and every golden's marker bytes, or (ii) a rule that
+    a line carrying an emitted marker is never a template/block candidate, which
+    changes §4.4.6/7's comparison-domain statement and would have to exempt
+    prior-marker payloads (§12 explicitly fixtures those). Both are DESIGN.md
+    decisions and are recorded here rather than taken; until one is made,
+    DESIGN.md:344-346 and the §12 property at 733 are **not** established for
+    arbitrary input, and this hunk no longer claims otherwise.
+  A **third** mechanism (C: a commit's anchor abutting a surviving neighbour
+  its own stage could not see) was found by the new fuzz target and is not
+  fixed either; the W2 review record below has its 173-byte reproducer.
+  The property is now *enforced* rather than sampled, in
+  `recompressing_an_output_is_a_fixed_point` (the 26 fixtures, unchanged) and in
+  the new `generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_anchor`
+  (2 000 generated payloads, deterministic): every payload must reach a fixed
+  point within two recompressions, and **every** divergence must be a second-pass
+  commit that runs over an emitted marker or over a first-pass anchor, so a
+  regression of mechanism A fails the test with the offending group's bytes in
+  the message. `a_block_whose_anchor_hides_a_shorter_period_is_not_a_fixed_point_of_itself`
+  pins the reviewed repro end-to-end (`twice == once`, `groups_collapsed == 0`
+  on the second pass).
+  **Gate M2 passes** — measured 2026-09-26, **re-measured 2026-09-27 after the W2
+  review fixes and unchanged: the 12 goldens are still reproduced byte-for-byte
+  (`the_chat_goldens_are_reproduced_byte_for_byte` green without regenerating a
+  single golden file), the ×1000 in-process gate is 0.87 s debug, the fixed-clock
+  `Stats` gate 0.87 s, and the cross-process gate 0.01 s** (debug build, i7-9700K):
   - *in-process ×1000*: `gate_m2_chat_outputs_are_byte_stable_over_1000_runs`
     compresses the 12-entry chat golden corpus (2 820 input bytes total; 9 of the
     12 entries change, 3 are the deliberate pass-throughs) once per run — **12 000
@@ -1588,6 +1738,132 @@ exit criteria. Gates M1–M4 are blocking milestones.
     pid, so the gate works under both runners; nextest is not installed in this
     environment, so the recorded run is `cargo test` (libtest) — CI's nextest
     job will re-exercise it.
+  **W2 review record (2026-09-27)** — the findings and where each one landed.
+  Files this review owns and changed: `crates/core/src/{pipeline,splice,ledger}.rs`,
+  `crates/core/src/detect/blocks.rs`,
+  `crates/core/tests/{pipeline,splice,ledger,detect_blocks}.rs`,
+  `fuzz/fuzz_targets/{fuzz_splitter,fuzz_pipeline}.rs`, `fuzz/Cargo.toml`,
+  `.github/workflows/fuzz.yml`, this hunk and the W2.4 hunk. No golden file
+  changed and `config.rs`/`render.rs`/`templ.rs`/`templ_blocks.rs` were not
+  touched.
+  - **B1 (idempotence, the normative claim was false)**: fixed in
+    `blocks::windowed_blocks` for stage 5 and stage 7 together — see the W2.4
+    hunk's reading (h) and item (6) here for the true residual mechanism and the
+    measured before/after generated-corpus rate (80.06% → 9.36% of 20 000
+    payloads).
+  - **B2 (marker style was resolved per payload, §4.5 says per span)**: fixed by
+    putting the resolved style on `Commit` (`ledger::Commit::style`, stamped by
+    `try_commit`, carried by `pipeline::shift`) and dropping the style parameter
+    from `splice::splice_into`/`spliced_len`; `splice_ledger` keeps its shape.
+    `splice.rs` also now asserts `anchor ⊆ removed` (the R3 last line of
+    defence: without it a regression would silently duplicate bytes), pinned by
+    `an_anchor_outside_its_removed_range_is_refused`. The per-span gate pricing
+    is untouched and can no longer diverge from the rendered bytes. New
+    `each_span_renders_in_its_own_resolved_style` pins a mixed payload (one
+    all-ASCII span + one non-ASCII span in the *same* document: the first emits
+    `[... x5 rows, template`, the second `⟪×5 rows, template`, exactly one of
+    each in the whole output), and `marker_at()` in this test file is now
+    **style-exact** (it used to accept either style, which is why B2 slipped
+    through) — the style comes from `commit.style`, and the whole 26-fixture
+    corpus passes under it.
+  - **`Proposal::repeat` truncation**: `ledger::try_commit` now returns
+    `InvalidCount` for a group that is not a whole number of copies, so a
+    partial copy can never price fewer bytes than it removes (the `repeat`
+    constructor may still *derive* a truncated count; it can no longer be
+    committed). Pinned by `a_group_that_is_not_a_whole_number_of_copies_is_rejected`.
+  - **Reused `spans`**: the unknown-schema path now clears the caller's span
+    vector unconditionally instead of leaving the previous call's spans in it.
+  - **Misleading test claim**: the "an all-ascii span resolves to the ascii style"
+    assertion inside `the_pretty_and_minified_chat_variants_compress_the_same_span`
+    only ever saw one span, so it could not reach the (now removed)
+    `unanimous == false` branch; its message now says so and points at
+    `each_span_renders_in_its_own_resolved_style`, which is the real coverage.
+  - **Determinism source scan**: the banned-identifier checks in
+    `tests/pipeline.rs`, `tests/ledger.rs` and `tests/detect_blocks.rs` matched
+    the **substring** `rand`, so an innocuous identifier like `brand` would have
+    been rejected; they now match identifier tokens (splitting on everything
+    outside `[A-Za-z0-9_]`), and the pipeline scan carries two self-checks
+    (`brand` must pass, `rand::rng()` must fail) so the matcher cannot rot into a
+    no-op. The same substring scan still exists in the five test files this
+    review does not own (`detect_exact`, `detect_wsruns`, `detect_templ`,
+    `detect_templ_blocks`, `splice`); W4.1 should convert them the same way.
+  - **`reversible`**: see deviation (2) — out of `config.rs`'s ownership, pinned
+    by a test and a recorded recommendation instead of silently fixed.
+  - **Fuzz (W0.4/W4.5, no Wave 2 coverage existed)**: `fuzz_splitter`'s
+    `assert_eq!(out, data)` was **vacuous** — it concatenated
+    `data[at..unit.range.end]` and `data[unit.range.end..stop]` unconditionally, so
+    it held for any ascending disjoint unit list. It now rebuilds the output from
+    each `unit.range` plus the independently derived gap bytes and asserts every
+    gap is a whole run of line-boundary escape units (`\n`, `\u000A`, `\u000a`) or
+    a single `,` (the §4.4.1b joiner rule), which is what makes the partition
+    meaningful; the two live asserts are kept. New `fuzz_pipeline` runs
+    `Compressor::compress` and asserts: no panic; the output equals the input
+    outside every reported `Commit` range (walking the commit list) with the
+    marker length pinned by the public `ledger::marker_len` and every marker
+    valid UTF-8 with no `"`, `\` or control byte; a commit-free payload is a
+    byte-for-byte pass-through; the output parses as JSON whenever the input
+    does (a compact recursive-descent validator in the target, BOM tolerated,
+    depth capped at 64); and idempotence — convergence to a fixed point within
+    two recompressions, with **every** intervening divergence required to be the
+    marker-mask mechanism of item (6) (a second-pass commit whose removed range
+    carries an emitted marker), which is exactly what B1's regression would
+    violate. Both new/rewritten targets were checked for non-vacuity by breaking
+    the code and observing the crash, then reverting: reverting W2.4 reading (h)
+    makes `fuzz_pipeline` panic on the 6-line repro seed
+    (`a second pass may only merge emitted markers, got TemplatedBlock over
+    "2026-08-25T10:00:01Z INFO hc …"`), and rejecting the `,` joiner makes
+    `fuzz_splitter` crash on the 128 KB over-cap dump seed.
+  - **Fuzz run counts (2026-09-27)**, all four targets, exit 0, zero crashes,
+    corpora seeded from the W0.3 fixtures (the pipeline corpus also carries the
+    6-line repro payload, the 173-byte mechanism-C reproducer below, and the
+    splitter corpus a 128 KB over-cap `},{` dump so stage 1b is really fuzzed):
+    `fuzz_sniff` 200 000 runs (0 s, cov 140 / ft 591, 342 files),
+    `fuzz_locator` 200 000 runs (7 s, cov 540 / ft 2 301, 912 files),
+    `fuzz_splitter` 200 000 runs (29 s, cov 98 / ft 403, 121 files),
+    `fuzz_pipeline` 200 000 runs (1 374 s, cov 1 259 / ft 5 774, 1 543 files /
+    20 MB). **Toolchain deviation, unchanged from W0.4/W1.1/W1.2**: nightly is
+    still unreachable here (static.rust-lang.org connection timeout), so all
+    four runs used the documented fallback — stable 1.98.0 with
+    `RUSTC_BOOTSTRAP=1` and `cargo fuzz run --sanitizer none`, i.e. **ASan was
+    off** (stable cannot enable it). `.github/workflows/fuzz.yml` keeps the
+    nightly+ASan configuration and now also runs on `pull_request` (it was
+    `workflow_dispatch`-only, which is why §12's "a fuzz panic is a blocker"
+    had no gate) and runs all four targets at 200 runs each.
+  - **A third residual mechanism (C) was found by the new fuzz target and is
+    NOT fixed** — recorded here because it is a real §4.4 gap, not a coding
+    mistake. Minimal reproducer (173 bytes, plain text, so `content_type=text`
+    and one whole-payload span): `2026-08-25T11,0:02Z INFO db 1&02
+    ok\n2026-08-25T11,00:02Z INFO db 10.1&0.2 ok\n2026-08-25T11:1.1&0.2
+    ok\n2026-08-25T11,00:02Z INFO db 10.1&0.2 ok\n2026-08-25T11:1.1&0.2 ok\n`.
+    Pass 1: stage 5 commits units 1..4 (a two-line `Block`, anchor = lines
+    1-2) because those two lines are ws-equal; lines 0 and 1 are *template*-equal
+    but not ws-equal, so nothing merges them. Pass 2: stage 7 (minimum period 1)
+    finds the pair (line 0, anchor line 1) and commits it, so the output shrinks
+    again (173 → 128 → 119 B, stable at pass 3). The general shape: **a commit's
+    anchor is glued to a surviving neighbour that the commit's own stage could
+    not see** — stage 7 never examined start 0 in pass 1 because unit 1 was
+    already claimed, and the marker is glued to the anchor's *last* line, so the
+    anchor's *head* becomes indistinguishable from its left neighbour in the
+    output. A per-commit check cannot see this: the match straddles the commit's
+    left boundary, and its left context is whatever survived. Closing it needs a
+    decision about the whole compaction, not one commit — e.g. compressing to a
+    fixed point (re-scan the residual of the spliced output and iterate), or
+    treating a line adjacent to an anchor as a wall in §4.4.5/7. Both are
+    DESIGN.md changes and are **not** taken here. Because of C the fuzz target
+    asserts the property that does hold universally (recompression reaches a
+    fixed point within two further passes, and never grows the payload) rather
+    than the B-only classification the deterministic test uses, which C would
+    false-positive on. The 2 000-payload generated corpus does not reach C, so
+    the deterministic test enforces the stricter "marker **or** anchor" rule
+    there; the exact mechanism-A regression is pinned by name in both places.
+  - **Verification**: `cargo test --workspace` **340 tests green** (341
+    collected, the one `#[ignore]`d golden generator), i.e. the 332 of the
+    W2.9 baseline plus the 8 this review adds; `cargo fmt --all --check` clean;
+    `cargo clippy --workspace --all-targets -- -D warnings` clean; the fuzz crate
+    checks and lints clean separately (`fuzz/` is excluded from the workspace, as
+    W0.4 recorded); `cargo metadata --locked --manifest-path fuzz/Cargo.toml`
+    still succeeds — adding a `[[bin]]` does not touch the lock. No new
+    dependency, no golden file and no DESIGN.md change.
 
 ## Wave 3 — API & transports (deps W2.9)
 

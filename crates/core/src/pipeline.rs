@@ -152,36 +152,28 @@ impl Compressor {
         } = self;
         let detect_start = clock.now_ns();
         let noop = match sniff::sniff(payload) {
-            None => Some(NoopReason::UnknownSchema),
+            None => {
+                spans.clear();
+                Some(NoopReason::UnknownSchema)
+            }
             Some(schema) => locate_into(payload, schema, options.scope_policy, spans),
         };
         let detect_end = clock.now_ns();
         commits.clear();
         let mut stage = StageStats::default();
         let mut degraded = noop.is_some();
-        let mut style = resolve_style(options.marker_style, payload);
-        let mut agreed: Option<MarkerStyle> = None;
-        let mut unanimous = true;
         if noop.is_none() {
             for span in spans.iter() {
                 let range = span.start..span.end;
-                let resolved = resolve_style(options.marker_style, &payload[range.clone()]);
-                if let Some(first) = agreed {
-                    unanimous &= first == resolved;
-                } else {
-                    agreed = Some(resolved);
-                }
+                let style = resolve_style(options.marker_style, &payload[range.clone()]);
                 let before = commits.len();
-                let result = compact_span(payload, &range, resolved, options, stages, commits);
+                let result = compact_span(payload, &range, style, options, stages, commits);
                 if result.degraded {
                     degraded = true;
                     commits.truncate(before);
                 } else {
                     stage.merge(&result.stats);
                 }
-            }
-            if unanimous {
-                style = agreed.unwrap_or(style);
             }
         }
         let compact_end = clock.now_ns();
@@ -191,7 +183,7 @@ impl Compressor {
                 .all(|pair| pair[0].removed.end <= pair[1].removed.start),
             "spans and commits are ascending and disjoint"
         );
-        splice_into(payload, style, commits, out);
+        splice_into(payload, commits, out);
         let splice_end = clock.now_ns();
         let mut stats = Stats {
             bytes_in: payload.len() as u64,
@@ -288,6 +280,7 @@ fn compact_span(
 fn shift(commit: &Commit, base: usize) -> Commit {
     Commit {
         kind: commit.kind,
+        style: commit.style,
         first: commit.first,
         last: commit.last,
         count: commit.count,

@@ -2,6 +2,7 @@ name: fuzz
 
 on:
   workflow_dispatch:
+  pull_request:
 
 jobs:
   fuzz:
@@ -13,9 +14,10 @@ jobs:
         with:
           components: rust-src
       - uses: taiki-e/install-action@cargo-fuzz
-      - name: run stub targets (TASKS.md W0.4 exit criterion)
+      - name: run every target (TASKS.md W0.4 exit criterion, W2 fuzz coverage)
         working-directory: fuzz
         run: |
           cargo fuzz run fuzz_sniff    -- -runs=200
           cargo fuzz run fuzz_locator  -- -runs=200
           cargo fuzz run fuzz_splitter -- -runs=200
+          cargo fuzz run fuzz_pipeline -- -runs=200

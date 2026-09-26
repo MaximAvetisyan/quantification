@@ -58,14 +58,14 @@ fn a_multi_commit_span_produces_the_pinned_output_bytes() {
     let commits = commits_of(&units, UNICODE, &[(1, 6)]);
     assert_eq!(commits.len(), 1);
     let mut out = Vec::new();
-    splice_into(&span, UNICODE, &commits, &mut out);
+    splice_into(&span, &commits, &mut out);
     let expect = format!(
         "head\\n{}{}\\ntail",
         text(&body),
         oracle(UNICODE, &commits[0], &body)
     );
     assert_eq!(text(&out), expect);
-    assert_eq!(out.len(), spliced_len(span.len(), UNICODE, &commits));
+    assert_eq!(out.len(), spliced_len(span.len(), &commits));
     assert_eq!(
         out.len(),
         "head\\ntail".len() + 2 + body.len() + oracle(UNICODE, &commits[0], &body).len()
@@ -80,7 +80,7 @@ fn two_commits_in_one_span_are_emitted_in_anchor_offset_order() {
     let units = split_span(&span);
     let commits = commits_of(&units, UNICODE, &[(4, 7), (0, 3)]);
     let mut out = Vec::new();
-    splice_into(&span, UNICODE, &commits, &mut out);
+    splice_into(&span, &commits, &mut out);
     let expect = format!(
         "{}{}\\nmid\\n{}{}",
         text(&first),
@@ -90,7 +90,7 @@ fn two_commits_in_one_span_are_emitted_in_anchor_offset_order() {
     );
     assert_eq!(text(&out), expect);
     assert!(commits[0].anchor.start < commits[1].anchor.start);
-    assert_eq!(out.len(), spliced_len(span.len(), UNICODE, &commits));
+    assert_eq!(out.len(), spliced_len(span.len(), &commits));
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn a_commit_at_the_very_start_and_at_the_very_end_of_the_buffer() {
     assert_eq!(units.len(), 7);
     let commits = commits_of(&units, UNICODE, &[(0, 3), (4, 7)]);
     let mut out = Vec::new();
-    splice_into(&buffer, UNICODE, &commits, &mut out);
+    splice_into(&buffer, &commits, &mut out);
     let expect = format!(
         "{}{}\\n\\nbetween\\n{}{}\\n",
         text(&head),
@@ -139,7 +139,7 @@ fn no_commits_is_a_byte_for_byte_passthrough() {
         let spliced = splice_ledger(&span, &ledger, &mut out);
         assert_eq!(spliced, &span[..]);
         assert_eq!(out.len(), span.len());
-        assert_eq!(spliced_len(span.len(), ASCII, ledger.commits()), span.len());
+        assert_eq!(spliced_len(span.len(), ledger.commits()), span.len());
     }
 }
 
@@ -177,7 +177,7 @@ fn a_leading_bom_is_copied_verbatim_and_offsets_stay_absolute() {
     assert!(text(&out).contains(&oracle(ASCII, &commit, &body)));
     assert_eq!(
         out.len(),
-        spliced_len(buffer.len(), ASCII, std::slice::from_ref(&commit))
+        spliced_len(buffer.len(), std::slice::from_ref(&commit))
     );
 }
 
@@ -209,10 +209,7 @@ fn a_poisoned_reused_buffer_never_leaks_a_stale_byte() {
         "a stale buffer byte reached the output"
     );
     assert!(short_out.starts_with(&body[..]));
-    assert_eq!(
-        spliced_len(short.len(), UNICODE, ledger.commits()),
-        short_len
-    );
+    assert_eq!(spliced_len(short.len(), ledger.commits()), short_len);
 }
 
 #[test]
@@ -245,8 +242,8 @@ fn the_output_equals_the_input_everywhere_outside_the_patched_ranges() {
         let commits = commits_of(&units, UNICODE, &groups);
         spliced_commits += commits.len();
         let mut out = Vec::new();
-        splice_into(&buffer, UNICODE, &commits, &mut out);
-        assert_eq!(out.len(), spliced_len(buffer.len(), UNICODE, &commits));
+        splice_into(&buffer, &commits, &mut out);
+        assert_eq!(out.len(), spliced_len(buffer.len(), &commits));
         let mut cursor = 0;
         let mut read = 0;
         for commit in &commits {
@@ -292,7 +289,7 @@ fn record_joiners_stay_outside_the_marker() {
     let commits = commits_of(&units, UNICODE, &[(1, 4)]);
     assert_eq!(commits.len(), 1);
     let mut out = Vec::new();
-    splice_into(&buffer, UNICODE, &commits, &mut out);
+    splice_into(&buffer, &commits, &mut out);
     let expect = format!(
         "[{},{}{},{}]",
         text(&big),
@@ -315,7 +312,50 @@ fn commits_out_of_emit_order_are_refused() {
     assert_eq!(commits.len(), 2);
     commits.reverse();
     let mut out = Vec::new();
-    splice_into(&span, UNICODE, &commits, &mut out);
+    splice_into(&span, &commits, &mut out);
+}
+
+#[test]
+fn each_commit_renders_in_its_own_style() {
+    let body = line(b"x", 40);
+    let span = span_of(&[&body, &body, &body, b"mid", &body, &body, &body]);
+    let units = split_span(&span);
+    assert_eq!(units.len(), 7);
+    let mut commits = commits_of(&units, UNICODE, &[(0, 3)]);
+    commits.append(&mut commits_of(&units, ASCII, &[(4, 7)]));
+    assert_eq!(commits[0].style, UNICODE);
+    assert_eq!(commits[1].style, ASCII);
+    let mut out = Vec::new();
+    splice_into(&span, &commits, &mut out);
+    let body = text(&body);
+    let spliced = text(&out);
+    assert!(
+        spliced.starts_with(&format!(
+            "{body}{}",
+            oracle(UNICODE, &commits[0], body.as_bytes())
+        )),
+        "{spliced}"
+    );
+    assert!(
+        spliced.ends_with(&format!(
+            "{body}{}",
+            oracle(ASCII, &commits[1], body.as_bytes())
+        )),
+        "{spliced}"
+    );
+    assert!(spliced.contains("\\nmid\\n"));
+    assert_eq!(out.len(), spliced_len(span.len(), &commits));
+}
+
+#[test]
+#[should_panic(expected = "the anchor is a sub-range of the range it replaces")]
+fn an_anchor_outside_its_removed_range_is_refused() {
+    let body = line(b"x", 40);
+    let span = span_of(&[&body, &body, &body, b"tail"]);
+    let units = split_span(&span);
+    let mut commits = commits_of(&units, ASCII, &[(0, 3)]);
+    commits[0].anchor = units[3].range.clone();
+    splice_into(&span, &commits, &mut Vec::new());
 }
 
 #[test]

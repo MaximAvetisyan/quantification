@@ -538,6 +538,37 @@ fn emitted_order_is_stable_across_repeated_detector_orders() {
 }
 
 #[test]
+fn a_group_that_is_not_a_whole_number_of_copies_is_rejected() {
+    let units = split_span(&line_span(5, 30));
+    let mut partial = ledger(&units);
+    let proposal = Proposal::repeat(0..5, 2, CommitKind::Block);
+    assert_eq!(
+        proposal.count, 1,
+        "a truncated count is derived but never used"
+    );
+    assert_eq!(
+        partial.try_commit(proposal),
+        CommitOutcome::InvalidCount,
+        "a partial copy must never be priced as a whole one"
+    );
+    assert!(partial.is_free(0..5));
+    assert_eq!(partial.commits().len(), 0);
+    let mut whole = ledger(&units);
+    assert_eq!(
+        whole.try_commit(Proposal::repeat(0..4, 2, CommitKind::Block)),
+        CommitOutcome::Committed(Commit {
+            kind: CommitKind::Block,
+            style: UNICODE,
+            first: 0,
+            last: 3,
+            count: 1,
+            anchor: units[0].range.start..units[1].range.end,
+            removed: units[0].range.start..units[3].range.end,
+        })
+    );
+}
+
+#[test]
 fn block_anchors_cover_the_whole_first_occurrence() {
     let units = split_span(&line_span(6, 30));
     let mut ledger = ledger(&units);
@@ -992,13 +1023,18 @@ fn ledger_path_has_no_forbidden_determinism_inputs() {
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(!source.contains(banned), "ledger must not use {banned}");
+        assert!(
+            !source
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == banned),
+            "ledger must not use {banned}"
+        );
     }
 }

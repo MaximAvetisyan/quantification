@@ -7,7 +7,7 @@ use quantification_core::config::{
     MarkerStyle, RawOptions, ResolveError, ResolvedOptions, ScopePolicy, resolve,
 };
 use quantification_core::fingerprint::marker_checksum;
-use quantification_core::ledger::{Commit, framing};
+use quantification_core::ledger::{Commit, CommitKind, framing};
 use quantification_core::pipeline::{ALGO_VERSION, Clock, Compressor, MonotonicClock, Stats};
 
 const CHAT_CORPUS: &[&str] = &[
@@ -231,7 +231,8 @@ fn the_pretty_and_minified_chat_variants_compress_the_same_span() {
         );
         assert!(
             !text(&run.payload).contains('\u{27ea}'),
-            "an all-ascii span resolves to the ascii style"
+            "a single all-ascii span resolves to the ascii style; the mixed-style case is \
+             each_span_renders_in_its_own_resolved_style"
         );
     }
     let anchor = b"2026-08-25T10:00:01Z INFO hc 10.0.0.1 ok";
@@ -676,6 +677,192 @@ fn recompressing_an_output_is_a_fixed_point() {
     }
 }
 
+const REPRO: [&str; 6] = [
+    "2026-08-25T10:00:01Z INFO hc 10.0.0.1 GET /v1/users?id=1 id=aaaaaaaa-1111-2222-3333-444444444444 took 5ms",
+    "2026-08-25T10:00:02Z INFO hc 10.0.0.2 GET /v1/users?id=2 id=bbbbbbbb-1111-2222-3333-444444444444 took 6ms",
+    "2026-08-25T10:00:03Z INFO hc 10.0.0.3 <- 200 bytes 4001 status 7ms id=cccccccc-1111-2222-3333-444444444444 took 7ms",
+    "2026-08-25T10:00:04Z INFO hc 10.0.0.4 GET /v1/users?id=3 id=dddddddd-1111-2222-3333-444444444444 took 8ms",
+    "2026-08-25T10:00:05Z INFO hc 10.0.0.5 GET /v1/users?id=4 id=eeeeeeee-1111-2222-3333-444444444444 took 9ms",
+    "2026-08-25T10:00:06Z INFO hc 10.0.0.6 <- 200 bytes 4003 status 7ms id=ffffffff-1111-2222-3333-444444444444 took 10ms",
+];
+
+#[test]
+fn a_block_whose_anchor_hides_a_shorter_period_is_not_a_fixed_point_of_itself() {
+    let payload = doc(&[("user", &joined(&REPRO.map(String::from)))]);
+    let once = compress(&payload, &defaults());
+    let twice = compress(&once.payload, &defaults());
+    assert_eq!(once.commits.len(), 2, "the two hidden pairs, not one block");
+    assert!(
+        once.commits.iter().all(|commit| {
+            commit.kind == CommitKind::TemplatedBlock
+                && commit.count == 1
+                && commit.removed.len() == 2 * commit.anchor.len() + 2
+        }),
+        "no commit keeps the three-line anchor that hid the pair: {:?}",
+        once.commits
+    );
+    assert_eq!(twice.payload, once.payload, "the repro is a fixed point");
+    assert_eq!(twice.stats.groups_collapsed, 0);
+    assert!(once.payload.len() < payload.len());
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+const ROLES: [&str; 4] = ["hc", "gateway", "pool", "worker"];
+const PADS: [&str; 4] = ["", "  ", "\\t", " \\t "];
+
+fn burst_line(rng: &mut Rng, role: &str, kind: usize, entry: usize) -> String {
+    let second = rng.below(60);
+    let ip = rng.below(64) + 1;
+    let tail = match kind {
+        0 => format!("GET /v1/users?id={entry}"),
+        1 => format!("<- 200 bytes {} status 7ms", 4000 + entry),
+        2 => format!("pool conns {entry} idle 0"),
+        _ => format!("boot phase node 10.1.{ip}.{} ok", entry % 256),
+    };
+    format!(
+        "2026-08-25T10:00:{second:02}Z INFO {role} 10.0.0.{ip} {tail} id={entry:08x}-1111-2222-3333-{entry:012x} took {}ms",
+        rng.below(900)
+    )
+}
+
+fn padded(rng: &mut Rng, line: &str) -> String {
+    let pad = PADS[rng.below(PADS.len())];
+    format!("{pad}{line}{pad}")
+}
+
+fn burst_span(rng: &mut Rng) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for group in 0..1 + rng.below(4) {
+        let role = ROLES[rng.below(ROLES.len())];
+        let header = burst_line(rng, role, 3, group);
+        lines.push(padded(rng, &header));
+        let pattern: Vec<usize> = (0..1 + rng.below(3)).map(|_| rng.below(2)).collect();
+        for entry in 0..2 + rng.below(3) {
+            for kind in &pattern {
+                let fresh = burst_line(rng, role, *kind, group * 7 + entry);
+                lines.push(padded(rng, &fresh));
+            }
+        }
+        if rng.below(4) == 0 {
+            let repeated = lines.clone();
+            for (offset, previous) in repeated.iter().enumerate() {
+                if offset % 3 == 0 {
+                    lines.push(previous.clone());
+                } else {
+                    let fresh = burst_line(rng, role, offset % 2, group + offset);
+                    lines.push(padded(rng, &fresh));
+                }
+            }
+        }
+    }
+    joined(&lines)
+}
+
+const GENERATED_BURSTS: usize = 2000;
+
+fn generated_payloads(count: usize) -> Vec<Vec<u8>> {
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    (0..count)
+        .map(|_| {
+            let spans: Vec<String> = (0..1 + rng.below(2))
+                .map(|_| burst_span(&mut rng))
+                .collect();
+            let borrowed: Vec<(&str, &str)> =
+                spans.iter().map(|span| ("user", span.as_str())).collect();
+            doc(&borrowed)
+        })
+        .collect()
+}
+
+fn output_offset(at: usize, commits: &[Commit]) -> usize {
+    let mut out = at;
+    for commit in commits {
+        if commit.removed.end <= at {
+            out -= commit.removed.len() - commit.anchor.len();
+        }
+    }
+    out
+}
+
+#[test]
+fn generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_anchor() {
+    let opts = defaults();
+    let payloads = generated_payloads(GENERATED_BURSTS);
+    let mut compressor = Compressor::new();
+    let mut out = Vec::new();
+    let (mut compressed, mut divergent) = (0, 0);
+    for payload in &payloads {
+        compressor.compress(payload, &opts, &mut out);
+        let once = out.clone();
+        let first = compressor.commits().to_vec();
+        if once.len() < payload.len() {
+            compressed += 1;
+        }
+        compressor.compress(&once, &opts, &mut out);
+        let twice = out.clone();
+        if twice == once {
+            continue;
+        }
+        divergent += 1;
+        let anchors: Vec<(usize, usize)> = first
+            .iter()
+            .map(|commit| {
+                (
+                    output_offset(commit.anchor.start, &first),
+                    output_offset(commit.anchor.end, &first),
+                )
+            })
+            .collect();
+        assert!(
+            !compressor.commits().is_empty(),
+            "a divergence must come from a group, not from nothing"
+        );
+        for commit in compressor.commits() {
+            let removed = &once[commit.removed.clone()];
+            let marker = removed.windows(5).any(|window| window == b" ...]");
+            let anchor = anchors
+                .iter()
+                .any(|(start, end)| commit.removed.start < *end && *start < commit.removed.end);
+            assert!(
+                marker || anchor,
+                "a second pass may only merge over an emitted marker or an anchor, got {:?} over {:?}",
+                commit.kind,
+                text(&removed[..removed.len().min(120)])
+            );
+        }
+        compressor.compress(&twice, &opts, &mut out);
+        assert_eq!(
+            out, twice,
+            "every payload must reach a fixed point within two recompressions"
+        );
+    }
+    assert!(
+        compressed * 2 >= payloads.len(),
+        "only {compressed} of {} generated payloads compressed: the corpus is not exercising the stages",
+        payloads.len()
+    );
+    assert!(
+        divergent * 100 <= payloads.len() * 5,
+        "{divergent} of {} generated payloads are not fixed points (3.15% measured, 5% ceiling)",
+        payloads.len()
+    );
+}
+
 #[test]
 fn prior_marker_text_round_trips_untouched() {
     let payload = fixture("edges/prior-markers.json");
@@ -759,18 +946,15 @@ fn oracle(style: MarkerStyle, commit: &Commit, anchor: &[u8]) -> String {
 }
 
 fn marker_at(rest: &[u8], commit: &Commit, anchor: &[u8]) -> String {
-    for style in [MarkerStyle::Ascii, MarkerStyle::Unicode] {
-        let marker = oracle(style, commit, anchor);
-        if rest.starts_with(marker.as_bytes()) {
-            return marker;
-        }
-    }
-    panic!(
-        "no legal {} marker for count {} follows the anchor in {:?}",
-        commit.kind.core(MarkerStyle::Ascii).1,
+    let marker = oracle(commit.style, commit, anchor);
+    assert!(
+        rest.starts_with(marker.as_bytes()),
+        "no {} marker for count {} follows the anchor in {:?}",
+        commit.kind.core(commit.style).1,
         commit.count,
         text(&rest[..rest.len().min(64)])
-    )
+    );
+    marker
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -836,8 +1020,12 @@ fn record_splits_counts_the_over_cap_lines_of_stage_one_b() {
         &defaults(),
     );
     assert_eq!(
-        dump.stats.block_repeats, 2,
+        dump.stats.block_repeats, 1,
         "stage 1b records collapse through stage 5"
+    );
+    assert_eq!(
+        dump.commits[0].count, 1022,
+        "the four-record period is the anchor, not a shorter one"
     );
     assert!(dump.payload.len() < dump.stats.bytes_in as usize / 8);
     let wall = compress(&fixture("edges/stage1b-record-len-16385.json"), &defaults());
@@ -911,6 +1099,64 @@ fn a_non_ascii_span_resolves_to_the_unicode_style() {
         }),
     );
     assert!(text(&forced.payload).contains("[... x5 rows, template"));
+}
+
+#[test]
+fn each_span_renders_in_its_own_resolved_style() {
+    let ascii = joined(&log_burst(6));
+    let unicode = joined(
+        &(0..6)
+            .map(|at| format!("2026-08-25T10:00:0{at}Z INFO caf\u{e9} 10.0.0.1 ok"))
+            .collect::<Vec<_>>(),
+    );
+    let payload = doc(&[("user", &ascii), ("user", &unicode)]);
+    let run = compress(&payload, &defaults());
+    assert_eq!(run.commits.len(), 2);
+    assert_eq!(run.commits[0].style, MarkerStyle::Ascii);
+    assert_eq!(run.commits[1].style, MarkerStyle::Unicode);
+    let rendered = text(&run.payload);
+    assert!(
+        rendered.contains("[... x5 rows, template"),
+        "the all-ascii span keeps the ascii fallback: {rendered}"
+    );
+    assert!(
+        rendered.contains("\u{27ea}\u{d7}5 rows, template"),
+        "the non-ascii span gets the unicode marker: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("[... x").count(),
+        1,
+        "one ascii marker only"
+    );
+    assert_eq!(
+        rendered.matches('\u{27ea}').count(),
+        1,
+        "one unicode marker only"
+    );
+}
+
+#[test]
+fn reversible_is_echoed_but_still_not_honoured() {
+    let payload = doc(&[("user", &joined(&log_burst(6)))]);
+    let off = options(&RawOptions {
+        reversible: Some(false),
+        ..RawOptions::default()
+    });
+    let on = options(&RawOptions {
+        reversible: Some(true),
+        ..RawOptions::default()
+    });
+    let without = compress(&payload, &off);
+    let with = compress(&payload, &on);
+    assert_eq!(with.payload, without.payload);
+    assert_eq!(with.commits, without.commits);
+    assert!(
+        without
+            .stats
+            .options_echo
+            .ends_with(r#""reversible":false}"#)
+    );
+    assert!(with.stats.options_echo.ends_with(r#""reversible":true}"#));
 }
 
 // ---------------------------------------------------------------- determinism of the plumbing
@@ -1014,25 +1260,36 @@ fn a_span_never_bleeds_into_its_neighbour() {
     assert_eq!(together.commits[1].count, alone.commits[0].count);
 }
 
+fn uses(source: &str, banned: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == banned)
+}
+
 #[test]
 fn the_pipeline_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/pipeline.rs");
+    assert!(
+        !uses("let brand = 1;", "rand"),
+        "the scan must not be a substring match"
+    );
+    assert!(
+        uses("let x = rand::rng();", "rand"),
+        "the scan must see a real use"
+    );
     for banned in [
         "HashMap",
         "RandomState",
         "BTreeMap",
         "SystemTime",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(
-            !source.contains(banned),
-            "the pipeline must not use {banned}"
-        );
+        assert!(!uses(source, banned), "the pipeline must not use {banned}");
     }
     assert!(
         source.matches("now_ns()").count() == 4,
