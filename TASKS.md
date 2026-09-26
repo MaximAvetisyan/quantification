@@ -2065,8 +2065,9 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W3.2 HTTP/axum** (§6.1) ∥ **W3.3 gRPC/tonic unary** (§6.2) ∥
   **W3.4 CCR store + Restore** (§9, flag-gated) — all parallel behind W3.1;
   W3.2 implements `X-Stats-*` naming verbatim.
-  Status: **complete** (2026-09-27). `crates/server` is now a lib plus a thin
-  bin: `src/lib.rs` (router, handlers, error mapping, Prometheus counters),
+  Status: **complete** (2026-09-27) for W3.2; **W3.3 is recorded below** and
+  W3.4 is open. `crates/server` is now a lib plus a thin bin: `src/lib.rs`
+  (router, handlers, error mapping, Prometheus counters),
   `src/options.rs` (query parser + option mapping, the only place a §6.1 option
   is spelled), `src/headers.rs` (`Stats` → `X-Stats-*`), `src/main.rs`
   (`axum::serve` on `QUANT_HTTP_ADDR`, default `127.0.0.1:8080`). Public
@@ -2227,7 +2228,162 @@ exit criteria. Gates M1–M4 are blocking milestones.
   `?envelope=json` and the bare path are the only two shapes. §3, §4.5, §6.1's
   endpoint table, §6.1's options table, §6.1's header naming, §7's
   `request_body_limit` and §9's flag-gating are otherwise implemented as
-  written, and gRPC and the CCR store remain W3.3's and W3.4's.
+  written, and gRPC was W3.3's, now below, with the CCR store still W3.4's.
+
+- **W3.3 gRPC/tonic unary** (§6.2) — the `compressor.v1.Compressor` service
+  beside W3.2's HTTP transport, unary only.
+  Status: **complete** (2026-09-27). One new source file,
+  `crates/server/src/grpc.rs`, plus its suite in
+  `crates/server/tests/grpc.rs`; the only lines added to W3.2's files are
+  `pub mod grpc;` in `src/lib.rs` and a second listener in `src/main.rs`
+  (`QUANT_GRPC_ADDR`, default `127.0.0.1:50051`, served with
+  `tonic::transport::Server`), and one match arm in `src/options.rs`
+  `resolve_message` (see the last paragraph). No route, header name, option
+  spelling or public name of W3.2 changed. `crates/core` and `crates/proto` are
+  untouched; the service calls only W3.1 and uses W1.6's
+  `convert::{to_raw_options}` and enum conversions as they stand.
+  **Public surface:** `grpc::Service::{new, with_store}`, `grpc::RestoreStore`
+  (the W3.4 seam), `grpc::server(Service) -> CompressorServer<Service>`
+  (limits applied, for `tonic::transport::Server`), `grpc::routes(Service) ->
+  tonic::service::Routes` (in-process serving, what the tests drive), and W3.2's
+  `CCR_ENABLED` is reused rather than re-spelled.
+  **RPC surface — exactly the two §6.2 methods, both unary:**
+
+  | Method | Path | Success | Failures |
+  |---|---|---|---|
+  | `Compress` | `/compressor.v1.Compressor/Compress` | `CompressResponse{payload, stats}`, payload = the core's bytes verbatim | `InvalidArgument` (3, 400/422 analogue), `OutOfRange` (11) over `request_body_limit`, `Internal` (13) if the blocking task dies |
+  | `Restore` | `/compressor.v1.Compressor/Restore` | `RestoreResponse{original}` only with a wired store under `--features ccr` | `Unimplemented` (12) always in the default build, `NotFound` (5) on a store miss |
+
+  **Status-code mapping** (§3, §6.2). gRPC has no 422 and no error-code field,
+  so `ApiError::as_str()` is prefixed onto every message and the HTTP status
+  becomes `InvalidArgument`: `ApiError::Options` ⇒
+  `invalid_options: <W3.2's resolve_message>` (so `min_group_size=1` reads
+  `invalid_options: min_group_size=1 is below the minimum of 2` and a reserved
+  `scope_policy` reads `… is reserved`), `ApiError::Malformed` ⇒ `malformed:
+  …` (only reachable in a `strict_validate` build), and
+  `ApiError::ContentTypeMismatch` ⇒ the core's own
+  `content_type_mismatch: pinned <pinned> but the payload sniffs as <sniffed>`,
+  which is the **only** way an `InvalidArgument` carries §3's reserved meaning
+  and is reachable **only** through an explicit `content_type` pin; an unpinned
+  unknown schema, a malformed document and a `Text` pin are all a 200-status
+  `CompressResponse` with the payload passed through and
+  `degraded=true`/`noop_reason` set. An out-of-range enum value on the wire
+  (`content_type`, `scope_policy`, `marker_style`) is `InvalidArgument` with
+  `invalid_argument: <field>=<value> is not a value of its compressor.v1 enum`,
+  because W3.2 answers HTTP's garbage option value with a 400 and parity is the
+  point; W1.6's `to_raw_options` would silently default it, so the three
+  discriminants are checked before it is called (the file is not modified).
+  A message over `request_body_limit` is refused by tonic's own length guard
+  before the body is buffered — `max_decoding_message_size(config::REQUEST_BODY_LIMIT)`
+  on the generated server — and surfaces as `OutOfRange` with
+  `Error, decoded message length too large: found … the limit is: 67108864 bytes`,
+  which is tonic's code for that check (the HTTP transport's 413 analogue);
+  tonic's 4 MiB default is replaced, so a 5 MiB payload is served.
+  **`Stats`** is filled field by field in §6.2's wire order (1…19):
+  `bytes_in`/`bytes_out` (the latter also the response length),
+  `approx_tokens_in`/`approx_tokens_out` (bytes/4), the five detector counters,
+  `templated_blocks`, `record_splits`, `degraded`, `noop_reason`
+  (`""` when compressed, `"unknown_schema"`/`"malformed"` on a pass-through),
+  the three `elapsed_*_ns`, `algo_version` (`ALGO_VERSION`) and `options_echo`
+  (W3.1's canonical string, field order untouched, never reformatted).
+  **§6.2 field 19 `restore_ids` is always empty**: §9's store is W3.4's, v1
+  compression stores nothing, so a compress answer never reports an id
+  (asserted in every stats assertion). `Restore` is feature-gated exactly like
+  W3.2's `/v1/restore`: with the `ccr` feature off it answers `Unimplemented`
+  with W3.2's "disabled in this build" message; with it on and no store wired
+  it answers `Unimplemented` with the "not implemented yet" message; a wired
+  store is consulted through `RestoreStore::restore_verified(&str) ->
+  Option<Vec<u8>>`, whose `None` (a miss, i.e. §9's length+hash re-verification
+  failing) is `NotFound`. No store behaviour is invented here — the trait is an
+  interface with no implementation in the tree, and W3.4 plugs one in without
+  touching this file.
+  **Option semantics are W3.2's**, because W1.6's `optional bool` restores
+  presence: an absent `options` message and an absent `normalize_ws` resolve to
+  the §7 default `true` (echo
+  `{"scope_policy":"user_content","min_group_size":3,"normalize_ws":true,"template_dedup":true,"marker_style":"auto","reversible":false}`),
+  an explicit `false` stays `false` and changes the output, `min_group_size=0`
+  is the default 3, and `content_type=AUTO` is the auto sniff. The proto enum
+  names are W1.6's (`MARKER_STYLE_*`, `CONTENT_TYPE_*`), a deviation this wave
+  inherits unchanged.
+  **Core purity.** The compression runs inside `tokio::task::spawn_blocking`,
+  and the non-`Send` seam is solved exactly as W3.2 solved it: W3.1's
+  `api::Compressor` holds `Box<dyn Clock + 'static>`, which is not `Send`, so it
+  cannot live in the `Arc`-shared service state tonic requires; a fresh
+  `Compressor::new()` (i.e. `MonotonicClock`) and a fresh `Vec` pre-sized with
+  `api::reserve` are built **inside** the blocking closure, so the non-`Send`
+  value never crosses a task boundary and the `elapsed_*` fields are the only
+  thing tokio can influence. Output bytes cannot depend on tokio, the wall
+  clock or the thread count (§5.5); the same `Arc<dyn Clock>`-in-`Service`
+  reason also means **no gRPC metrics** — W3.2's four Prometheus families count
+  only HTTP, and a fifth family would have had to change W3.2's renderer and
+  its test.
+  **No streaming, asserted two ways** (§5.6): `the_proto_declares_no_streaming_rpc`
+  token-scans `quantification_proto::COMPRESSOR_PROTO` (no `stream` token
+  anywhere; exactly the two `rpc` lines of §6.2), and
+  `the_service_exposes_two_unary_methods_and_no_streaming_ones` posts raw
+  requests to the routing tree: `Compress`/`Restore` are routed (they answer
+  something other than `Unimplemented`), while `CompressStream`,
+  `CompressBidiStream`, `CompressServerStream`, `CompressChunked`,
+  `StreamCompress`, `Subscribe` and `Watch` are not methods of the service at
+  all (`grpc-status: 12` with no message, i.e. the generated server's default
+  arm).
+  **HTTP/gRPC parity is the headline test.**
+  `http_and_grpc_answer_with_identical_bytes_and_stats` drives a 15-case table
+  (every detector, both scope policies, both marker styles, `min_group_size`,
+  a `responses` and a `text` pin, an unknown schema, a malformed document) and
+  asserts for each case that the bare HTTP body, the `?envelope=json` payload
+  and the gRPC `CompressResponse.payload` are the **same bytes**, that the
+  bytes are the core's own output, and that the 13 non-timing `Stats` fields
+  plus `options_echo` are equal to the envelope's.
+  `every_case_answers_the_core_bytes_and_a_full_stats_message` then asserts the
+  full message field by field against the core's `Stats`, and
+  `the_reversible_option_is_decided_the_same_way_by_both_transports` asserts
+  parity of *outcome* for `reversible=true` (whatever the core decides, both
+  transports decide it identically) because that option's fate belongs to W3.4.
+  Also asserted: every option's effect on the output, the wire round trip of
+  `optional bool`, the pinned-contradiction vs matching-pin split, the
+  unknown-enum and reserved-option `InvalidArgument`s, `Unimplemented` `Restore`
+  in both feature states, the real limit paths, eight repeated identical
+  requests encoding to **byte-identical** `CompressResponse`s once the three
+  `elapsed_*` fields are zeroed (they are the only non-deterministic bytes, and
+  §5 forbids them from touching anything else), and a real HTTP/2 round trip
+  over a `TcpListener` for the serving path `main.rs` uses.
+  Tests: **9 unit** in `grpc.rs` (the content-type mapping, the status table,
+  the `Stats` mapping, the degraded reason, the option presence mapping, the
+  unknown-enum refusals, the `ccr` gate, the service name, the proto token
+  scan) and **15 integration** in `crates/server/tests/grpc.rs`; 24 new tests
+  in total, 20 of them unit-plus-integration green in the default, `ccr` and
+  `strict_validate` feature states (`cargo test -p quantification-server`).
+  Dependencies added to `crates/server`: `tonic` 0.14 (MIT) and, for the tests,
+  `prost` 0.14 (Apache-2.0) — plus `quantification-proto` by path; all four
+  were already in the graph through W1.6, so `Cargo.lock` gained no package,
+  only the server's own dependency edges, and `deny.toml` needed no change.
+  **Deviations from DESIGN: two, recorded here rather than in DESIGN.md.**
+  (1) **The gRPC error discriminator is the message, not a code field.** gRPC
+  statuses cannot carry §6.1's `error.code`, so the transport prefixes
+  `ApiError::as_str()` (`invalid_options`, `malformed`,
+  `content_type_mismatch`, `invalid_argument`) onto the message text; a client
+  that wants a stable discriminator must match the prefix. §6.2 pins no error
+  shape at all, so this is a reading, and DESIGN.md §6.2 should state it next to
+  the status table. (2) **Three additions to W3.2's files, all forced.** W3.2's
+  `src/lib.rs` needed `pub mod grpc;` (the module is otherwise unreachable) and
+  `src/main.rs` a second listener (a transport the binary cannot serve is not a
+  transport), both purely additive with no existing line removed or reordered —
+  the same shape as W3.1's and W2.9's one-line `pub mod` additions. The third is
+  not mine in spirit: the concurrent `crates/core` work added
+  `ResolveError::UnsupportedReversible`, which made W3.2's `options.rs`
+  `resolve_message` non-exhaustive and left **the whole crate uncompilable**, so
+  this wave added the missing arm ("reversible=true is not accepted; the
+  reversible store (DESIGN section 9) is not implemented yet") and both
+  transports report it identically. Two pre-existing tests now fail because of
+  that core change rather than of this wave, and both are in files this wave
+  does not own: `crates/proto`'s
+  `convert::tests::explicit_false_survives_wire_and_resolves_false` (it asserts
+  `reversible=true` resolves) and W3.2's
+  `reversible_is_accepted_and_reserved`. §3's degradation policy, §4.5's
+  marker/Stats set, §5's determinism, §6.1's option semantics, §6.2's service
+  shape, §6.2's `Stats` message and §7's `request_body_limit` are implemented
+  as written.
 
 ## Wave 4 — verification & perf (overlaps Waves 2–3 where noted)
 

@@ -598,10 +598,13 @@ name = "quantification-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "prost",
  "quantification-core",
+ "quantification-proto",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "tower",
 ]
 

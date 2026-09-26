@@ -108,6 +108,9 @@ pub fn resolve_message(error: ResolveError) -> String {
         ResolveError::UnsupportedScopePolicy(policy) => {
             format!("scope_policy={} is reserved", policy.as_str())
         }
+        ResolveError::UnsupportedReversible => {
+            "reversible=true is not accepted; the reversible store (DESIGN section 9) is not implemented yet".to_string()
+        }
         ResolveError::MinGroupSizeBelowTwo(size) => {
             format!("min_group_size={size} is below the minimum of 2")
         }
