@@ -1869,6 +1869,199 @@ exit criteria. Gates M1–M4 are blocking milestones.
 
 - **W3.1 Library API** — `crates/core` public surface, options resolution
   echo, `strict_validate` flag (§4.1). Sequential first.
+  Status: **complete** (2026-09-27). The stable surface is the new module
+  `quantification_core::api` (`crates/core/src/api.rs`); `crates/core/src/lib.rs`
+  gained the single line `pub mod api;` (no existing line reordered or removed)
+  and `crates/core/Cargo.toml` gained the `[features]` table below. **The exact
+  signatures W3.2/W3.3/W3.4 build on, frozen here:**
+  ```rust
+  pub const STRICT_VALIDATE: bool;                       // cfg!(feature = "strict_validate")
+  pub use crate::config::{MarkerStyle, RawOptions, ResolveError, ScopePolicy};
+  pub use crate::locator::NoopReason;                    // = locator::NoopReason
+  pub use crate::pipeline::{ALGO_VERSION, Clock, MonotonicClock, Stats};
+  pub use crate::sniff::Schema as ContentType;           // Chat|Responses|Messages|Text
+
+  pub struct Request {
+      pub content_type: Option<ContentType>,   // None = AUTO (§6.2's ContentType::Auto)
+      pub options: RawOptions,                 // the §6.1 option set, §7 defaults
+  }
+  impl Request {
+      pub fn pinned(content_type: ContentType) -> Self;         // Request::default() = auto
+      pub fn with_options(self, options: RawOptions) -> Self;
+  }
+
+  pub enum ApiError {
+      Options(ResolveError),
+      ContentTypeMismatch { pinned: ContentType, sniffed: Option<ContentType> },
+      Malformed,                                                // strict_validate only
+  }
+  impl ApiError { pub fn as_str(&self) -> &'static str; }        // + Display
+
+  pub struct Compressor { /* private: pipeline::Compressor */ }
+  impl Compressor {
+      pub fn new() -> Self;                                      // MonotonicClock
+      pub fn with_clock(clock: impl Clock + 'static) -> Self;   // the W2.9 seam, unchanged
+      pub fn compress(
+          &mut self,
+          payload: &[u8],
+          request: &Request,
+          out: &mut Vec<u8>,                                    // caller-owned, reused
+      ) -> Result<Stats, ApiError>;
+  }
+  pub fn reserve(out: &mut Vec<u8>, input_len: usize);          // pre-sizing helper
+  ```
+  One obvious entry point: `compress(bytes, request, out) -> Result<Stats,
+  ApiError>`, the compressed bytes landing in the caller's `out`. It is pure
+  (§3): no tokio, no IO, no wall clock, no RNG, no env; the `Clock` seam is
+  injectable through `with_clock` and can reach nothing but the three
+  `elapsed_*` fields (the api module itself never calls `now_ns`, pinned by a
+  source scan, and `a_pathological_clock_cannot_change_the_output` injects a
+  clock that returns `u64::MAX`/`0` alternately and **panics on a fifth read**,
+  asserting byte-identical output). `reserve` is the pre-sizing helper the
+  design already had: it is `splice::spliced_len(input_len, &[])` — the
+  splicer's own length function with no commits, which is an upper bound on
+  every possible output because §4.4's profitability gate never grows a
+  payload — so one `Compressor` plus one reserved `Vec<u8>` serves a whole
+  request stream with no per-call output allocation
+  (`the_reserved_buffer_is_reused_and_never_reallocates`). Options are
+  resolved per call through the existing `config::resolve` and the resolved
+  options' `options_echo` rides out in `Stats::options_echo` (§6.2 field 17)
+  **verbatim** — `api` never reformats it; the canonical field order and the §7
+  defaults are pinned end-to-end by
+  `the_seven_defaults_reach_the_echo_end_to_end` and
+  `every_option_reaches_the_echo_in_the_section_six_one_order`.
+  **The pinned-`content_type` path** (the only error §3's degradation policy
+  reserves, `422 InvalidArgument`): `Request::pinned(ContentType)` makes the
+  caller's claim explicit, and the pin **drives location** — it is not a
+  validation-only hint. `ApiError::ContentTypeMismatch` is raised when the
+  payload plainly contradicts the pin, decided from `sniff::sniff`'s own
+  normative discriminators and nothing else (§4.1's candidate order, frozen by
+  W1.1), so no second scanner is needed:
+  * `sniff == Some(pinned)` ⇒ never a contradiction;
+  * `sniff == None` and the pin is a JSON schema ⇒ contradiction (the payload
+    matches no known schema, e.g. `{"foo":1}`);
+  * `Text` pinned ⇒ **never** a contradiction (plain text is opaque and the pin
+    is a legitimate way to say "compress this whole buffer", including a
+    buffer that happens to start with a brace);
+  * `Chat`/`Messages` vs `Chat`/`Messages` ⇒ **never** a contradiction in either
+    direction — this is the one place a pin may legitimately disagree with the
+    sniff, and it is observable: a `tool_result` block is a `Tool` span under a
+    `Messages` pin and is not eligible at all under a `Chat` pin, which
+    `the_pin_decides_the_schema_and_not_the_sniff` pins (and the same payload
+    also shows the `user_and_tools` policy difference);
+  * every other pairing (`Responses` vs `Chat`/`Messages`, any JSON pin vs
+    `Text`) ⇒ contradiction, because the sniff's discriminators make the two
+    schemas mutually exclusive by construction (`Responses` requires root
+    `input` and *no* root `messages`; `Chat` requires root `messages`);
+  * and a document that the locator cannot parse under a pin is a
+    contradiction too, per §4.1's acceptance envelope ("never a 422 unless
+    `content_type` was explicitly pinned"), reported after the compression as
+    `ContentTypeMismatch` with the same shape.
+  Everything else degrades: an unpinned unknown schema is
+  `Ok(Stats { degraded: true, noop_reason: Some(UnknownSchema), .. })` with
+  byte-identical output, a malformed document is the same with `Malformed`, and
+  the two paths are asserted side by side by
+  `a_contradiction_is_an_error_while_an_unknown_schema_is_a_pass_through`. No
+  payload in the 26-fixture corpus is ever refused
+  (`no_fixture_of_the_corpus_is_ever_refused`), and the six degenerate payloads
+  (empty, whitespace, `null`, `{}`, `[]`, a bare string) pass through without a
+  panic or an error.
+  **`strict_validate` (§4.1).** An optional cargo feature **off by default**
+  (`[features] default = [], strict_validate = []`). When off, the whole
+  validator is `#[cfg]`-ed out and the only thing compiled in its place is
+  `fn strict(_payload: &[u8], _pinned: Option<ContentType>) -> Result<(), ApiError>
+  { Ok(()) }` — measured, the default release rlib is 728 266 bytes with **zero**
+  `api::Parser` symbols against 774 638 bytes with them, so the default build
+  pays no code, no allocation and no pass. **Cost when on: one extra full
+  O(n) recursive-descent pass over the payload (strict JSON grammar: exact
+  `true`/`false`/`null`, no leading zeros, `\uXXXX` validated, no raw control
+  byte in a string, no trailing bytes, `json_depth_cap` counted the same way
+  the locator counts it — 64 containers accepted, 65 refused — BOM tolerated),
+  plus one extra `sniff::sniff` on the unpinned path; allocation-free and
+  integer-only, but linear, so per §4.1 it is "acceptable for small payloads
+  only" and must not be enabled on the §8 8 MiB hot path blindly.** It never
+  changes output bytes for a document it accepts
+  (`with_the_flag_a_valid_payload_is_untouched_by_the_parse` diffs the api
+  against a raw `pipeline::Compressor` over the whole corpus, and the 12 chat
+  goldens are reproduced byte-for-byte in both feature states). It is skipped
+  when the effective content type is `Text` (there is no JSON guarantee to
+  give for opaque text), it only ever *rejects* — the failure is
+  `ApiError::Malformed` for an unpinned request, and a pinned request reports
+  every rejection as `ContentTypeMismatch` so that a transport's status mapping
+  never depends on the build. §3's `422` therefore stays reserved for
+  `ContentTypeMismatch`; a transport should map `Malformed` to `400`.
+  Both feature states are tested: 31 tests in the default build, 33 with
+  `--features strict_validate` (the extra two are the cfg'd pairs).
+  **One change to an existing file, called out.** `pipeline::Compressor::compress`
+  is sniff-driven and W1.1's `locate_as` is public, so a pin could not drive
+  location without threading the schema into the pipeline. `pipeline.rs` gained
+  `Compressor::compress_as(&[u8], Schema, &ResolvedOptions, &mut Vec<u8>) ->
+  Stats` and a private `run(..., pinned: Option<Schema>, ...)` that
+  `compress` now calls with `None`; the only behavioural line is
+  `pinned.or_else(|| sniff::sniff(payload))` in place of `sniff::sniff(payload)`,
+  plus `use crate::sniff::{self, Schema}`. `compress` is bit-identical (all 340
+  baseline tests and all 12 goldens unchanged) and the W2.9 source scans in
+  `tests/pipeline.rs` still hold, including the four-`now_ns()` and
+  stage-order invariants. No other existing module was touched.
+  **The surface is provably closed**, which is what keeps W3.2/W3.3 from
+  reaching around it: `the_public_surface_is_exactly_the_documented_items`
+  extracts every `pub` declaration from `api.rs` and compares it to the 21 items
+  above (any addition breaks the test and must be recorded here);
+  `no_public_signature_exposes_an_internal_type` token-scans every public
+  function signature and every public field against an allowlist of public types
+  (with a self-check that the scan rejects a synthetic
+  `-> &[Commit]` leak), pins the four public fields, and asserts the wrapped
+  `pipeline::Compressor` is a **private** field of `api::Compressor`;
+  `the_api_module_cannot_reach_the_detectors_the_ledger_or_the_fingerprint_tables`
+  token-scans the whole module for `detect`/`ledger`/`fingerprint`/`mask`/
+  `keys`/`stage1`/`wsnorm`/`s1`/`render` and for the internal types
+  `Commit`/`Span`/`Scratch`/`StageStats`/`Ledger` (the only internal modules it
+  may name are `config`, `pipeline`, `sniff`, `splice`, `locator`), and for the
+  §5 banned determinism inputs plus `tokio`/`std::io`/`std::fs`/`thread`; and
+  the same scan asserts the module carries no comment at all. The s1 spike is
+  still reachable only as `quantification_core::spike` and is **not** re-exported
+  here. Tests: 31 new integration tests in `crates/core/tests/api.rs`
+  (core 330 → 361, workspace 340 → **371**, 372 collected with
+  the one `#[ignore]`d golden generator; **373** with
+  `--features strict_validate`, which swaps the two default-build degradation
+  tests for four strict-parse ones).
+  They include the 12 chat goldens
+  reproduced through the public API, options resolution and echo end to end
+  (`min_group_size` 3 vs 4 on a three-line run, both forced marker styles
+  reaching the output, `scope_policy` selecting a `tool_result` span, the §7
+  defaults pinned as one string), W2.9 observation (5) carried into the api
+  layer (`min_group_size` gates stages 3/4/6 but *not* stage 7, whose minimum
+  is a period), W2.9 deviation (2) restated for the transport
+  (`reversible` is resolved, echoed and still changes nothing — a transport
+  must document it as reserved until W3.4), byte-identical output between the
+  auto and a matching pin over the whole corpus, 64 repeated rounds over the
+  corpus byte-identical, the pathological-clock test, the buffer-reuse tests,
+  and the pass-through/degrade tests. Verification: `cargo test --workspace`
+  **371 green** (372 collected, the ignored golden generator),
+  `cargo test --workspace --features strict_validate` **373 green**,
+  `cargo fmt --all --check` clean, `cargo clippy --workspace --all-targets --
+  -D warnings` clean in both feature states, `cargo check` on the excluded
+  `fuzz/` crate clean, a default-feature release build inspected for the
+  absence of the validator. No new dependency, no golden file and no
+  DESIGN.md change.
+  **Deviations from DESIGN: two, both recorded here rather than in
+  DESIGN.md.** (1) **`§3`'s "422 only for an explicitly pinned `content_type`
+  that the payload plainly contradicts" needs a decision §3 does not make: what
+  "plainly contradicts" is for a pin that merely *disagrees* with the sniff.**
+  The decision above (the sniff's own discriminators decide, with the
+  `Chat`/`Messages` family treated as compatible in both directions and `Text`
+  as never contradicting) is a reading, not a quote, and it is the reason a
+  pin is allowed to change the output at all. (2) **`§4.1`'s `strict_validate`
+  is a flag with no defined failure mode**: §4.1 says the feature runs "full
+  parse" for "parse guarantees" and that malformed input "never [a 422] unless
+  `content_type` was explicitly pinned", but it does not say what a *caller who
+  asked for the guarantee* gets when the parse fails. This implementation
+  answers: a typed `ApiError::Malformed` for an unpinned request (not a
+  pass-through, and deliberately **not** a 422, which §3 reserves) and
+  `ContentTypeMismatch` for a pinned one. §3, §4.1, §6.1, §6.2, §7, §8 and §9
+  are otherwise implemented as written, and `reversible` stays deviation (2) of
+  the W2.9 record.
+
 - **W3.2 HTTP/axum** (§6.1) ∥ **W3.3 gRPC/tonic unary** (§6.2) ∥
   **W3.4 CCR store + Restore** (§9, flag-gated) — all parallel behind W3.1;
   W3.2 implements `X-Stats-*` naming verbatim.

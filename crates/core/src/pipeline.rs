@@ -6,7 +6,7 @@ use crate::detect::{blocks, exact, templ, templ_blocks, wsruns};
 use crate::ledger::{Commit, Ledger, StageStats};
 use crate::locator::{NoopReason, Span, locate_into};
 use crate::render::resolve_style;
-use crate::sniff;
+use crate::sniff::{self, Schema};
 use crate::splice::splice_into;
 use crate::stage1;
 
@@ -144,6 +144,26 @@ impl Compressor {
         options: &ResolvedOptions,
         out: &mut Vec<u8>,
     ) -> Stats {
+        self.run(payload, None, options, out)
+    }
+
+    pub fn compress_as(
+        &mut self,
+        payload: &[u8],
+        schema: Schema,
+        options: &ResolvedOptions,
+        out: &mut Vec<u8>,
+    ) -> Stats {
+        self.run(payload, Some(schema), options, out)
+    }
+
+    fn run(
+        &mut self,
+        payload: &[u8],
+        pinned: Option<Schema>,
+        options: &ResolvedOptions,
+        out: &mut Vec<u8>,
+    ) -> Stats {
         let Compressor {
             clock,
             spans,
@@ -151,7 +171,7 @@ impl Compressor {
             stages,
         } = self;
         let detect_start = clock.now_ns();
-        let noop = match sniff::sniff(payload) {
+        let noop = match pinned.or_else(|| sniff::sniff(payload)) {
             None => {
                 spans.clear();
                 Some(NoopReason::UnknownSchema)

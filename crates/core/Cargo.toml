@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+default = []
+strict_validate = []
+
 [dependencies]
 twox-hash = { version = "2.1.2", default-features = false, features = [
     "std",
