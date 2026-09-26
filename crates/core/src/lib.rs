@@ -1,5 +1,7 @@
 pub mod config;
 mod s1;
+pub mod stage1;
+pub mod stage1b;
 
 pub use s1::{Role, Span};
 pub mod benches {

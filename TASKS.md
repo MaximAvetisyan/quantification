@@ -72,6 +72,69 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W1.2 Unit splitter** (§4.4 stages 1+1b) — line split; normative record
   segmentation `u_head`/`u_i`/`u_tail`; caps. Exit: property test — units +
   joiners reassemble to the original span byte-for-byte.
+  Status: **complete** (2026-09-26). Stage 1
+  (`quantification_core::stage1::split_span`) walks the raw escaped bytes one
+  escape unit at a time (2-byte simple escapes, 6-byte `\uXXXX`, truncated
+  tails tolerated) and cuts a line at each **line-boundary escape unit**: the
+  2-byte `\n` plus the 6-byte `\u000A`/`\u000a` (§4.2; the four hex bytes must
+  be `000A` or `000a` — no other variants exist). The boundary test lives
+  inside that escape-unit walk, never a second substring scan, so `\u005Cn`
+  does not split, `\\` followed by `\u000A` does, and a truncated trailing `\`
+  never does. A boundary unit belongs to neither line, so it becomes joiner
+  bytes (6 for the `\u` form) — the removal rule's joining
+  **line-boundary escape units** are exactly those gaps, never part of a
+  member; adjacent boundaries concatenate — `a\n\u000Ab`
+  yields one 8-byte joiner, `a\u000A\u000Ab` one 12-byte joiner, and a span
+  that is just `\u000A` yields zero units. Lines over `max_line_bytes` are
+  handed to stage 1b, the last line without a trailing separator is included,
+  blank lines fold into the joiner, and every unit range is absolute within
+  the span. Stage 1b (`stage1b::segment_line`, crate-private — every test
+  drives it through `split_span`) keeps the literal §4.4 ranges `u_head` /
+  `u_i` / `u_tail` on literal `},{` with **no edge special-casing**: 1-byte
+  units are kept symmetrically (a line starting `},{` keeps the bare `}`; a
+  line ending `},{` keeps the trailing `{`), empty units are discarded, and
+  no-separator lines plus over-cap records stay verbatim. `eligible` is
+  `len <= max_record_bytes`; an under-cap line never reaches stage 1b and stays
+  one eligible unit. `Unit { range, eligible }` carries no joiner —
+  `stage1::joiner` derives the gap from the distance to the next unit, so no
+  duplicated state can drift, and it asserts its precondition (units ascending
+  and disjoint, i.e. valid only on the *unfiltered* list — W2 must re-derive
+  `removed_bytes` from committed units instead of reusing this joiner, pinned
+  by a `should_panic` test). `reassemble` is a test/reassembly helper, so it
+  lives in the integration test and (as an independent oracle) in the fuzz
+  target rather than in the public API.
+  Tests: 30 integration tests in `crates/core/tests/stage1_split.rs`
+  (workspace total 39 = 9 config + 30 splitter). Exit criterion met: the
+  property test asserts units + joiners reassemble to the original span
+  byte-for-byte over 48 deterministic pseudo-random spans (no new deps; LCG
+  in the test; it self-checks that stage 1b and both boundary forms were
+  actually reached), and every joiner is proven to be a whole run of
+  line-boundary escape units or the single `,` separator, so no boundary can
+  land mid-escape. Goldens cover the seven W0.3 edge fixtures (record-len
+  16383/16384/16385, no-separator overcap, single-line tool dump
+  overcap/small, `newlines-u000a-only.json` = 4 units / three 6-byte joiners /
+  all eligible / no stage-1b handoff at 186 B), plus the `max_line_bytes`
+  boundary, the `max_record_bytes` ±1 boundary, mixed and truncated escape
+  forms, and the bracket-carrying `u_head`/`u_tail` — those stay verbatim
+  because they carry the `[`/`]` and so rarely memcmp-equal their siblings
+  (§4.4), with `eligible` decided by the cap alone (a 16385-byte head is
+  ineligible, a 1-byte `}` is eligible).
+  Fuzz (W0.4 target, now wired): `fuzz/fuzz_targets/fuzz_splitter.rs` calls
+  `split_span` on arbitrary bytes and asserts that units + gaps rebuild the
+  input byte-for-byte and that units are ascending and disjoint. One clean run
+  on 2026-09-26: 200 000 runs, exit 0, zero crashes, 90 edges / 407 features,
+  largest input 558 KB, seeded with a 557 KB over-cap `},{` line so stage 1b
+  is actually fuzzed (the plain `-runs=200` protocol run is clean too).
+  Toolchain deviation: nightly is still unreachable (static.rust-lang.org
+  connection timeout), so the run used the documented W0.4 fallback — stable
+  1.98.0 with `RUSTC_BOOTSTRAP=1` and `cargo fuzz run --sanitizer none` (no
+  ASan, which stable cannot enable). The nightly+ASan CI configuration is
+  unchanged and must be exercised when nightly is reachable; the 200k soak
+  and corpus minimization stay W4.2/W4.5 scope.
+  Deviations from DESIGN: none outstanding — §4.2's `\u000A` line boundaries
+  and §4.4's literal ranges are both implemented as written, and DESIGN.md is
+  not amended. Plain byte loops only; `memchr` is deliberately not added and
+  stays a W4.3 bench item.
 - **W1.3 WS-normalization transform** (§4.2) — escape-unit collapse, trim.
   Exit: golden vectors incl. mixed `\n` / `\u000A`.
 - **W1.4 Hashing facade** — xxh3-128/64 fixed-seed wrappers; open-address
