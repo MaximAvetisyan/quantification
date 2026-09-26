@@ -313,6 +313,145 @@ fn duplicate_nested_part_keys_keep_the_last_value() {
     );
 }
 
+const TOOL_RESULT_PARTS: &str =
+    r#"[{"type":"tool_result","content":[{"type":"text","text":"INNER"}]}]"#;
+
+fn anthropic_message(role: &str, members: &str) -> Vec<u8> {
+    format!(r#"{{"max_tokens":8,"messages":[{{"role":"{role}",{members}}}]}}"#).into_bytes()
+}
+
+fn user_message(members: &str) -> Vec<u8> {
+    anthropic_message("user", members)
+}
+
+#[test]
+fn a_duplicate_key_drops_the_whole_shadowed_value_subtree() {
+    for (later, want) in [
+        (r#""LATER""#, vec!["LATER"]),
+        ("null", vec![]),
+        (r#"{"text":"LATER"}"#, vec![]),
+        ("[]", vec![]),
+        (r#"[{"type":"text","text":"LATER"}]"#, vec!["LATER"]),
+        (r#"{"type":"text","text":"LATER"}"#, vec![]),
+    ] {
+        let payload = user_message(&format!(
+            r#""content":{TOOL_RESULT_PARTS},"content":{later}"#
+        ));
+        let want: Vec<String> = want.iter().map(|s| (*s).to_string()).collect();
+        for policy in BOTH {
+            assert_eq!(spans_of(&payload, policy), want, "{later} {policy:?}");
+        }
+    }
+}
+
+#[test]
+fn a_duplicate_chat_content_drops_the_shadowed_parts() {
+    let payload = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"INNER"}],"content":"LATER"}]}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        vec!["LATER".to_string()]
+    );
+    let payload =
+        br#"{"messages":[{"role":"user","content":[{"type":"text","text":"INNER"}],"content":[{"type":"text","text":"MID"}],"content":"LAST"}]}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        vec!["LAST".to_string()]
+    );
+}
+
+#[test]
+fn a_duplicate_key_drops_the_shadowed_subtree_at_any_depth() {
+    let payload = user_message(
+        r#""content":[{"type":"tool_result","content":[{"type":"text","text":"X"}],"content":"LATER"}]"#,
+    );
+    assert_eq!(
+        spans_of(&payload, ScopePolicy::UserContent),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        classes(&payload, ScopePolicy::UserAndTools),
+        vec![("LATER".to_string(), SpanClass::Tool)]
+    );
+    let payload = user_message(
+        r#""content":[{"type":"tool_result","content":[{"type":"text","text":"X"}]}],"content":[{"type":"text","text":"A","text":"B"}]"#,
+    );
+    for policy in BOTH {
+        assert_eq!(
+            spans_of(&payload, policy),
+            vec!["B".to_string()],
+            "{policy:?}"
+        );
+    }
+}
+
+#[test]
+fn a_duplicate_key_keeps_the_spans_of_other_members_and_siblings() {
+    let payload =
+        br#"{"max_tokens":8,"messages":[{"role":"tool","content":"drop","content":"keep"}]}"#;
+    assert_eq!(
+        classes(payload, ScopePolicy::UserAndTools),
+        vec![("keep".to_string(), SpanClass::Tool)]
+    );
+    let payload = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"drop"}],"content":"later"},{"role":"user","content":"sibling"}]}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        vec!["later".to_string(), "sibling".to_string()]
+    );
+    let payload = br#"{"messages":[{"role":"user","content":"first"},{"role":"user","content":[{"type":"text","text":"drop"}],"content":"later"}]}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        vec!["first".to_string(), "later".to_string()]
+    );
+}
+
+#[test]
+fn an_assistant_duplicate_never_leaks_the_shadowed_tool_span() {
+    let payload = anthropic_message(
+        "assistant",
+        &format!(r#""content":{TOOL_RESULT_PARTS},"content":"LATER""#),
+    );
+    for policy in BOTH {
+        assert_eq!(
+            spans_of(&payload, policy),
+            Vec::<String>::new(),
+            "{policy:?}"
+        );
+    }
+    let payload = anthropic_message("assistant", &format!(r#""content":{TOOL_RESULT_PARTS}"#));
+    assert_eq!(
+        spans_of(&payload, ScopePolicy::UserContent),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        classes(&payload, ScopePolicy::UserAndTools),
+        vec![("INNER".to_string(), SpanClass::Tool)]
+    );
+}
+
+#[test]
+fn duplicate_root_messages_keep_only_the_last_array() {
+    let payload = br#"{"max_tokens":8,"messages":[{"role":"user","content":"A"}],"messages":[{"role":"user","content":"B"}]}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        vec!["B".to_string()]
+    );
+    let payload = br#"{"max_tokens":8,"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"INNER"}]}]}],"messages":[{"role":"user","content":"B"}]}"#;
+    assert_eq!(
+        classes(payload, ScopePolicy::UserAndTools),
+        vec![("B".to_string(), SpanClass::User)]
+    );
+    let payload = br#"{"max_tokens":8,"messages":[{"role":"user","content":"A"}],"messages":"B"}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        Vec::<String>::new()
+    );
+    let payload = br#"{"messages":[{"role":"user","content":"A"}],"x":{"messages":[{"role":"user","content":"B"}]},"messages":[{"role":"user","content":"C"}]}"#;
+    assert_eq!(
+        spans_of(payload, ScopePolicy::UserContent),
+        vec!["C".to_string()]
+    );
+}
+
 #[test]
 fn duplicate_keys_never_mix_two_candidate_values() {
     let payload = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"part"}],"content":"plain","content":[{"type":"text","text":"part2"}]}]}"#;
@@ -618,6 +757,22 @@ fn the_span_cap_boundary_is_exact() {
     assert_eq!(located.spans.len(), 1);
     assert_eq!(located.spans[0].start, at);
     assert_eq!(located.spans[0].end, at + MAX_SPAN_BYTES);
+}
+
+#[test]
+fn oversized_text_spans_are_passed_through() {
+    let over = vec![b'a'; MAX_SPAN_BYTES + 1];
+    let located = locate(&over, ScopePolicy::UserContent);
+    assert_eq!(located.schema, Some(Schema::Text));
+    assert!(located.spans.is_empty());
+    assert!(!located.degraded());
+    let mut exact = vec![0xEF, 0xBB, 0xBF];
+    exact.extend_from_slice(&vec![b'a'; MAX_SPAN_BYTES]);
+    let located = locate(&exact, ScopePolicy::UserContent);
+    assert_eq!(located.spans.len(), 1);
+    assert_eq!(located.spans[0].start, 3);
+    assert_eq!(located.spans[0].end, exact.len());
+    assert!(!locate(b"", ScopePolicy::UserContent).degraded());
 }
 
 fn malformed(payload: &[u8]) {

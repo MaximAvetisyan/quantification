@@ -45,7 +45,7 @@ pub struct Span {
     pub class: SpanClass,
     check: Check,
     read: Owner,
-    owner: Owner,
+    frame_id: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +91,7 @@ pub fn locate_into(
     out.clear();
     let bom = bom_len(payload);
     if schema == Schema::Text {
-        if bom < payload.len() {
+        if bom < payload.len() && payload.len() - bom <= MAX_SPAN_BYTES {
             out.push(Span {
                 start: bom,
                 end: payload.len(),
@@ -101,10 +101,7 @@ pub fn locate_into(
                     frame: 0,
                     slot: NO_KEY,
                 },
-                owner: Owner {
-                    frame: 0,
-                    slot: NO_KEY,
-                },
+                frame_id: 0,
             });
         }
         return None;
@@ -115,6 +112,7 @@ pub fn locate_into(
         policy,
         bom,
         depth: 0,
+        ids: 0,
         frames: [Frame::EMPTY; JSON_DEPTH_CAP],
     };
     match scanner.run(out) {
@@ -168,7 +166,9 @@ struct Frame {
     key: u8,
     owner: Owner,
     first: usize,
-    marks: [usize; KEY_COUNT],
+    id: u32,
+    enters: [u32; KEY_COUNT],
+    leaves: [u32; KEY_COUNT],
     slots: [Slot; KEY_COUNT],
 }
 
@@ -182,7 +182,9 @@ impl Frame {
             slot: NO_KEY,
         },
         first: 0,
-        marks: [0; KEY_COUNT],
+        id: 0,
+        enters: [0; KEY_COUNT],
+        leaves: [0; KEY_COUNT],
         slots: [Slot::EMPTY; KEY_COUNT],
     };
 }
@@ -210,6 +212,7 @@ struct Scanner<'a> {
     policy: ScopePolicy,
     bom: usize,
     depth: usize,
+    ids: u32,
     frames: [Frame; JSON_DEPTH_CAP],
 }
 
@@ -353,6 +356,8 @@ impl Scanner<'_> {
             return Err(Fail);
         }
         let at = self.depth;
+        self.ids += 1;
+        let id = self.ids;
         let (ctx, owner) = if at == 0 {
             (Ctx::Root, self.frames[0].owner)
         } else {
@@ -376,7 +381,9 @@ impl Scanner<'_> {
             key: NO_KEY,
             owner,
             first: n,
-            marks: [n; KEY_COUNT],
+            id,
+            enters: [0; KEY_COUNT],
+            leaves: [0; KEY_COUNT],
             slots: [Slot::EMPTY; KEY_COUNT],
         };
         self.depth = at + 1;
@@ -416,7 +423,8 @@ impl Scanner<'_> {
             self.drop_key(at, key, out);
         }
         self.frames[at].key = key;
-        self.frames[at].marks[key as usize] = out.len();
+        self.frames[at].enters[key as usize] = self.ids;
+        self.frames[at].leaves[key as usize] = 0;
     }
 
     fn set_other(&mut self) {
@@ -473,7 +481,7 @@ impl Scanner<'_> {
                 frame: at as u8,
                 slot: key,
             },
-            owner: self.frames[at].owner,
+            frame_id: frame.id,
         });
     }
 
@@ -487,31 +495,22 @@ impl Scanner<'_> {
     }
 
     fn drop_key(&mut self, at: usize, key: u8, out: &mut Vec<Span>) {
-        let from = self.frames[at].marks[key as usize];
-        if from >= out.len() {
-            return;
-        }
         let frame = at as u8;
-        let mut marks = self.frames[at].marks;
+        let enter = self.frames[at].enters[key as usize];
+        let leave = self.frames[at].leaves[key as usize];
+        let from = self.frames[at].first;
         let mut w = from;
         for r in from..out.len() {
             let span = out[r];
-            if (span.read.frame == frame && span.read.slot == key)
-                || (span.owner.frame == frame && span.owner.slot == key)
-            {
+            let shadowed = (span.read.frame == frame && span.read.slot == key)
+                || (leave != 0 && span.frame_id > enter && span.frame_id <= leave);
+            if shadowed {
                 continue;
-            }
-            if span.read.frame == frame {
-                marks[span.read.slot as usize] = marks[span.read.slot as usize].min(w);
-            }
-            if span.owner.frame == frame && span.owner.slot != NO_KEY {
-                marks[span.owner.slot as usize] = marks[span.owner.slot as usize].min(w);
             }
             out[w] = span;
             w += 1;
         }
         out.truncate(w);
-        self.frames[at].marks = marks;
     }
 
     fn close(&mut self, out: &mut Vec<Span>) {
@@ -523,6 +522,13 @@ impl Scanner<'_> {
             _ => {}
         }
         self.depth = at;
+        if at > 0 {
+            let parent = at - 1;
+            let key = self.frames[parent].key;
+            if key != NO_KEY {
+                self.frames[parent].leaves[key as usize] = self.ids;
+            }
+        }
     }
 
     fn resolve_part(&mut self, at: usize, out: &mut Vec<Span>) {

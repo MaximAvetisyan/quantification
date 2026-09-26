@@ -7,7 +7,7 @@ pub mod mask;
 mod s1;
 pub mod sniff;
 pub mod stage1;
-pub mod stage1b;
+mod stage1b;
 pub mod wsnorm;
 
 pub mod benches {

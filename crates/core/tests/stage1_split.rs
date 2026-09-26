@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use quantification_core::config::{MAX_LINE_BYTES, MAX_RECORD_BYTES};
-use quantification_core::stage1::{Unit, joiner, split_span};
+use quantification_core::stage1::{Unit, joiner, split_span, split_span_counted};
 
 const SEPARATOR: &[u8; 3] = br"},{";
 const CONTENT_KEY: &[u8] = b"\"content\":\"";
@@ -740,4 +740,35 @@ fn property_units_and_joiners_reassemble_generated_spans() {
     assert!(records > 0, "generator never reached stage 1b");
     assert!(u_boundaries > 0, "generator never split a \\u000A boundary");
     assert!(n_boundaries > 0, "generator never split a \\n boundary");
+}
+
+#[test]
+fn record_split_count_is_the_number_of_over_cap_lines() {
+    let short = record(64);
+    let over = comma_joined(&record(MAX_RECORD_BYTES), 5);
+    assert!(over.len() > MAX_LINE_BYTES);
+    let span = [
+        short.as_slice(),
+        br"\n",
+        over.as_slice(),
+        br"\n",
+        over.as_slice(),
+    ]
+    .concat();
+    let split = split_span_counted(&span);
+    assert_eq!(split.record_splits, 2);
+    assert_eq!(split.units, split_span(&span));
+    assert_eq!(split_span_counted(&short).record_splits, 0);
+    assert_eq!(
+        split_span_counted(b"").units,
+        Vec::<Unit>::new(),
+        "an empty span has no units and no splits"
+    );
+    assert_eq!(
+        split_span_counted(b"plain").units,
+        vec![Unit {
+            range: 0..5,
+            eligible: true
+        }]
+    );
 }

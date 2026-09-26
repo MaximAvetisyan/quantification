@@ -80,7 +80,7 @@ impl FingerprintTable {
         self.insert_hashed(keys, key, rep, hash)
     }
 
-    pub fn insert_hashed(
+    pub(crate) fn insert_hashed(
         &mut self,
         keys: &[u8],
         key: Range<usize>,
@@ -106,7 +106,7 @@ impl FingerprintTable {
         self.find_hashed(keys, key, hash)
     }
 
-    pub fn find_hashed(&self, keys: &[u8], key: Range<usize>, hash: u128) -> Option<usize> {
+    pub(crate) fn find_hashed(&self, keys: &[u8], key: Range<usize>, hash: u128) -> Option<usize> {
         self.probe(keys, &key, hash).0
     }
 
@@ -126,17 +126,17 @@ impl FingerprintTable {
             if slot.rep == usize::MAX {
                 return (None, miss);
             }
-            if slot.hash == hash {
-                if slot.len == key.len() {
+            if slot.len == key.len() {
+                if slot.hash == hash {
                     if keys[slot.key..slot.key + slot.len] == keys[key.clone()] {
                         return (Some(slot.rep), Miss::Absent);
                     }
                     miss = miss.max(Miss::Memcmp);
                 } else {
-                    miss = miss.max(Miss::Length);
+                    miss = miss.max(Miss::Hash);
                 }
             } else {
-                miss = miss.max(Miss::Hash);
+                miss = miss.max(Miss::Length);
             }
             at = (at + 1) & (self.slots.len() - 1);
         }

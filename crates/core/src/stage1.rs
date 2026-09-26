@@ -9,6 +9,12 @@ pub struct Unit {
     pub eligible: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Split {
+    pub units: Vec<Unit>,
+    pub record_splits: usize,
+}
+
 pub fn joiner(units: &[Unit], index: usize, end: usize) -> Range<usize> {
     let unit = &units[index];
     let stop = match units.get(index + 1) {
@@ -25,7 +31,12 @@ pub fn joiner(units: &[Unit], index: usize, end: usize) -> Range<usize> {
 }
 
 pub fn split_span(span: &[u8]) -> Vec<Unit> {
+    split_span_counted(span).units
+}
+
+pub fn split_span_counted(span: &[u8]) -> Split {
     let mut units = Vec::new();
+    let mut record_splits = 0usize;
     let mut start = 0;
     let mut at = 0;
     while at < span.len() {
@@ -33,7 +44,7 @@ pub fn split_span(span: &[u8]) -> Vec<Unit> {
             Some(len) => {
                 if is_line_boundary(span, at, len) {
                     if start < at {
-                        push_line(span, start..at, &mut units);
+                        push_line(span, start..at, &mut units, &mut record_splits);
                     }
                     start = at + len;
                 }
@@ -43,9 +54,12 @@ pub fn split_span(span: &[u8]) -> Vec<Unit> {
         }
     }
     if start < span.len() {
-        push_line(span, start..span.len(), &mut units);
+        push_line(span, start..span.len(), &mut units, &mut record_splits);
     }
-    units
+    Split {
+        units,
+        record_splits,
+    }
 }
 
 fn escape_at(span: &[u8], at: usize) -> Option<usize> {
@@ -62,9 +76,10 @@ fn is_line_boundary(span: &[u8], at: usize, len: usize) -> bool {
     len == 6 && matches!(&span[at + 2..at + 6], b"000A" | b"000a")
 }
 
-fn push_line(span: &[u8], range: Range<usize>, units: &mut Vec<Unit>) {
+fn push_line(span: &[u8], range: Range<usize>, units: &mut Vec<Unit>, splits: &mut usize) {
     let line = &span[range.clone()];
     if line.len() > MAX_LINE_BYTES {
+        *splits += 1;
         units.extend(segment_line(line, range.start));
     } else {
         units.push(Unit {

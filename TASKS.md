@@ -132,16 +132,40 @@ exit criteria. Gates M1–M4 are blocking milestones.
   Responses-pinned payload ignores `messages`, a Chat/Messages-pinned payload
   ignores root `input`, and root `system` is never eligible anywhere). Also
   frozen: an empty string value yields no span, a value longer than
-  `max_span_bytes` is passed through (not a degrade), string escapes and number
-  literals are consumed leniently (`\u` with non-hex or truncated bytes is
-  opaque, so it can never produce a wrong range), and every one of the 26 W0.3
+  `max_span_bytes` is passed through (not a degrade) — on **both** paths, the
+  `Schema::Text` whole-buffer span included, which the W1 review found
+  uncapped — string escapes and number literals are consumed leniently (`\u`
+  with non-hex or truncated bytes is opaque, so it can never produce a wrong
+  range), and every one of the 26 W0.3
   fixtures is re-validated as a whole document. Duplicate object keys are
   **last occurrence wins** for both scalars (`role`, `type`) and candidate
-  values, including nested ones (`content` → array → part `text`): the
-  earlier occurrence's spans are removed when the later key is seen, keyed on
-  the `(frame, key)` member that lexically encloses them, and the frame's
-  output-index marks are re-derived in the same pass — not an error, not a
-  degrade. Both S1-review defects are fixed and pinned by test: (a) every
+  values, now at **any depth** and for the **whole shadowed subtree** (the W1
+  review found the previous handling only dropped spans keyed on the innermost
+  enclosing `(frame, key)`, so a candidate value nested behind an *additional*
+  object member survived — an Anthropic `tool_result` whose `content` is a
+  `[{type:"text",text}]` array, i.e. a Tool span under an assistant message that
+  R4 forbids). The mechanism is a per-frame *frame id*: every container push
+  takes the next id (`u32`, monotonic, so frame slots can be reused without
+  aliasing), each span records the id of the frame that read it, and a key's
+  value records `(enter, leave]` — the id interval its container value occupied
+  (`enter` at the key, `leave` at the container's close, so every id in the
+  subtree is inside the interval because a container's whole subtree is
+  contiguous in push order). On a duplicate key every span from the frame's own
+  output index onwards whose `read` is `(frame, key)` **or** whose frame id lies
+  in that interval is dropped, which reaches arbitrarily deep shadowed values
+  while leaving the spans of intervening members and of sibling frames (whose
+  ids are outside the interval) untouched; scalar duplicates are covered by the
+  `read` test alone. Not an error, not a degrade. Six regression tests
+  (`a_duplicate_key_drops_the_whole_shadowed_value_subtree`,
+  `a_duplicate_chat_content_drops_the_shadowed_parts`,
+  `a_duplicate_key_drops_the_shadowed_subtree_at_any_depth`,
+  `a_duplicate_key_keeps_the_spans_of_other_members_and_siblings`,
+  `an_assistant_duplicate_never_leaks_the_shadowed_tool_span`,
+  `duplicate_root_messages_keep_only_the_last_array`) pin the later value as a
+  string / null / object / array / parts array, triple duplicates, the
+  assistant-role shape, a depth-3 `content` duplicate and a duplicate root
+  `messages`, all under both policies. Both S1-review defects are fixed and
+  pinned by test: (a) every
   failure path clears the output vector, so a document truncated *after* a
   valid prefix can never emit a partial span set
   (`a_truncated_document_never_emits_a_partial_span_set` walks all 60-odd
@@ -149,28 +173,32 @@ exit criteria. Gates M1–M4 are blocking milestones.
   root document — trailing bytes, a second document, or an unclosed container
   all degrade. Degradation covers every §4.1 acceptance-envelope trigger:
   unquoted identifiers, raw control characters (in keys or values), truncated
-  documents/strings, trailing commas, bad literals, depth > cap ⇒ whole-request
+  documents/strings, trailing commas, typo'd `true`/`false`/`null` (only those
+  three literals are matched exactly — number scanning is **lenient by design**,
+  any run of `[0-9.eE+-]` containing a digit is accepted, so `01` or `1e` are
+  not a degrade), depth > cap ⇒ whole-request
   pass-through with `degraded=true`, `noop_reason="malformed"`, zero spans.
   §5 on the hot path: integer-only, no `HashMap`/`RandomState`, no clock, RNG,
   env or float anywhere in the three new modules; the frame stack, the key
   decode buffer and the number scan are all fixed-size stack state, so the only
   allocation is the caller's output `Vec`. Tests: 7 unit tests in `keys.rs`, 4
-  in `sniff.rs`, 41 integration tests in `crates/core/tests/locator.rs` (all
+  in `sniff.rs`, 48 integration tests in `crates/core/tests/locator.rs` (all
   W0.3 fixtures across `schemas/`, `shapes/`, `edges/` — chat/messages/
   responses minified+pretty, text-plain, content-null, mixed-parts,
   function-call-output, input-string, anthropic-system-top, anthropic-tool-result,
   sniff-overlap, bom-chat, dup-keys-last-wins, escaped-structural-keys,
   newlines-u000a-only, prior-markers, profitability-below-threshold and the
   single-line/stage-1b dumps — plus the eligibility map, both scope policies,
-  exact role matching, caps, and 17 malformed/degradation vectors × 3 schemas ×
+  exact role matching, caps, the seven nested/duplicate last-wins regressions
+  and the text-path span cap, and 17 malformed/degradation vectors × 3 schemas ×
   2 policies), 16 in `crates/core/tests/sniff.rs`, and
   `crates/core/tests/locator_alloc.rs`, whose counting global allocator
   **asserts the hot loop allocates zero times** across six measured calls (a
   400-message/16 000-line payload under both policies and all three schemas,
   plus a >1 MB single-span payload and the text degenerate case) with the
-  output vector pre-sized so even a growth would be counted. Core total 136
-  (23 lib unit + 8 fingerprint + 41 locator + 1 locator-alloc + 9 mask +
-  16 sniff + 30 splitter + 8 ws); workspace total 146. Fuzz (W0.4 targets, now
+  output vector pre-sized so even a growth would be counted. Core total 143
+  (23 lib unit + 8 fingerprint + 48 locator + 1 locator-alloc + 9 mask +
+  16 sniff + 30 splitter + 8 ws); workspace total 153. Fuzz (W0.4 targets, now
   wired to the real code): `fuzz_sniff` asserts the candidate invariant
   (a JSON schema requires an object root, `Text` requires a non-JSON first
   byte, unknown requires a JSON-shaped payload) and determinism;
@@ -179,10 +207,25 @@ exit criteria. Gates M1–M4 are blocking milestones.
   disjoint, in bounds, never covering the BOM, always delimited by quotes with
   no unescaped `"` or raw control byte inside (the splicer can therefore never
   produce invalid JSON), no `Tool` span under `user_content`, no span at all
-  when degraded, and byte-identical repeat runs. One clean run each on
+  when degraded, byte-identical repeat runs, and — added by the W1 review, since
+  the nested-shadow leak is exactly the class a black-box fuzzer misses — the
+  **last-wins invariant**: a small independent lenient JSON walker in the target
+  collects the value range of every non-final occurrence of the ten structural
+  keys, and no reported span may fall inside one. The walker's key set is a
+  subset of the locator's (it matches raw key bytes, the locator also matches
+  decoded ones), so the check can only miss violations, never invent them; it
+  bails out (no assertion) on documents it cannot parse or nesting past
+  `DEPTH_CAP = 96`. It is not vacuous: replayed against the pre-fix locator it
+  crashes on the exact `tool_result`-parts payload above
+  (`artifacts/fuzz_locator/crash-0412dbb8…`, verified by reverting
+  `locator.rs` and re-running the target), and is clean against the fix. One
+  clean run each on
   2026-09-26, corpus seeded with all 26 W0.3 fixtures plus Anthropic-tool-result,
   Responses `function_call_output`, duplicate-key and BOM seeds: 200 000 runs,
-  exit 0, zero crashes, 411 coverage points / 1416 features on the locator.
+  exit 0, zero crashes, 411 coverage points / 1416 features on the locator;
+  re-run after the W1-review last-wins fix and the new invariant (same stable
+  fallback, the corpus as found on disk, 1 584 seed files): 200 000 runs,
+  exit 0, zero crashes, 519 coverage points / 1908 features.
   Toolchain deviation: nightly is still unreachable (static.rust-lang.org
   connection timeout), so both runs used the documented W0.4 fallback — stable
   1.98.0 with `RUSTC_BOOTSTRAP=1` and `cargo fuzz run --sanitizer none` (no
@@ -191,9 +234,23 @@ exit criteria. Gates M1–M4 are blocking milestones.
   minimization stays W4.5 scope. Throughput sanity check (not a gate): the same
   8 MiB escaped-heavy S1 fixtures that the spike measured at 1495/1441 MB/s
   locate in 5.34 ms / 5.58 ms p50 = **1571 / 1501 MB/s** (pinned core, warm,
-  `--release`), i.e. ≈3.9× the §8 400 MB/s floor. `fuzz/Cargo.lock` is
-  regenerated by cargo-fuzz (it needs the `twox-hash` entry W1.4 added to
-  core) and was therefore left unstaged. Deviations from DESIGN: none — §4.1's
+  `--release`), i.e. ≈3.9× the §8 400 MB/s floor; the W1-review last-wins
+  rewrite leaves that path untouched (those fixtures have no duplicate keys, so
+  `drop_key` never runs; the added state is one `u32` per span and 8 bytes per
+  frame slot) and the figure was not re-measured. `fuzz/Cargo.lock`: the earlier
+  claim that it "was left unstaged" was wrong — it was byte-identical to HEAD
+  and simply **stale** (no `twox-hash` entry, which W1.4 added to core), so
+  `cargo metadata --locked --manifest-path fuzz/Cargo.toml` failed and CI's
+  `fuzz.yml` silently re-resolved the fuzz graph on every run. It is now
+  regenerated and committed (only the `twox-hash 2.1.4` entry and core's
+  dependency edge are added; no unrelated version churn), `cargo metadata
+  --locked` succeeds and `cargo check` in `fuzz/` is clean. `fuzz/corpus/` is
+  now **git-ignored** rather than committed: it holds ~2 500 libfuzzer-mutation
+  artifacts (several >100 KB) of which only the 26 W0.3-derived seeds carry
+  meaning, and those are already versioned as `crates/core/tests/fixtures/` and
+  re-validated by the workspace suite — so the deterministic gate loses no
+  coverage, while a committed corpus would freeze thousands of machine-named
+  blobs that every run rewrites anyway. Deviations from DESIGN: none — §4.1's
   eligibility map, last-wins, decoded-key and acceptance-envelope rules are
   implemented as written and DESIGN.md is not amended; the sniff
   discriminators, `SNIFF_PREFIX_BYTES`, the BOM offset contract, the
@@ -220,22 +277,31 @@ exit criteria. Gates M1–M4 are blocking milestones.
   handed to stage 1b, the last line without a trailing separator is included,
   blank lines fold into the joiner, and every unit range is absolute within
   the span. Stage 1b (`stage1b::segment_line`, crate-private — every test
-  drives it through `split_span`) keeps the literal §4.4 ranges `u_head` /
-  `u_i` / `u_tail` on literal `},{` with **no edge special-casing**: 1-byte
-  units are kept symmetrically (a line starting `},{` keeps the bare `}`; a
-  line ending `},{` keeps the trailing `{`), empty units are discarded, and
-  no-separator lines plus over-cap records stay verbatim. `eligible` is
-  `len <= max_record_bytes`; an under-cap line never reaches stage 1b and stays
-  one eligible unit. `Unit { range, eligible }` carries no joiner —
-  `stage1::joiner` derives the gap from the distance to the next unit, so no
-  duplicated state can drift, and it asserts its precondition (units ascending
-  and disjoint, i.e. valid only on the *unfiltered* list — W2 must re-derive
-  `removed_bytes` from committed units instead of reusing this joiner, pinned
-  by a `should_panic` test). `reassemble` is a test/reassembly helper, so it
-  lives in the integration test and (as an independent oracle) in the fuzz
-  target rather than in the public API.
-  Tests: 30 integration tests in `crates/core/tests/stage1_split.rs`
-  (workspace total 39 = 9 config + 30 splitter). Exit criterion met: the
+  drives it through `split_span`; the W1 review also made the module itself
+  private, `mod stage1b`, since it exposed nothing publicly) keeps the literal
+  §4.4 ranges `u_head` / `u_i` / `u_tail` on literal `},{` with **no edge
+  special-casing**: 1-byte units are kept symmetrically (a line starting `},{`
+  keeps the bare `}`; a line ending `},{` keeps the trailing `{`), empty units
+  are discarded, and no-separator lines plus over-cap records stay verbatim.
+  `eligible` is `len <= max_record_bytes`; an under-cap line never reaches
+  stage 1b and stays one eligible unit. `Unit { range, eligible }` carries no
+  joiner — `stage1::joiner` derives the gap from the distance to the next
+  unit, so no duplicated state can drift, and it asserts its precondition
+  (units ascending and disjoint, i.e. valid only on the *unfiltered* list — W2
+  must re-derive `removed_bytes` from committed units instead of reusing this
+  joiner, pinned by a `should_panic` test). `reassemble` is a test/reassembly
+  helper, so it lives in the integration test and (as an independent oracle)
+  in the fuzz target rather than in the public API. Added by the W1 review:
+  `stage1::split_span_counted(span) -> Split { units, record_splits }` is the
+  same walk, so §6.1's `X-Stats-Record-Splits` and §6.2's
+  `Stats.record_splits = 18` are computable (W2.9); `split_span` is exactly its
+  `units`, and `record_splits` counts **over-cap lines handed to stage 1b**
+  (the §6.2 wording "over-cap lines re-segmented"), not records or separator
+  cuts —
+  frozen here because both readings are defensible and §5.7 freezes behaviour
+  per release.
+  Tests: 31 integration tests in `crates/core/tests/stage1_split.rs`
+  (workspace total 40 = 9 config + 31 splitter). Exit criterion met: the
   property test asserts units + joiners reassemble to the original span
   byte-for-byte over 48 deterministic pseudo-random spans (no new deps; LCG
   in the test; it self-checks that stage 1b and both boundary forms were
@@ -306,7 +372,10 @@ exit criteria. Gates M1–M4 are blocking milestones.
   plus the representative's key range and unit index; it never iterates, so
   there is no iteration-order dependency to leak into output, and it uses no
   `HashMap`/`RandomState` and no floats (§5.1). Every lookup is verified in the
-  normative order **byte-length → fingerprint → memcmp**: the probe compares
+  normative order **byte-length → fingerprint → memcmp**, and the W1 review made
+  that the *literal* implementation (the probe tested `hash` before `len`; the
+  two are observationally equivalent, but §4.4.2 names the order as the
+  contract): it compares
   `len` first, then `hash`, then the key bytes, and a length-equal /
   hash-equal / bytes-different candidate is *rejected* and the probe
   continues, so such a pair coexists in the table (linear probing requires it)
@@ -316,14 +385,22 @@ exit criteria. Gates M1–M4 are blocking milestones.
   4/5, a masked-form arena for stages 6/7. `insert` returns
   `Insert::{New, Duplicate(rep), Full}`; `find`/`insert_hashed`/`find_hashed`
   also accept a caller-supplied fingerprint so residual fingerprints are never
-  recomputed. Caps are frozen in code: `for_keys(key_bytes)` pre-sizes to
+  recomputed — `insert_hashed`/`find_hashed` are `pub(crate)` since the W1
+  review, because §4.4.2's "verified by memcmp" guarantee is only as strong as
+  its call sites and nothing outside the module needs them. Caps are frozen in
+  code: `for_keys(key_bytes)` pre-sizes to
   `key_bytes / 16` slots (smallest plausible unit), clamped to
   `MIN_SLOTS = 64` and `MAX_SLOTS = 262_144` (§7's "pre-sized from span
   bytes; hard cap"); growth doubles below the cap at a 75% load factor and
   rehashes in slot order, and at the cap `insert` returns `Full` and
   `is_full()` reports it, which is the §7 signal for W2 to degrade a
   pathological unique-line flood to pass-through with bounded memory
-  (≈12 MiB worst case, independent of span size).
+  (≈12 MiB worst case, independent of span size). The cap is not exotic: the
+  75% load factor on `MAX_SLOTS` binds at **196 608 stored units** (the
+  196 609th `insert` returns `Full`), which at the 16-bytes-per-unit sizing is
+  ~3 MiB of keys, so *ordinary* large spans of unique lines reach it too — W2
+  must treat `Full`/`is_full()` as a routine pass-through trigger, not a
+  corner case.
   Tests: 5 unit tests in `fingerprint.rs` (the crate-private probe returns the
   rejecting stage, which pins the order: `Absent` / `Hash` / `Length` /
   `Memcmp` for constructed single-entry tables, plus memcmp-separated
@@ -335,17 +412,22 @@ exit criteria. Gates M1–M4 are blocking milestones.
   insertion-order independence, raw-domain and ws-domain grouping over real
   stage-1 units, and zero-length keys). Core total 60
   (9 config + 5 fingerprint unit + 8 fingerprint + 30 splitter + 8 ws).
-  Dependency: `twox-hash 2.1.2` (`default-features = false`, features
-  `std`, `xxhash3_128`, `xxhash3_64`), chosen over hand-rolling XXH3 and over
+  Dependency: `twox-hash`, required as **`^2.1.2`** (`default-features = false`,
+  features `std`, `xxhash3_128`, `xxhash3_64`) and pinned to **2.1.4** by both
+  the workspace `Cargo.lock` and `fuzz/Cargo.lock` (the W1.1 block previously
+  claimed a flat "2.1.2"), chosen over hand-rolling XXH3 and over
   `xxhash-rust`, whose BSD-2-Clause is outside the `deny.toml` allow list.
   MIT, no transitive dependencies (`rand`/`serde` are optional and off), and
   its runtime SSE2/AVX2/NEON dispatch is bit-exact for xxh3, which §5.9
   explicitly accepts; the scalar path is the reference. `Cargo.lock` is
   committed here because the new dependency requires it — note the file also
-  picks up the pending W1.6 proto entries left unstaged by that commit.
+  picks up the W1.6 proto entries, which that commit left out of
+  `fuzz/Cargo.lock` (see the W1.1 block: that omission was a stale file, not a
+  staged/unstaged split, and is now fixed and committed).
   Deviations from DESIGN: none. DESIGN.md is not amended; the only judgement
   calls are the frozen numbers §7 leaves open (`16` bytes per unit, the
-  `64`/`262_144` slot bounds, the 75% load factor) and `CCCC` using the same
+  `64`/`262_144` slot bounds, the 75% load factor — and the resulting
+  196 608-unit cap W2 must handle) and `CCCC` using the same
   fixed seed as the fingerprints.
 - **W1.5 Mask automata** (§4.6) — six masks, priority order,
   leftmost-longest. Exit: golden mask vectors.
@@ -397,6 +479,52 @@ exit criteria. Gates M1–M4 are blocking milestones.
   list per release. No new dependencies.
 - **W1.6 Proto crate** (§6.2) — corrected .proto compiles; tonic codegen;
   shared types. Independent of core.
+  Status: **complete** (2026-09-26; status block added by the W1 review, which
+  found the task had none). `crates/proto` builds the corrected
+  `compressor/v1/compressor.proto` in `build.rs` with tonic/prost codegen and
+  converts between the generated types and `quantification_core::config`
+  (`RawOptions`/`ResolvedOptions`, `ScopePolicy`, `MarkerStyle`, `Stats`).
+  Tests: 10 unit tests (`wire_numbers_and_names_pinned`,
+  `enum_conversions_roundtrip`, `omitted_bools_resolve_to_defaults`,
+  `explicit_true_is_not_omitted`,
+  `explicit_false_survives_wire_and_resolves_false`,
+  `min_group_size_one_rejected`, `reserved_scope_policy_rejected`,
+  `stats_wire_fields_pinned`, `service_codegen_present`). Three deviations
+  from §6.2 as written are recorded here rather than in DESIGN.md, which this
+  wave did not amend:
+  (a) **`MarkerStyle` values are `MARKER_STYLE_AUTO` / `MARKER_STYLE_ASCII` /
+  `MARKER_STYLE_UNICODE`** (and `ContentType` symmetrically
+  `CONTENT_TYPE_*`) because proto3 C++ scoping forbids two enums in the same
+  package from both defining the bare value `AUTO` — `ScopePolicy` and
+  `MarkerStyle` collided, and the collision is a codegen error, not a
+  warning. Wire numbers are unchanged (`0`/`1`/`2`) and pinned by
+  `wire_numbers_and_names_pinned`, so the wire contract §6.2 specifies is
+  intact and only the JSON/text names differ. **DESIGN.md §6.2 should be
+  amended to match**: §6.2's block is the normative source for the enum
+  spellings, §5.7 freezes *behaviour* rather than identifiers, and the
+  alternative (freezing the §6.2 spelling as-is) would mean shipping a proto
+  that its own design document says should not compile. Open item for W3.3:
+  gRPC clients must send `MARKER_STYLE_*`; the generated `from_str_name`
+  rejects the bare `UNICODE`, which the test pins.
+  (b) `Options.normalize_ws`, `Options.reversible` and
+  `Options.template_dedup` are `optional bool`, not plain `bool`. proto3
+  scalars have no presence, so a default-true option would be
+  indistinguishable from "caller asked for false"; `optional` restores
+  presence. This is wire-identical for the encodings §6.1/§6.2 can produce
+  (the value is still a `bool` on the wire) and preserves §6.1's default-true
+  semantics end to end; the conversion layer resolves absent ⇒ §7 default
+  (pinned by `omitted_bools_resolve_to_defaults` and the explicit-true/false
+  wire tests).
+  (c) **§6.2 pins `rpc Restore(RestoreRequest) returns (RestoreResponse)` but
+  defines no message bodies**, so `RestoreRequest { bytes payload = 1; string
+  restore_id = 2; }` and `RestoreResponse { bytes original = 1; }` were
+  invented here (the field names mirror §9's "compressed + id → original" and
+  §6.1's `/v1/restore`). **W3.3 and W3.4 inherit this shape** and must either
+  adopt it or amend it in DESIGN.md before either ships; the HTTP side
+  (§6.1) is unpinned by DESIGN.md in the same way. Deviations from DESIGN
+  overall: these three, recorded here; §6.2's
+  `CompressRequest`/`CompressResponse`/`Stats` bodies, all field numbers and
+  the unary-only service shape are as written.
 
 ## Wave 2 — detectors & output (deps W1)
 
@@ -458,9 +586,9 @@ exit criteria. Gates M1–M4 are blocking milestones.
   and `anchor_units == 0` are rejected. (g) `MarkerStyle::Auto` is refused by
   `Ledger::new` — the caller (W2.9) resolves auto/ascii per span first,
   because the gate's `marker_bytes` depends on the style. Tests: 31
-  integration tests in `crates/core/tests/ledger.rs` (core total 167 =
-  23 lib unit + 8 fingerprint + 31 ledger + 41 locator + 1 locator-alloc +
-  9 mask + 16 sniff + 30 splitter + 8 ws; workspace total 177, unchanged
+  integration tests in `crates/core/tests/ledger.rs` (core total 175 =
+  23 lib unit + 8 fingerprint + 31 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 16 sniff + 31 splitter + 8 ws; workspace total 185, of which
   proto/server 10). Exit criteria met:
   removal-rule ranges are pinned for `\n`/2-byte, 6-byte `\u000A`/`\u000a`,
   concatenated-boundary and `,` joiners, for multi-member and single-member
