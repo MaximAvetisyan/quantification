@@ -654,6 +654,82 @@ exit criteria. Gates M1–M4 are blocking milestones.
   **W2.4 Stage 5 repeated blocks** (ws-normalized domain) ∥
   **W2.5 Stage 6 template groups** — all after W2.1
   (W2.4 also needs W1.3; W2.5 also needs W1.5).
+  Status (W2.2): **complete** (2026-09-26). Stage 3 is
+  `quantification_core::detect::exact::exact_runs(span: &[u8], ledger: &mut
+  Ledger, min_group_size: u32) -> StageStats` (module `detect::exact`, the
+  only content of `detect/mod.rs` so far). `span` is the **eligible span's raw
+  escaped bytes** and `ledger` is the W2.1 ledger over the **full** stage-1/1b
+  unit list of that span — indices, not filtered offsets, so W2.1's
+  `removal_range` derivation and its W1.2 joiner hazard stay inapplicable. The
+  returned `StageStats` holds only this stage's commits (`exact_runs` ==
+  `groups_collapsed`, all other counters 0) and W2.9 merges it into §6.2's
+  `Stats` with `StageStats::merge`; the caller resolves `min_group_size` from
+  the options (§7) and the marker style first (`Ledger::new` refuses `Auto`,
+  so W2.6's `resolve_style` must precede it). Algorithm — integer-only,
+  allocation-free, one linear pass: walk the unit list in ascending index order
+  (the only order available, so leftmost-first and §5.4's "first occurrence in
+  byte order wins" hold by construction, with no hash table anywhere on the
+  path) and extend a maximal run while the candidate unit is (a) unclaimed
+  (`Ledger::is_committed`, hence a residual run can never straddle an earlier
+  stage's committed region), (b) `eligible` — an over-cap record is a verbatim
+  wall that is never grouped, never hashed and breaks the run on both sides —
+  and (c) equal to the run head in the §4.4 stage-3 comparison domain, **raw
+  bytes**, verified in the normative order byte-length → xxh3-128 → `memcmp`
+  (`fingerprint::fingerprint`, so §4.4.2's order is the literal code, not a
+  table probe). Runs shorter than `min_group_size.max(2)` are not proposed;
+  a proposed run is the **maximal** run and the decision is left entirely to
+  `Ledger::try_commit(Proposal::run(group, CommitKind::ExactRun))`, so the
+  §4.4 gate prices anchor + marker (with the exact decimal width of the
+  emitted omitted-copy count) against the removal-rule range, and a
+  `BelowThreshold` group claims nothing, stays verbatim and stays available to
+  stages 4–7. Frozen readings: (a) a rejected run is **skipped whole**
+  (`at = end`), never re-proposed as a shorter sub-range — a sub-range has
+  strictly smaller `removed_bytes` and a no-larger marker, so it can never be
+  more profitable, and skipping keeps the group whole for the later stages;
+  (b) candidates are compared against the run **head**, which is equivalent to
+  comparing against the previous unit (byte equality is transitive) and keeps
+  the work linear in span bytes; (c) **no `FingerprintTable`**: stage 3 only
+  asks "is this adjacent unit the same as the last one", so §7's table cap and
+  W1.4's `Full`/`is_full()` ⇒ pass-through signal are not reachable from here
+  (W2.4/W2.5 own the table); (d) `walk_runs(ledger, min_group_size, kind,
+  same)` is `pub(crate)` and is the shared run walker — the comparison closure
+  is the only difference between stage 3 and stage 4, which is what keeps the
+  two stages' residual, ordering and minimum-size rules literally identical.
+  Tests: 14 integration tests in `crates/core/tests/detect_exact.rs` (core total
+  207 = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 11 render + 16 sniff + 31 splitter + 8 ws + 14 exact runs; workspace
+  total 217). Exit criteria met: a 5×40-byte run commits as one `ExactRun`
+  (count 4, anchor = the first line's range, `removed` = `5*40 + 2*4`); a
+  below-threshold run (3×4-byte lines) claims nothing while the 3×40-byte run
+  behind it commits, `is_free(0..3)` and `residual() == [0,1,2]` hold, a second
+  call is a no-op, and the same shape with 20-byte lines commits — so the
+  rejection is the gate, not a grouping failure; the count width is priced at
+  the carry (ten 1-byte lines commit with count 9 because `1 + 26 < 28` while
+  `profitable(.., 10, 1, 28)` is false, eleven 1-byte lines commit with the
+  two-digit count 10, `marker_len(10) - marker_len(9) == 1`); the raw domain
+  refuses to merge padding variants that stage 4 will merge (a 3×`\t` run and a
+  3×double-space run commit as two groups, never one), and raw-identical lines
+  commit with the same result on a second ledger, with a source assertion that
+  the module contains neither `normalize_ws` nor `normalize` at all; an
+  over-cap record in the middle of a 401-record dump splits two runs, stays
+  unclaimed and free, and leaves the bracket-carrying `u_head`/`u_tail`
+  verbatim; the removal rule is exercised in one span over `\n`, 6-byte
+  `\u000A` and `,` joiners (removed lengths `3*40+2*2`, `3*40+2*6`,
+  `398*200+397`, every commit re-derived as Σ member bytes + Σ inter-member
+  gaps, and the surviving neighbours' joiners proven to stay outside every
+  removed range); overlap and adjacency are exercised against a pre-committed
+  `2..4` block (with `min_group_size` 2 the residual runs `0..2` and `4..6`
+  commit, giving three anchor-ordered commits and no group crossing the claimed
+  region; with 3 they commit nothing and leave `[0,1,4,5]`); empty, single-unit
+  and single-over-cap-line spans commit nothing without panicking; determinism
+  is checked over a 400-line LCG span (two ledgers ⇒ identical `commits()` and
+  byte-identical spliced output assembled in-test from anchor bytes + the
+  frozen marker bytes, and a re-run on a committed ledger changes nothing);
+  determinism inputs are source-scanned. Deviations from DESIGN: none — §4.4's
+  stage-3 rule, the §4.4 stage ordering, comparison domain, removal rule and
+  profitability gate are implemented as written and DESIGN.md is not amended.
+  The readings in (a)–(d) resolve points §4.4 leaves to the implementation,
+  frozen here because §5.7 freezes behaviour per release. No new dependencies.
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
   Status: **complete** (2026-09-26). The module is
