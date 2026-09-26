@@ -815,6 +815,129 @@ exit criteria. Gates M1–M4 are blocking milestones.
   The readings in (a)–(d) resolve points §4.4/§8 leave to the implementation
   (scratch ownership and where the `normalize_ws` switch lives), frozen here
   because §5.7 freezes behaviour per release. No new dependencies.
+  Status (W2.5): **complete** (2026-09-26). Stage 6 is
+  `quantification_core::detect::templ::template_groups(span: &[u8], ledger: &mut
+  Ledger, min_group_size: u32, scratch: &mut Scratch) -> Templated`, plus
+  `templ::Scratch` (the caller-owned two-buffer transform, as W2.3's), the
+  **stage-7 handoff** `templ::Templated { pub stats: StageStats, pub forms:
+  Forms, pub degraded: bool }` with `templ::Forms { pub bytes: Vec<u8>, pub units:
+  Vec<Template> }`, `templ::Template { pub masked: Range<usize>, pub id:
+  TemplateId, pub hash: u128 }`, `TemplateId(pub u64)`, and the accessors
+  `Forms::len` / `is_empty` / `masked(unit) -> &[u8]` / `id(unit) -> TemplateId`
+  / `same(left, right) -> bool`; `Forms::units[i]` is the entry of **ledger unit
+  `i`**, so `Forms` and the ledger are index-aligned and `forms.masked(i)` /
+  `forms.id(i)` are exactly the per-unit masked form and template id §4.4.6's
+  handoff promises. `span` and `ledger` are W2.2's arguments unchanged, and the
+  module is declared by the one added line `pub mod templ;` in
+  `crates/core/src/detect/mod.rs` (that file, not `lib.rs`, holds `detect`'s
+  submodule declarations; `lib.rs` keeps its single `pub mod detect;`).
+  The comparison domain is §4.4's **masked form**: each unit's raw bytes are
+  ws-normalized into `Scratch::ws` (§4.2 / W1.3) and masked into `Scratch::form`
+  (§4.6 / W1.5, the frozen six-mask priority order used as written,
+  leftmost-longest, hand-written byte automata), and the masked form is appended
+  to the per-call `Forms::bytes` arena, so there is no per-unit allocation. Every
+  equality claim is verified in the normative order byte-length → xxh3-128 →
+  `memcmp` of the **masked** bytes, once inside `FingerprintTable::insert_hashed`
+  (the interning pass, and the source of the `Insert::Duplicate(rep)` id) and
+  again on the commit path in `Forms::same` — W1.4's verification entry points
+  are `pub(crate)` and the group claim is a stage-6 claim, so the stage
+  re-derives the same three-step order literally rather than trusting the
+  table. The **anchor is always the original raw escaped bytes**:
+  `Proposal::run(group, CommitKind::TemplateGroup)` makes the first member the
+  anchor and W2.7 emits `span[anchor]`, never a normalized or masked form, so a
+  committed group's marker checksum and echoed line are the first line verbatim,
+  byte for byte, with its own timestamp/IP/uuid/counter. Frozen readings:
+  (a) a stage-6 group is a **contiguous run** of equal masked forms, not the set
+  of all same-template units in the span: `Proposal::run` takes a `Range<usize>`
+  and derives the count as `len - 1`, and §4.4.1b's removal rule is stated for
+  "consecutive units `u_a..u_b`", so a non-contiguous group is not expressible
+  in the frozen W2.1 API (and a range spanning the interleaved lines would
+  destroy them). This is the same reading as §4.4's "Non-consecutive duplicates
+  are **not** compacted in v1 (digest mode deferred)", which leaves digest mode
+  to v2 (§10). (b) The `TemplateId` is the **low 64 bits of the xxh3-128 of the
+  masked form**, so an id is a pure function of the template bytes: equal
+  templates always get equal ids, ids are stable across spans and across input
+  orderings, and nothing depends on table probe or insertion order (§5.1,
+  §5.4). Unequal templates could in principle share the low 64 bits; §4.4.7
+  verifies a stage-7 join by `memcmp` of the masked-form bytes, so such a
+  collision costs a missed merge and never a wrong merge — and stage 6 itself
+  never keys on the id, only on the three-step verification. The full 128-bit
+  `hash` is kept per unit so the normative order uses the whole digest and
+  stage 7 gets a cheap pre-filter for free. (c) Coverage is **dense over every
+  unit of the span** in ascending index order, committed or not: a unit already
+  claimed by stage 3, 4 or 5 and an over-cap `eligible == false` record both
+  still receive a masked form and an id, because §4.4.6's handoff is stated for
+  "every residual line" (they are the residual of *this* stage) and a dense
+  array keeps stage 7's windowed scan index-aligned with the ledger instead of
+  needing an offset map; an over-cap unit is still a wall for stage 7 as it is
+  here. (d) `FingerprintTable::for_keys(span.len())` pre-sizes the table from
+  the span's bytes (W1.4's sizing) and `Insert::Full` **degrades the whole
+  span**: the stage returns `Templated { stats: StageStats::default(), forms:
+  Forms::default(), degraded: true }` — zero commits, no forms, no panic, no
+  silent truncation — which is §7's bounded-memory pass-through signal and
+  W2.9's `Stats.degraded`; earlier stages' commits are untouched, they are the
+  earlier stages' decisions. (e) The run walk is a local `walk_templates` rather
+  than W2.2's `pub(crate) walk_runs`, whose closure receives a `&Unit` while the
+  masked comparison needs the unit's index into `Forms`; it is otherwise
+  literally W2.2's walker (residual-only, `eligible`-only, the
+  `min_group_size.max(2)` floor, the maximal run, skip-a-rejected-run-whole,
+  ascending-index discovery ⇒ leftmost-first with no hash-table iteration order
+  anywhere on the output path, §5.1/§5.4). Integer-only, no clock, RNG or env
+  (§5.3, §5.5). No new dependencies.
+  Tests: 17 integration tests in `crates/core/tests/detect_templ.rs` (core total
+  247 = 23 lib unit + 8 fingerprint + 38 ledger + 48 locator + 1 locator-alloc +
+  9 mask + 11 render + 16 sniff + 10 splice + 31 splitter + 8 ws + 14 exact runs
+  + 13 ws runs + 17 template groups; workspace total 257, of which 10 are W2.7's
+  and 10 W1.6's proto unit tests). Exit criteria met: a three-line log burst
+  (same shape, differing only in timestamp, IP, uuid and duration) that stages 3
+  and 4 both refuse — run first on the same span, both yielding zero commits —
+  collapses through stage 6 alone into one `TemplateGroup` with count 2,
+  `anchor == units[0].range`, `removed` = Σ raw lengths + the two `\n` joiners,
+  marker length 31, and a spliced output pinned byte-for-byte to the first line
+  plus `⟪×2 rows, template ·7837⟫`; the anchor is asserted to carry its own
+  `2026-08-26T10:00:00Z`, `10.0.0.1` and `123e4567-…-426614174000`, to differ
+  from the masked form and from its own ws-normalized form, while all three
+  masked forms are byte-equal; a two-member group is refused at `min_group_size`
+  3, 4 and 9 (nothing claimed, span byte-identical, still two byte-equal masked
+  forms under one id) and commits at 0, 1 and 2 with count 1, and a three-line
+  group the §4.4 gate refuses on width (`a 1`/`a 2`/`a 3`, `profitable(.., 3, 13)`
+  false) also claims nothing while keeping its ids, so the rejection is the gate
+  and not a grouping failure; full coverage is asserted with a stage-3 exact run
+  pre-committed — all seven units, including the three committed ones, carry a
+  masked form equal to `mask(&normalize(raw))` and an id, id equality implies
+  masked-byte equality over every pair, and the 401-record dump shows the same
+  for the bracket-carrying `u_head`/`u_tail` and the over-cap wall; leftmost-first
+  ordering is pinned by two bursts separated by one different line, which commit
+  as `0..2` then `4..6` in anchor-offset order, leave the middle unit uncommitted
+  and residual, and splice to a byte-pinned output; a group never straddles a
+  committed region (with `1..2` claimed by stage 3 the walk commits only `3..5`
+  and leaves unit 0 free and residual), and an over-cap record in the middle of a
+  401-record dump splits two groups at `1..199` and `201..399` while itself
+  staying unclaimed and free; determinism holds over two 400-line generated spans
+  (four rotating levels, per-line ts/ip/uuid/duration/counter, which stages 3
+  and 4 also refuse) run through two ledgers and two differently-initialised
+  scratches — identical `forms`, identical `stats`, identical `commits()`,
+  byte-identical spliced output, and a re-run on a committed ledger is a no-op —
+  with each unit's id asserted equal to
+  `TemplateId(fingerprint(&mask(&normalize(line))))`, and a **permutation** of
+  the same five lines reproduces each line's id and masked form, which is the
+  insertion-order independence; a span of 64 all-distinct templates commits
+  nothing, leaves the span byte-identical and yields 64 pairwise distinct ids;
+  table-`Full` is pinned by a 200 000-distinct-template span (pre-sized to
+  `MAX_SLOTS`), which returns `degraded == true`, default stats, empty forms,
+  zero commits and a byte-identical span, while a 200 000-line span of a *single*
+  template does **not** degrade and commits one 200 000-member group — so the
+  degradation is the §7 cap, not the line count; the scratch stays at its
+  pre-sized capacity across a 2000-line span and a following small span, a
+  `default()` scratch stays within 2× the longest unit and produces identical
+  output, and the module is source-scanned for the §5.1–§5.5 banned inputs.
+  Deviations from DESIGN: none — §4.4.6's algorithm, the comparison-domain
+  paragraph, the anchor rule, §4.4.1b's removal rule, the §4.4 profitability
+  gate and §7's table-cap degradation are implemented as written and DESIGN.md is
+  not amended. The readings in (a)–(e) resolve the points §4.4/§4.6 leave to the
+  implementation (group contiguity, id derivation, coverage width, the shape of
+  the degradation, and the walker), frozen here because §5.7 freezes behaviour
+  per release. No new dependencies.
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
   Status: **complete** (2026-09-26). The module is
