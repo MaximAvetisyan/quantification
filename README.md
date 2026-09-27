@@ -25,15 +25,16 @@ Requires a stable Rust toolchain (edition 2024) and `protoc` on `PATH` for
 
 ```sh
 cargo run --release -p quantification-server
-# quantification listening on http://127.0.0.1:8080 and grpc://127.0.0.1:50051
+# quantification listening on http://127.0.0.1:8080 and grpc://127.0.0.1:50051 (draining for 25000ms on SIGTERM/SIGINT)
 ```
 
-The binary reads exactly two environment variables:
+The binary reads exactly three environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `QUANT_HTTP_ADDR` | `127.0.0.1:8080` | axum HTTP bind address |
 | `QUANT_GRPC_ADDR` | `127.0.0.1:50051` | tonic gRPC bind address |
+| `QUANT_SHUTDOWN_GRACE_MS` | `25000` | total drain budget after `SIGTERM`/`SIGINT`; anything that is not a whole number of milliseconds is a startup error (`quantification: QUANT_SHUTDOWN_GRACE_MS=soon is not a whole number of milliseconds`, exit 1) |
 
 HTTP and gRPC run in the same process, on the same event loop. There is no
 config file and no other environment input.
@@ -75,92 +76,82 @@ and is reporting only — it never gates acceptance (DESIGN.md §4.5).
 
 ## Docker
 
-There is **no Dockerfile and no published image in this tree at this commit**
-(`git ls-files` has no image definition, and no CI workflow builds one). The
-server is one executable driven by two env vars, so a minimal image is all it
-needs; the recipe below is written against the facts verified above and has
-**not** been built in this environment — neither the image tags nor the build
-were exercised, because the container registry is unreachable from this
-machine. It builds with the server's `ccr` feature on.
+There is a `Dockerfile` at the repo root, and a `.dockerignore` beside it that
+keeps the build context to `Cargo.toml`, `Cargo.lock` and `crates/`. It is a
+two-stage build:
 
-```dockerfile
-# syntax=docker/dockerfile:1
-FROM rust:1.98-bookworm AS build
-WORKDIR /src
-COPY . .
-RUN cargo build --release -p quantification-server --features ccr
-
-FROM debian:bookworm-slim
-COPY --from=build /src/target/release/quantification-server /usr/local/bin/quantification-server
-USER 65532:65532
-ENV QUANT_HTTP_ADDR=0.0.0.0:8080 \
-    QUANT_GRPC_ADDR=0.0.0.0:50051
-EXPOSE 8080 50051
-ENTRYPOINT ["/usr/local/bin/quantification-server"]
-```
+* **build** — `rust:1.98-bookworm`, with `protobuf-compiler` installed for
+  `quantification-proto`'s `tonic-prost-build`, thin LTO and one codegen unit.
+  It stubs every workspace member and builds once to warm the dependency cache,
+  copies the real sources, touches every `crates/**/*.rs` (`COPY` preserves
+  source mtimes, which would otherwise leave cargo believing the stubs are
+  current), and builds `quantification-server` with `--locked --features ccr`.
+* **runtime** — `gcr.io/distroless/cc-debian12`: the release binary at
+  `/usr/local/bin/quantification-server`, `USER nonroot:nonroot` (UID/GID
+  65532), no shell and no package manager, `STOPSIGNAL SIGTERM`,
+  `EXPOSE 8080 50051`.
 
 ```sh
 docker build -t quantification .
 docker run --rm -p 8080:8080 -p 50051:50051 quantification
 ```
 
-Both addresses must be set to `0.0.0.0:…` inside a container: the built-in
-defaults bind `127.0.0.1`, which is unreachable from outside the container.
-
 * 8080 = HTTP, 50051 = gRPC.
-* With `--features ccr` (as above), `/v1/restore` and gRPC `Restore` are live and
-  `reversible=true` returns `restore_ids`. Without the feature, `/v1/restore`
-  answers `501 Not Implemented` with
+* The image sets `QUANT_HTTP_ADDR=0.0.0.0:8080` and
+  `QUANT_GRPC_ADDR=0.0.0.0:50051`: both addresses must be `0.0.0.0:…` inside a
+  container, because the built-in defaults bind `127.0.0.1`, which is
+  unreachable from outside it. `QUANT_SHUTDOWN_GRACE_MS` is not set, so the
+  25 s default applies; pass `-e QUANT_SHUTDOWN_GRACE_MS=…` to change it.
+* The `ccr` feature is compiled in, so `/v1/restore` and gRPC `Restore` are
+  live and `reversible=true` returns `restore_ids`. `/metrics` reports
+  `quantification_build_info{algo_version="0.1.0",ccr="true"}`, which is how a
+  running container tells you it has the feature. Without the feature
+  `/v1/restore` answers `501 Not Implemented` with
   `{"error":{"code":"not_implemented","message":"the reversible store (DESIGN section 9) is disabled in this build; reversible=true stores no span, so no restore_id is returned"}}`
-  and gRPC `Restore` returns `UNIMPLEMENTED` (both statuses verified over HTTP;
-  the gRPC mapping is the same constant, asserted in `crates/server/src/grpc.rs`).
-* `/metrics` exposes `quantification_build_info{algo_version="0.1.0",ccr="true"}`,
-  so a running container reports whether it was built with the feature.
+  and gRPC `Restore` returns `UNIMPLEMENTED` (the same constant, asserted in
+  `crates/server/src/grpc.rs`); both statuses verified over HTTP.
 
-A minimal Kubernetes deployment consistent with that image:
+**The image was never built in the environment this was written in.** No
+container registry was reachable from that machine — every pull of
+`rust:1.98-bookworm` and `gcr.io/distroless/cc-debian12` failed with
+`net/http: TLS handshake timeout` — so neither base image could be fetched and
+no image was assembled. What was run natively is the content of every build
+step: the same `cargo build --release --locked -p quantification-server
+--features ccr`, the release binary started and exercised over real sockets, and
+`ldd` on it, which needs only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` and
+`ld-linux-x86-64.so.2` — no `libssl`, no `libstdc++`, so the binary does fit
+`cc-debian12`. That is not the same thing as a built image, and it is not a
+claim that the runtime stage, the `nonroot` UID, the ports or the `ENTRYPOINT`
+have been observed working: the Dockerfile is reviewed-but-unbuilt until someone
+runs the `docker build` above with registry access.
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: quantification
-spec:
-  replicas: 1
-  selector:
-    matchLabels: { app: quantification }
-  template:
-    metadata:
-      labels: { app: quantification }
-    spec:
-      terminationGracePeriodSeconds: 30
-      containers:
-        - name: quantification
-          image: quantification
-          ports:
-            - { name: http, containerPort: 8080 }
-            - { name: grpc, containerPort: 50051 }
-          env:
-            - { name: QUANT_HTTP_ADDR, value: "0.0.0.0:8080" }
-            - { name: QUANT_GRPC_ADDR, value: "0.0.0.0:50051" }
-          readinessProbe:
-            httpGet: { path: /readyz, port: http }
-          livenessProbe:
-            httpGet: { path: /healthz, port: http }
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
-            seccompProfile: { type: RuntimeDefault }
-```
+### Kubernetes
 
-`/healthz` and `/readyz` are unconditional `200` static responses
-(`{"status":"ok"}` / `{"status":"ready"}`) — they do not probe the gRPC listener
-or the store. `terminationGracePeriodSeconds` is set to 30 s as a placeholder:
-`main.rs` at this commit has no SIGTERM handling and no drain grace to match, so
-this value has to be reconciled with the shutdown path when it lands.
+`k8s/quantification.yaml` holds a `Deployment` and a `Service` for that image,
+and `k8s/README.md` is the contract the manifest assumes; read it for the
+details. Three things in it interact with the server's own behaviour:
+
+* `terminationGracePeriodSeconds: 30` against the container's
+  `QUANT_SHUTDOWN_GRACE_MS: "25000"`. The grace period has to stay above the
+  drain budget: the kubelet starts it at `SIGTERM`, and if it expires first the
+  process is `SIGKILL`ed mid-drain. The manifest sets the grace explicitly so
+  the relationship is auditable in the manifest instead of being whatever the
+  binary happens to default to.
+* `replicas: 1` is a **correctness constraint for `/v1/restore`, not a scaling
+  knob**: the CCR store is per-pod and in-process, so a `restore_id` only
+  resolves on the pod that issued it and a second replica can answer a valid id
+  with `404`. Compression itself is stateless and scales. `k8s/README.md` gives
+  the two supported ways to run more than one pod.
+* `readinessProbe` on `/readyz` at `periodSeconds: 1, failureThreshold: 1`, and
+  `livenessProbe` on `/healthz` at `periodSeconds: 10`: the drain flips
+  `/readyz` to `503`, and the pod has to leave the Service endpoints before the
+  listener closes ~2 s later.
+
+`/healthz` is an unconditional `200 {"status":"ok"}` and deliberately stays that
+way for the whole drain: it is the liveness probe, and a red liveness probe
+would have the kubelet restart the pod in the middle of finishing in-flight
+requests. `/readyz` is the drain-aware one; neither probes the gRPC listener or
+the store. The manifest itself has never been applied to a cluster.
 
 ## API
 
@@ -172,8 +163,8 @@ this value has to be reconciled with the shutdown path when it lands.
 | POST | `/v1/compress?envelope=json` | `{payload, options, content_type?}` → `{payload, stats}`, no stats headers |
 | POST | `/v1/detect` | payload → `{schema, scope_policy, span_count, spans_truncated, spans[…], degraded, noop_reason}` (first 64 spans) |
 | POST | `/v1/restore` | compressed bytes + `?restore_id=<id>` (or `?envelope=json`) → the stored original, `application/octet-stream`; 501 without the `ccr` feature, 404 on a miss |
-| GET | `/healthz` | `{"status":"ok"}` |
-| GET | `/readyz` | `{"status":"ready"}` |
+| GET | `/healthz` | `{"status":"ok"}`, an unconditional `200` for the whole life of the process, drain included |
+| GET | `/readyz` | `{"status":"ready"}` while serving; `503 {"status":"draining"}` from the instant of `SIGTERM`/`SIGINT` until the process exits |
 | GET | `/metrics` | Prometheus text: `quantification_http_requests_total`, `quantification_payload_bytes_total`, `quantification_pass_through_total`, `quantification_build_info` |
 
 `POST /v1/compress` echoes the request's `Content-Type` on the response when one
@@ -188,6 +179,28 @@ The `X-Stats-*` header set is exactly: `Bytes-In`, `Bytes-Out`,
 response degraded. `elapsed_*_ns`, `options_echo` and `restore_ids` are
 envelope/gRPC only. Header names are emitted lowercase (HTTP header names are
 case-insensitive).
+
+### Shutdown
+
+On `SIGTERM` or `SIGINT` the process latches a drain, in this order
+(`crates/server/src/{main.rs,lib.rs}`):
+
+1. `/readyz` starts answering `503 {"status":"draining"}`, before the listener
+   closes, so the pod leaves the Service endpoints while it is still reachable;
+2. an endpoint settle of `min(QUANT_SHUTDOWN_GRACE_MS / 4, 2000)` ms — 2000 ms at
+   the 25 s default — with both transports still polled, so a request arriving
+   in that window is served rather than left in the accept queue;
+3. the graceful-shutdown signal is released: both listeners stop accepting and
+   in-flight HTTP and gRPC work finishes, bounded by the whole
+   `QUANT_SHUTDOWN_GRACE_MS`.
+
+Exit code is 0 on a clean signal-initiated drain, 1 if either transport fails
+(the other is drained too, deliberately: a pod serving one transport with the
+other dead is worse than a restarted pod), 2 if the grace expires. `/healthz`
+stays `200` throughout so the kubelet does not restart the pod mid-drain, and
+`/metrics` is unaffected. `crates/server/tests/shutdown.rs` pins all of it,
+including that the output bytes and stats headers are identical before and after
+a drain.
 
 ### gRPC (tonic) — unary only
 
@@ -294,7 +307,13 @@ of the five kinds, all produced by the server, ascii and unicode forms:
 | templated block | `[... templated block x2 9394 ...]` | `⟪templated block ×2 ·9394⟫` |
 
 Markers contain no `"`, `\` or control character, so they need no re-escaping
-inside a JSON string.
+inside a JSON string. The checksum is a function of the anchor bytes and nothing
+else, so it is not comparable across payloads: the anchor is the first line for
+the run and template-group kinds (hence `a492` twice above — it is the same
+first log line) and the entire first occurrence for the two block kinds. Change
+one byte of the anchor and the four hex digits change; recompute them with
+`quantification_core::fingerprint::marker_checksum` rather than expecting a
+particular value.
 
 ### Profitability gate
 
@@ -307,9 +326,14 @@ anchor_bytes + marker_bytes < removed_bytes
 where `removed_bytes` is the exact byte range the marker replaces (member units
 plus the joiners between them) and `marker_bytes` includes the decimal width of
 the emitted count. Below the threshold the lines are kept verbatim. This is why
-a group of three short lines often survives: three `GET /a 200 Nms` lines are
-not collapsed at any `min_group_size` (verified: 92 → 92 bytes, 0 groups),
-while four are (108 → 92 bytes, 1 template group).
+a group of three short lines often survives. Measured on one body
+(`{"model":"gpt-4","messages":[{"role":"user","content":…}]}`, `GET /a 200 Nms`
+lines, default options): two lines 89 → 89 bytes and three lines 105 → 105
+bytes, 0 groups, at `min_group_size` 2 and 3 alike, while four lines collapse
+121 → 105 bytes with 1 template group. The comparison is byte-exact, so a
+one-byte-longer marker flips a borderline group: those same three lines *do*
+commit under `marker_style=unicode` (105 → 104 bytes, 1 template group), the
+unicode marker being one byte shorter than the ascii one.
 
 ### Determinism
 
@@ -320,29 +344,31 @@ recompression of the output is a fixed point. `algo_version` (`0.1.0`) is
 exposed in the stats and as `X-Stats-Algo-Version` so callers can detect a
 cross-release output change.
 
-Verified here at 8222e97: 1000 runs over the 36-entry gate corpus (26 golden
-fixtures + 10 adversarial cases, 847,098 bytes) are byte-equal, and the
-`x86-64` and `x86-64-v3` builds produce identical digests.
+Re-verified on this checkout: `gate_outputs_are_byte_stable_over_1000_runs`
+(the ignored §5.8 quick gate, run in release) reports `1000 runs over 36
+entries (847098 bytes)`, all byte-equal, in 11 s. The CPU-feature half of the
+§5.9 matrix was not re-run — see the ARM/NEON bullet under known limits.
 
 ## Options that bite
 
 * **Newlines must be escaped.** The splitter works on raw escaped bytes, so it
   splits on the two-byte sequence `\n` (or the escape units `\u000A` /
   `\u000a`). A plain-text body with raw LF bytes is one span, one unit, and does
-  not compress: verified, a 150-byte raw-LF text body with three near-identical
-  lines comes back as 150 bytes with `groups_collapsed=0` and
-  `degraded=false`, while the same content with `\n` escapes collapses to a
-  template group.
+  not compress: verified, a 135-byte raw-LF text body with three near-identical
+  lines comes back as 135 bytes with `groups_collapsed=0` and
+  `degraded=false`, while the same three lines as a chat `content` span with
+  `\n` escapes collapse to one template group (195 → 135 bytes).
 * **Default scope is `user_content` only.** `role:"tool"` spans are left
-  verbatim. Verified on a body with one `tool` and one `user` message: default
-  collapses only the user message; `?scope_policy=user_and_tools` collapses both.
+  verbatim. Verified on a body with one `tool` and one `user` message, four
+  `GET /a`-style lines each: default 196 → 180 bytes with 1 template group,
+  `?scope_policy=user_and_tools` 196 → 164 bytes with 2.
   Agent traffic usually puts the bulkiest dumps in tool messages, so
   `user_and_tools` is usually the right setting (DESIGN.md §4.3).
 * **`min_group_size` default 3 is a floor, not a promise.** A 3-line group is
   still subject to the profitability gate, and for short lines it usually fails
   it (see above). Lower it to `2` to make the run/template detectors eligible for
   smaller groups; note the gate still applies, so `min_group_size=2` alone does
-  not collapse a 2-line group of short lines (verified: 76 → 76 bytes).
+  not collapse a 2-line group of short lines (verified: 89 → 89 bytes).
 * **`reversible=true` is what produces `restore_ids`, and it needs the `ccr`
   feature.** Without the feature the option resolves fine, nothing is stored,
   `restore_ids` comes back empty, and `/v1/restore` is `501`. With the feature
@@ -357,15 +383,16 @@ fixtures + 10 adversarial cases, 847,098 bytes) are byte-equal, and the
 ## Development
 
 ```sh
-cargo test --workspace                 # 529 passed, 0 failed, 6 ignored
+cargo test --workspace                 # 537 passed, 0 failed, 6 ignored
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The 6 ignored tests are the long-running ones CI drives explicitly: the 1000-run
-byte-stability gate, the 200,000-run nightly soak (chunked, 8 ways), the
-cross-process fuzz-corpus replay, the ISA-leg aggregator, and the golden
-generator `write_the_chat_goldens`. CI runs `cargo nextest run --workspace` and
+byte-stability gate, the 200,000-run nightly soak in two tests (a 1-of-8 chunk
+and the aggregator that checks the chunks sum to the whole), the cross-process
+fuzz-corpus replay, the ISA-leg matrix, and the golden generator
+`write_the_chat_goldens`. CI runs `cargo nextest run --workspace` and
 `cargo deny check` in addition to fmt and clippy.
 
 Feature states:
@@ -414,6 +441,8 @@ with `PROTOC=/nonexistent/protoc` fails with prost-build's "Could not find
 Cargo.toml                workspace: core, eval, proto, server (fuzz/ excluded)
 DESIGN.md                 the normative design
 AGENTS.md                 repo conventions
+Dockerfile                the two-stage image; .dockerignore keeps the context to the workspace
+k8s/                      Deployment + Service for that image, and the contract they assume
 crates/core/              the pure compressor library
 crates/proto/             compressor.proto + tonic/prost build
 crates/server/            the binary: axum routes, tonic service, config
@@ -426,7 +455,7 @@ fuzz/                     cargo-fuzz targets and corpus
 |---|---|
 | `quantification-core` | the whole algorithm, bytes in → bytes + `Stats` out. No tokio, no clocks, no IO. `sniff` (schema), `locator` (span ranges), `stage1`/`stage1b` (line/record split), `detect/{exact,wsruns,blocks,templ,templ_blocks}` (stages 3–7), `mask` (the fixed mask list), `wsnorm`, `fingerprint`, `ledger` (commit admission, profitability gate, marker grammar), `render`, `splice`, `pipeline` (the driver), `ccr` (reversible store), `config` (frozen limits and option resolution) |
 | `quantification-proto` | `compressor.proto`, `tonic-prost-build`, and the `compressor.v1` types plus core conversion |
-| `quantification-server` | `main.rs` (env vars, both listeners), the axum app (`lib.rs`), HTTP option/envelope parsing (`options.rs`), stats headers (`headers.rs`), the tonic service (`grpc.rs`), Prometheus metrics |
+| `quantification-server` | `main.rs` (env vars, signal handling, both listeners), the axum app and the drain in `lib.rs` (`serve`, `State::drain`, `shutdown_grace`), HTTP option/envelope parsing (`options.rs`), stats headers (`headers.rs`), the tonic service (`grpc.rs`), Prometheus metrics |
 | `quantification-eval` | the `quant-eval` binary: real-tokenizer token reduction per corpus stratum and the four task-quality classes with injectable providers. Reporting-only; see `crates/eval/README.md` |
 
 `quantification-core` is the primary integration surface as a library; the
@@ -438,16 +467,29 @@ The algorithm, both transports, the CCR store, the determinism gates and the
 fuzz targets exist and are tested. The following are **not** done, and are
 recorded as open in the repo history:
 
-* **The per-stage compaction budget is still exceeded.** On this checkout, on an
-  Intel i7-9700K pinned to one core, the M3 gate over an 8,399,344-byte
-  log-heavy chat payload (77,000 units, compressed to 76,878 bytes, 300 groups)
-  reports p50 aggregate 80.9 ms / 103.8 MB/s, detect 7.1 ms, **compaction 73.7 ms
-  / 113.9 MB/s**, splice 0.04 ms. Verdict `M3 FAIL`: the aggregate ≥100 MB/s
-  floor passes, as do the detect and splice budgets, but the ≤50 ms compaction
-  budget, its ≥160 MB/s floor, and the R2 ≤80 ms aggregate budget all fail.
-  Reproduced across runs; this is a property of the code on this hardware, not
-  measurement noise. `stage6_masked_forms` (34%) and `stage5_blocks` (26%) are
-  the two hot stages.
+* **The compaction budget is exceeded on every run, and the aggregate floor is
+  borderline.** Re-measured on this checkout with the documented protocol
+  (`taskset -c 2`, 3 warmups discarded, 30 iterations, p50), seven runs of the
+  M3 gate over the 8,399,344-byte log-heavy chat payload (77,000 units,
+  compressed to 76,878 bytes, 300 groups) on an Intel i7-9700K (8 logical CPUs,
+  `powersave` governor, load average ~5.7 from other work on the box) give:
+
+  | metric | p50 across the 7 runs | throughput across the 7 runs |
+  |---|---|---|
+  | aggregate | 80.0–88.8 ms | 94.6–104.9 MB/s |
+  | detect | 7.1–7.8 ms | 1083–1185 MB/s |
+  | compaction | 72.9–81.0 ms | 103.7–115.2 MB/s |
+  | splice | 0.04 ms | not gated |
+
+  Verdict `M3 FAIL` in all seven runs: the ≤50 ms compaction budget, its
+  ≥160 MB/s floor and the R2 ≤80 ms aggregate budget fail every time, and the
+  aggregate ≥100 MB/s floor fails in 4 of the 7 (it passed at 101.7, 104.6 and
+  104.9 MB/s, so on this hardware it sits on the line and the box's load is part
+  of the answer). The detect (≤20 ms, ≥400 MB/s) and splice (≤10 ms) budgets
+  pass in every run. The compaction overrun is ~1.5× the budget and is not
+  measurement noise; `stage6_masked_forms` (34–36% of compaction) and
+  `stage5_blocks` (25–26%) are the two hot stages. Treat the aggregate figure as
+  "at the floor, machine-dependent", not as a pass.
 * **The offline evaluation targets are unratified, so every measured reduction
   figure is provisional.** DESIGN.md §13.1 (tokenizer baseline), §13.4
   (reference corpus) and §13.5 (task suite) are open, and the harness refuses
@@ -458,10 +500,10 @@ recorded as open in the repo history:
   The task-quality parity gates report `NOT MEASURED` because no provider was
   called — the harness never calls a model without `QUANT_EVAL_PROVIDER_CMD`
   and credentials.
-* **The ARM/NEON determinism leg is reported unavailable, not verified.** On this
-  x86-64 machine the ISA matrix ran the `x86-64` and `x86-64-v3` legs and they
-  agree byte for byte; the `neon` leg was declared unavailable. The DESIGN.md
-  §5.9 matrix has three legs and only two were executed.
+* **The ARM/NEON determinism leg is reported unavailable, not verified.** The
+  §5.9 matrix has three legs; the last local run of it executed `x86-64` and
+  `x86-64-v3`, which agree byte for byte, and declared `neon` unavailable. Only
+  two of the three legs have ever run on real hardware.
 * **Fuzzing has not been run in this environment.** Only the stable toolchain is
   installed and `rustup toolchain install nightly` cannot reach
   `static.rust-lang.org` from here, so `cargo fuzz` cannot build at all — it is
@@ -469,16 +511,34 @@ recorded as open in the repo history:
   outright. The targets compile only under `cargo fuzz`'s own build. The
   CI-runs-only fuzz legs (ASan smoke, 15-minute soak, retained-corpus
   determinism replay) have therefore not been exercised locally.
+* **The container image has never been built and the manifest has never been
+  applied to a cluster.** No registry was reachable from the machine the
+  Dockerfile was written on (every pull failed with `net/http: TLS handshake
+  timeout`), so neither base image could be fetched and no image exists. What
+  was done is native: the same `cargo build --release --locked … --features
+  ccr`, the binary started and exercised over real sockets, and `ldd` on it.
+  The drain behaviour, the distroless runtime stage, the non-root UID and the
+  probes are therefore read off the source, not observed on a pod. See the
+  Docker section above and `k8s/README.md`.
 
 Also open, and worth knowing before relying on this:
 
-* `cargo test --workspace --all-features` is not reliably green:
+* `cargo test --workspace --all-features` was green in every run here — 550
+  passed, 0 failed, 6 ignored, twice — so the flake an earlier revision of this
+  README reported under that heading did not reproduce:
   `quantification-eval`'s `the_command_transport_pipes_the_prompt_and_reports_a_missing_program`
-  fails intermittently ("`/bin/sh` did not finish"). `Injected::run_command`
-  requires the stdin writer to succeed before it reports the child's exit
-  status, and `sh -c 'exit 3'` closes stdin immediately, so the assertion on
-  "exited with" races a `EPIPE`. `cargo test --workspace` with default features
-  is stable.
+  passed 12 runs in a row. The race that would cause it is still in the code,
+  though, so treat the suite as green-and-racy rather than fixed:
+  `Injected::run_command` (`crates/eval/src/tasks.rs`) folds the stdin writer's
+  result into its `ok`, and `sh -c 'exit 3'` closes stdin immediately, so an
+  `EPIPE` on the prompt write can turn a clean "`exited with`" failure into
+  "`did not finish`". `cargo test --workspace` with default features is 537
+  passed, 0 failed, 6 ignored.
+* `crates/server/tests/shutdown.rs` (8 tests) binds real sockets and has been
+  seen to fail on a busy machine with a connection reset in the SIGTERM drain
+  path; it passed in every run here, including four full `cargo test
+  --workspace` runs and two `cargo test --workspace --all-features` runs. A red
+  drain test on a loaded box is worth a rerun before it is believed.
 * Only the `user_content` and `user_and_tools` scopes exist; `all_messages` and
   `explicit_paths` parse and are then refused. v2 items (Drain-style fuzzy
   clustering, custom masks, non-consecutive dedup, value-preserving collapses)
