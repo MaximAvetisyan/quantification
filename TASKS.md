@@ -3883,6 +3883,116 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W4.4 Adversarial perf fixtures** (§12) — unique floods, giant line,
   periodic patterns, collision pressure, maximal-density `},{`. Parallel
   with W4.3.
+  Status: **complete; all eight §12 adversarial cases are generated in
+  process, all 16 tests green, and the two §8 claims they were written to
+  test both hold (2026-09-27).** One real finding is recorded below
+  (stage 7's window factor is 64 per unit, not 63) and one measurement the
+  design did not anticipate (the JSON depth cap bites at 61 nested arrays
+  inside a message, not at 64).
+  - **What landed.** `crates/core/tests/adversarial_fixtures.rs` (the seeded
+    generator module: a `Rng` over a fixed-seed xorshift64 `0x0ad5_1e4d_5eed_0001`,
+    a 26-letter `tag` counter, and the eight case builders — no committed
+    blob, no wall clock, no `/dev/urandom`, so CI regenerates byte-identical
+    payloads), `crates/core/tests/adversarial_perf.rs` (13 default tests +
+    3 `bench_stages` tests), `crates/core/tests/span_shape.rs` (the §12
+    span-shape histogram). The fixture module is included by
+    `#[path = "adversarial_fixtures.rs"] mod fixtures;` from the two test
+    files that use it — it is compiled as its own 0-test target, which is the
+    price of **not** creating a `tests/common/` module and **not** refactoring
+    `tests/pipeline.rs`; no production file, no dependency, no
+    `Cargo.lock`/`deny.toml` change.
+  - **The cases, and what each one is asserted to do** (default suite ≈0.7 s
+    wall, `bench_stages` suite ≈3.2 s wall, both in debug on the reference
+    box; every test carries a generous per-case millisecond ceiling *and* a
+    structural assertion, so a slow box cannot turn a real regression into a
+    flake):
+    | §12 case | builder | asserted behaviour |
+    |---|---|---|
+    | all-unique-lines flood | `unique_lines(n)`, 11-byte lines | 9 000 units: no commits, byte-for-byte pass-through, stage 5/7 compares ≤ the per-unit cap, and 2× the units costs ≤ 3× the time. Past the cap (`bench_stages`, 200 000 units): `degraded=true` with `noop_reason=None` and a byte-for-byte pass-through — the degradation *is* the table cap |
+    | single giant line | `giant_line(n)` | one over-cap line, `record_splits == 1`, exactly one **ineligible** unit, zero work in stage 5, pass-through, no degradation |
+    | highly periodic (KMP worst case) | `periodic_units(n, 129)` | period `2·max_block_lines+1` hides every window: 0 block commits, 0 verifying memcmps, `compares ≤ 63·units` (stage 5) and `≤ 64·units` (stage 7), `scanned ≤ units`, and 2× units ≤ 2× steps + slack |
+    | deeply nested arrays | `nested_arrays(500, 3)` | 1 504 units, the repeated `]]]` tail collapses (stage 3 and stage 7 both fire), the spliced output still sniffs as `chat` and still locates (the R3 proxy) |
+    | deeply nested envelope | `deep_envelope(d)` | 60 frames still locate their user span; 61+ frames hit `JSON_DEPTH_CAP` and the whole payload degrades to a byte-for-byte pass-through — the cap is asserted from both sides, so it is not a "degrades somehow" test |
+    | millions of tiny messages | `tiny_messages(n)` | 20 000 messages → 10 000 user-class spans, one unit each, pass-through, and 2× the messages ≤ 3× the time; `bench_stages` runs the real **1 000 000 messages / 37 500 014 B / 500 000 spans** case in 2.32 s debug (release ≈0.2 s) |
+    | collision pressure | `collision_neighbors(g)` + `FingerprintTable` | 200 masked-equal triples merge (200 template groups) while all 600 byte-different neighbours survive verbatim; separately, 8 keys searched into **one** start slot of a 64-slot table all stay findable, a 1-byte twin inserts as `New` and never shadows its neighbour, and the 128-bit digests are pairwise distinct — the memcmp path is exercised, no real collision is claimed |
+    | maximal-density `},{` | `dense_records(n, unique)` | 9 000 records at a stride of 10 B (8 B is the floor for `{\"k\":0}` + `,`), one over-cap line, 8 999 separators, every unit ≤ `max_record_bytes`: the uniform dump is 1 exact run (90 056 → 116 B), the unique dump is 0 exact runs and 1 template group (162 056 → 145 B); `bench_stages` shows 200 000 unique records degrading at the table cap |
+  - **The table cap, asserted at the mechanism and at the pipeline.** The
+    degradation path is *not* "the table gives up when it is half full": the
+    table **grows** until `MAX_SLOTS = 262 144`, and only then does
+    `insert_hashed` return `Full` at the 75 % rule, which is what stage 5
+    turns into `degraded`. That is measured directly
+    (`the_fingerprint_table_caps_itself_and_then_refuses_to_grow`:
+    `full_at == MAX_SLOTS·3/4 == 196 608`, `slots()` never grows past
+    `MAX_SLOTS`) and end-to-end at 200 000 unique units, so §8's "unique-line
+    floods degrade to pass-through via the table caps" is a bounded, checked
+    claim and not an assumption. It also means the degradation needs ~197 k
+    unique units to trigger, which is why the sub-cap flood (9 000 units) is
+    a *pass-through without degradation* and the over-cap one lives in the
+    `bench_stages` set.
+  - **§12 span-shape instrumentation** (`span_shape.rs`, a reporting
+    artifact, never a gate): every eligible span of the 26-file golden corpus
+    **plus** the adversarial suite is classified `multi_line` /
+    `single_line` / `over_cap` (`over_cap` ≡ `record_splits > 0`, i.e. the
+    stage-1b share) per schema and role class under
+    `ScopePolicy::UserAndTools`, printed as a table and written to
+    `target/span-shape-report.json` (8.5 KB, aggregated per corpus entry).
+    The test asserts only that the histogram is non-degenerate (all three
+    shapes and both role classes occur, every schema contributes, the shares
+    add up) — the numbers are reported, not gated. **Measured here, over the
+    golden corpus alone: **27 eligible spans, 17 multi-line, 5 single-line,
+    5 over-cap** (every one of the 5 from the deliberately over-cap
+    `edges/*` fixtures; 3 072 units in the biggest, and `eligible_units == 0`
+    in the two records-at-the-cap fixtures, which is the cap working); the
+    adversarial suite adds 10 008 spans of which 10 001 are single-line.
+    So the golden corpus is 63 % multi-line, and its whole stage-1b share is
+    a *fixture* property, not a corpus property: §13.6's "extend stage 1b
+    depending on the span-shape histogram" cannot be answered from this
+    corpus until single-line tool dumps appear at corpus scale.** This is
+    the measurement §12 asked for, and it is the honest answer rather than
+    the assumed one.
+  - **Finding (real, recorded not deleted): stage 7's window factor is 64
+    per unit, stage 5's is 63.** The first draft of the periodic case asserted
+    `compares ≤ (max_block_lines-1)·units` for both stages, copied from
+    `tests/detect_blocks.rs`, and stage 7 failed at 571 904 compares for
+    9 000 units. §4.4 stage 5 scans `L` from `max_block_lines` **down to
+    `min_block_lines = 2`** (63 candidate lengths) while stage 7 lowers the
+    minimum to **1** (64 candidate lengths). Both are still linear with the
+    same ≤64 constant §8 claims, so the *claim* holds and the test was
+    wrong; the two factors are now named (`STAGE5_FACTOR`, `STAGE7_FACTOR`)
+    and asserted separately. Nothing in `src/` changed.
+  - **Measurement the design text did not predict.** `JSON_DEPTH_CAP` is 64
+    *frames*, and the frames spent getting to a message's sibling key are 4,
+    so the deepest payload that still locates is 60 nested arrays and 61 is
+    `Malformed`. The test pins both sides of that boundary rather than
+    "deeply nested degrades", because the alternative would have let a
+    regression in the depth accounting pass unnoticed. Two further
+    observations, neither a defect and neither asserted as one: a payload
+    whose *root* object carries a non-`messages` array key (`{"messages":
+    [...], "pad": [...]}`) is `Malformed` at every depth, and
+    `{"messages": [[[ … ]]]}` (the message object at the bottom of nested
+    arrays) is `Malformed` too — the locator only walks the shapes §4.1
+    defines. The envelope case therefore nests *inside* the message, where
+    the depth cap is the thing under test.
+  - **Gates.** `cargo test --workspace` **499 green, 0 failed, 1 `#[ignore]`d**
+    (485 → 499: 13 in `adversarial_perf.rs`, 1 in `span_shape.rs`; the
+    `adversarial_fixtures.rs` target collects 0 tests),
+    **511** with `--all-features`, **428** for
+    `-p quantification-core --features bench_stages` (411 → 428, the three
+    `bench_stages`-gated adversarial tests included). `cargo fmt --all
+    --check` clean; `cargo clippy --workspace --all-targets -D warnings`
+    clean in the default and `--all-features` states. The whole workspace
+    suite grew 12.4 s → 13.3 s wall.
+  - **Not done / still open.** The adversarial cases are in-process only:
+    none of them is a committed fixture, so they are exercised by
+    `cargo test`/`--features bench_stages` and by the W4.2 gate's corpus
+    (`gate_suite()`), but a *file-level* corpus entry per case (so the fuzz
+    and soak jobs can address them by name) is not written. The per-case
+    millisecond ceilings are calibrated on one debug box; a much slower
+    runner could in principle trip one, which is why every ceiling sits next
+    to a structural assertion that does not depend on the clock. The
+    histogram is computed from the committed golden corpus, not from the
+    §13.4 reference corpus, so its numbers are indicative only — it becomes a
+    decision input when that corpus is ratified.
 - **W4.5 Continuous fuzzing** (§12) — live from W1 onward; triage weekly.
 - **W4.6 Offline eval harness** (§12) — tokenizer-based success metric +
   task-quality parity suite. Parallel from W2.9 onward (external models
