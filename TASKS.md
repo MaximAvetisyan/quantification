@@ -1145,6 +1145,35 @@ exit criteria. Gates M1–M4 are blocking milestones.
   **one** block with `count = 1022` (128 057 → **333** B, previously 3 854 B in two
   commits) and is a fixed point. Tests: 20 integration tests in
   `crates/core/tests/detect_blocks.rs` (was 19). No new dependencies.
+  - **B1, stage-5 half (the coarse id column's "not loaded" state was inside
+    the value domain — fixed 2026-09-27, tree review after W4.6).** Same
+    sentinel defect as the W2.8 hunk above, in the `coarse` column this stage
+    builds from `forms.id(index).0 as u32` (and, before `4bc6447`, in this
+    stage's own fine column too, whose `rep as u32` was always in range
+    because `rep < units.len() <= span.len() <= MAX_SPAN_BYTES = 2^25`). Both
+    columns are now `UnitId = Option<u32>`, so a real template id can never read
+    as "not loaded". **Stated honestly: the coarse column's truncation has no
+    reachable behavioural difference, and this is why the stage-5 test recorded
+    here is a lock-in rather than a red/green reproducer** — `anchor_is_match_free`
+    compares coarse ids only as a filter and then *always* re-verifies with
+    `coarse_same`, i.e. a memcmp of the two masked forms, so a low-32 collision
+    between two different templates costs one extra masked-byte compare and is
+    then rejected; the only false refusal it could cause needs two units whose
+    masked forms are equal *and* whose ids differ, which `Forms::build` cannot
+    produce (equal masked forms always get the same id). The stage-7 id column
+    had no such safety net — its `same_bytes` is consulted only *after* the run
+    scan — which is why that is where the reproducer lives. Test:
+    `the_id_columns_hold_each_unit_once` is replaced by
+    `the_id_columns_survive_a_sentinel_valued_template_id` (one for one — this
+    file holds 22 integration tests today, after the later waves' additions —
+    keeping the workspace-bound assertions that test really owned and adding
+    the value-domain claim: the same
+    4-unit span, the same masked forms, the only difference being the template
+    ids (`[0, 1, 0, 1]` against
+    `[0xffff_ffff, 0x1_ffff_ffff, 0xffff_ffff, 0x1_ffff_ffff]`, i.e. two ids that
+    are distinct as `u64` and identical in the low 32 bits) must produce equal
+    `StageStats` and equal `commits()`, plus `size_of::<UnitId>()` so the
+    out-of-domain state cannot be bought with a wider column.
 - **W2.6 Renderer / marker grammar** (§4.5) — exact pinned shapes + CCCC
   checksum. Parallel with W2.2–W2.5 (consumes commit ledger only).
   Status: **complete** (2026-09-26). The module is
@@ -1410,6 +1439,46 @@ exit criteria. Gates M1–M4 are blocking milestones.
   implementation (the walker seam, the id width, the caps, rejection handling,
   the degradation shape and the work meter), frozen here because §5.7 freezes
   behaviour per release. No new dependencies.
+  - **B1 (the id column's "not loaded" state was inside the value domain —
+    fixed 2026-09-27, tree review after W4.6).** The W4.3 commit `4bc6447`
+    ("one shared ws-normalized column") replaced this hunk's `Vec<Option<usize>>`
+    id column with a `Vec<u32>` plus an in-band sentinel,
+    `blocks::NONE = u32::MAX` (`detect/blocks.rs:14`). `TemplateId` is the low
+    **64** bits of the masked form's xxh3-128, so storing `hash as u64 as u32`
+    puts a real id in the *same* domain as the sentinel with nothing keeping
+    them disjoint, and this stage's `load` is the one that stores template ids
+    verbatim. The probability is 2^-32 per distinct masked form — a natural log
+    never hits it, but §1's input is untrusted text, which is the case that
+    matters. The failure is silent by construction: `windowed_blocks`' run scan
+    reads `ids[run] != NONE` as the end of a run (`blocks.rs:171`), so a
+    sentinel-valued unit masquerades as "not loaded", `room` collapses, no
+    candidate length survives, and the templated block is dropped with **no
+    panic and no `degraded` flag** — the only symptom is a lower
+    `templated_blocks` count. **Reproducer (identical source, only the
+    `TemplateId` value differs):** ids `[0, 1, 2, 0xffff_ffff, 0, 1, 2,
+    0xffff_ffff]` give `templated_blocks == 1` before `4bc6447` and `0` after;
+    the scan stops at unit 3 and nothing else survives. **Fix:** the id columns
+    are `pub type UnitId = Option<u32>` (`detect/blocks.rs`), so "not loaded" is
+    out of the value domain by construction and this hunk's frozen reading (b)
+    is restored exactly — it is 8 bytes per unit here as it was there, and
+    `size_of::<UnitId>() == 2 * size_of::<u32>()` is now asserted. `pub const
+    NONE` is deleted; the two domain tests (`detect_blocks.rs`,
+    `detect_templ_blocks.rs`) additionally assert `!source.contains("u32::MAX")`
+    so the in-band sentinel cannot come back unnoticed. **`Scratch::reserved()`
+    is a capacity in elements, so no workspace total moves.** Cost: two id
+    columns are 8 B/unit again instead of 4 B/unit — the width W2.4/W2.8
+    shipped and the width `4bc6447` replaced — and one 64-bit compare replaces
+    one 32-bit compare per `equal_tail` step; the compare/verification counts
+    are unchanged, and **no measurement was taken to move a number**. Tests:
+    `a_template_id_whose_low_32_bits_are_the_sentinel_is_still_loaded` in
+    `crates/core/tests/detect_templ_blocks.rs` (16 → 17) is the reproducer
+    verbatim — hand-built `Forms`, the four distinct masked forms twice, ids
+    carrying `0xffff_ffff` at units 3 and 7, asserted to commit the same
+    `TemplatedBlock(0..7, count = 1)` with the same four-unit anchor as the
+    control ids `[0, 1, 2, 3, 0, 1, 2, 3]`; verified **red on `4bc6447`**
+    (`templated_blocks 0`, zero commits) and green here. The stage-5 half of
+    the same defect is recorded in the W2.4 hunk below, and the tree review's
+    remaining findings in the W4.3 hunk.
 - **W2.9 Pipeline orchestration + Stats assembly** (§3, §4.5) — after
   W2.2–W2.8. **Gate M2**: chat golden outputs byte-stable ×1000.
   Status: **complete** (2026-09-26). The module is
@@ -4020,6 +4089,96 @@ exit criteria. Gates M1–M4 are blocking milestones.
     the gate turns green the moment the work is done, and the criterion group
     that moved names the stage. **M3's aggregate floor and R2 are green today;
     the gate's verdict line is not, and must not be recorded as green.**
+  - **Tree review after W4.6 (2026-09-27) — one blocker and the advisories
+    fixed in it.** A review of the tree at `be47078` found one blocker in the
+    W4.3 line of work and a set of advisories; the blocker (the id column's
+    sentinel) is recorded in the W2.8 and W2.4 hunks, which own those files.
+    What is recorded here is the rest, plus the review's disposition.
+    **Files changed:** `crates/core/src/{mask,wsnorm,detect/templ}.rs`,
+    `crates/core/tests/{mask,wsnorm,detect_templ}.rs`, this hunk and the two
+    detector hunks. `crates/eval/**`, `.github/**`, `fuzz/**`
+    and `crates/server/**` were not touched.
+    - **A1 (the mask growth bound was an unasserted luck).** `mask.rs` sized its
+      scratch `ws_line.len() * GROWTH + 8` with `GROWTH = 5`, which is *smaller
+      than the longest placeholder* (`<uuid>` is 6 bytes) and is only safe
+      because every mask in the frozen §4.6 list happens to satisfy
+      `placeholder_len <= 5 * consumed_len` on its shortest form. `AGENTS.md`
+      forbids comments, so that invariant was written down nowhere: a future
+      6- or 7-byte placeholder on 1–2 bytes of consumption turns `copy`'s
+      `buf[at..at + bytes.len()]` into an **index-out-of-bounds panic on user
+      payload**, in a compressor whose input is untrusted. `mask.rs` now carries
+      a `SHORTEST: [(Mask, usize); 6]` table pairing each mask with the shortest
+      form that triggers it (`ts` 10, `ip` 3, `uuid` 36, `hex` 16, `dur` 2,
+      `num` 1) and a `const fn growth()` that takes
+      `max ⌈placeholder_len / consumed⌉` **at compile time**; the result is
+      still exactly 5, so the bound, `templ::Scratch::with_capacity`'s hint and
+      every workspace number are unchanged, but the invariant is now enforced
+      by const-eval instead of by luck, and adding a mask that needs more
+      changes the number rather than overflowing. `Mask::placeholder` is a
+      `const fn` so the table can read it, and `mask_bound(len)` is `pub const`
+      so `templ::Scratch::with_capacity` derives its hint from the same
+      expression instead of repeating `* 5 + 8`. Tests: lib
+      `mask::tests::the_growth_bound_is_the_worst_paired_placeholder_ratio`
+      pins the table against `MASK_LIST` and against a real witness input per
+      entry (an input of exactly `consumed` bytes that masks to exactly that
+      placeholder), and integration
+      `the_derived_bound_covers_the_worst_placeholder_ratio` pushes 1 000
+      `5,` tokens (1.67× growth, the densest token pair in the list) through a
+      deliberately stale scratch. **Non-vacuity was checked by breaking it:**
+      forcing `growth()` to return 1 makes the flood panic in `copy`
+      (`index out of bounds: the len is 2008 but the index is 2008`) and the
+      lib test fail on `assert_eq!(GROWTH, worst)`, then reverting.
+    - **A2 (`mask_len`'s contract was implicit).** `mask_len` only ever resizes
+      its output buffer *up*, so it could hand back a length shorter than
+      `out.len()` with stale bytes beyond it; every current caller sliced to the
+      returned length, so the tree was correct, but a future caller could have
+      read garbage. `mask_len` is now **private**: the only public shape is
+      `mask_into`, which leaves `out` at exactly the masked length, and
+      `Forms::build` uses `mask_into` + `out.len()` (the source scan in
+      `detect_templ.rs` now pins `mask_into`). One test line changed with it.
+    - **A3 (the SWAR byte search was little-endian-only with no guard).**
+      `wsnorm::next_byte` / `plain_run` load with `u64::from_le_bytes` and
+      derive the index from `trailing_zeros() / 8`, which is only correct when
+      byte *i* of the word is `raw[at+i]`. Both current targets are
+      little-endian, so this is latent — but on a big-endian target stage 1's
+      line splitting would return **wrong offsets** silently, a correctness bug
+      rather than a perf one. The assumption is now explicit and enforced with
+      a `#[cfg(target_endian = "big")] compile_error!` naming the two functions
+      and what to port, so a BE port fails to build instead of corrupting
+      quietly. Test: `the_word_scan_finds_a_byte_at_every_offset_of_the_word`
+      compares `next_byte` against a naive scan for 4 target bytes × 8 word
+      offsets × 25 buffer lengths × every start index, which is the index
+      derivation the endianness assumption feeds.
+    - **A7** (the `capped()` helper in this hunk's `adversarial_perf.rs` threw
+      away the counter it is named for) is recorded in the **W4.4** hunk below,
+      which owns that file.
+    - **A8.** The tautological `the_id_columns_hold_each_unit_once` is replaced
+      in the W2.4 hunk above; the review's judgement that it restated
+      `with_capacity` and `Vec::resize` is accepted, and only the workspace
+      bound it genuinely owned is kept.
+    - **Left alone, with the review's own reasoning:** A4 (`work.compares`
+      deferral is arithmetically identical, verified), A5 (the wsruns memo was
+      deleted, not live), A6 (the single-build assumption is guarded; optional
+      hardening only), A9/A10 (the ISA-leg reporting composition is sound; the
+      NEON leg is honestly reported unavailable), A12 (`perf_payload` is a
+      speed oracle only; the differential oracles are the real defence), A13
+      (`fuzz_splitter`'s tautological rebuild is documented and the real checks
+      are elsewhere), A14/A15 (the M3 report is honest and no golden was
+      weakened). **This hunk's M3 numbers are unchanged and were not re-measured
+      for these fixes** — none of them touches a compression path, and no
+      measurement was taken to move a number.
+    - **Verification.** `cargo test --workspace` **529 green, 0 failed, 6
+      `#[ignore]`d** (525 at `be47078` plus 4 new tests: 1 lib mask, 1 mask, 1
+      wsnorm, 1 templated blocks; the detector-block test was replaced 1:1).
+      `cargo test --workspace --all-features` 541 green with one **pre-existing
+      flake** in `crates/eval/tests/eval.rs`
+      (`the_command_transport_pipes_the_prompt_and_reports_a_missing_program`
+      fails with `/bin/sh did not finish` under the full-suite run and passes in
+      isolation; it reproduces at `be47078` with these changes stashed, and
+      `crates/eval/**` is outside this fix's ownership, so it is reported and
+      not touched). `cargo fmt --all --check` clean; `cargo clippy --workspace
+      --all-targets -- -D warnings` clean. No new dependency, no golden file
+      and no DESIGN.md change.
 - **W4.4 Adversarial perf fixtures** (§12) — unique floods, giant line,
   periodic patterns, collision pressure, maximal-density `},{`. Parallel
   with W4.3.
@@ -4113,6 +4272,21 @@ exit criteria. Gates M1–M4 are blocking milestones.
     arrays) is `Malformed` too — the locator only walks the shapes §4.1
     defines. The envelope case therefore nests *inside* the message, where
     the depth cap is the thing under test.
+  - **A7 (the "capped work" helper threw away the counter it is named for —
+    fixed 2026-09-27, tree review after W4.6).** `capped()` hard-capped
+    `compares` (`factor * lines`) and `scanned` (`lines`) and then discarded the
+    third element of its tuple with `let _ = verifications;`, so the memcmp
+    counter was unbounded inside the one function whose name claims the work is
+    capped — the "capped work" claim in the test names above was overstated. It
+    is now bounded by construction **and asserted**: every `verifications += 1`
+    in `windowed_blocks` is preceded by a `compares += 1` in the same branch
+    (the main `L` descent, `anchor_is_match_free` and `copies` each do
+    `compares += 1` then conditionally `verifications += 1`), so
+    `verifications <= compares` — checked on every fixture, not assumed. The
+    `verifications` element stays in the tuple because two callers assert on it
+    directly (the periodic case pins the KMP worst case to `work.1 == 0`, "never
+    reaches a verifying memcmp"). No `src/` change, no new assertion weakened,
+    and the two hard caps are untouched.
   - **Gates.** `cargo test --workspace` **499 green, 0 failed, 1 `#[ignore]`d**
     (485 → 499: 13 in `adversarial_perf.rs`, 1 in `span_shape.rs`; the
     `adversarial_fixtures.rs` target collects 0 tests),
@@ -4121,7 +4295,8 @@ exit criteria. Gates M1–M4 are blocking milestones.
     `bench_stages`-gated adversarial tests included). `cargo fmt --all
     --check` clean; `cargo clippy --workspace --all-targets -D warnings`
     clean in the default and `--all-features` states. The whole workspace
-    suite grew 12.4 s → 13.3 s wall.
+    suite grew 12.4 s → 13.3 s wall. (A7 adds one assertion to an existing
+    test: 13 → 13 in this file, no test count moves.)
   - **Not done / still open.** The adversarial cases are in-process only:
     none of them is a committed fixture, so they are exercised by
     `cargo test`/`--features bench_stages` and by the W4.2 gate's corpus

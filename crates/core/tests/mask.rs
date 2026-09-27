@@ -1,5 +1,5 @@
 use quantification_core::config::MarkerStyle;
-use quantification_core::mask::{MASK_LIST, Mask, mask, mask_into};
+use quantification_core::mask::{MASK_LIST, Mask, mask, mask_bound, mask_into};
 use quantification_core::wsnorm::normalize;
 
 const UNICODE: MarkerStyle = MarkerStyle::Unicode;
@@ -278,6 +278,36 @@ fn mask_into_clears_its_output() {
     assert_eq!(out, br"a\tb");
     mask_into(b"7", &mut out);
     assert_eq!(out, b"<num>");
+}
+
+const WORST_RATIO: (&str, &str) = ("5,", "<num>,");
+
+#[test]
+fn the_derived_bound_covers_the_worst_placeholder_ratio() {
+    for group in ALL {
+        for (input, expect) in *group {
+            assert!(
+                mask_bound(input.len()) >= expect.len(),
+                "bound too small for {input:?}"
+            );
+        }
+    }
+    let (token, form) = WORST_RATIO;
+    let line = token.repeat(1000);
+    let expect = form.repeat(1000);
+    let out = mask(line.as_bytes());
+    assert_eq!(out, expect.as_bytes());
+    assert!(
+        out.len() > line.len(),
+        "the fixture must outgrow its input or it proves nothing"
+    );
+    assert!(
+        mask_bound(line.len()) >= out.len(),
+        "bound too small for a flood of the worst ratio"
+    );
+    let mut scratch = vec![b'x'; mask_bound(line.len())];
+    mask_into(line.as_bytes(), &mut scratch);
+    assert_eq!(scratch, out);
 }
 
 struct Rng(u64);

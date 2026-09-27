@@ -1,4 +1,4 @@
-use crate::detect::blocks::{Domain, NONE, Work, windowed_blocks};
+use crate::detect::blocks::{Domain, UnitId, Work, windowed_blocks};
 use crate::ledger::{CommitKind, Ledger, StageStats};
 
 use super::templ::Forms;
@@ -6,7 +6,7 @@ use super::templ::Forms;
 const MIN_PERIOD: usize = 1;
 
 pub struct Scratch {
-    ids: Vec<u32>,
+    ids: Vec<UnitId>,
     work: Work,
 }
 
@@ -75,11 +75,11 @@ pub fn templated_blocks(
 fn load(ledger: &Ledger<'_>, forms: &Forms, scratch: &mut Scratch) {
     let units = ledger.units();
     scratch.ids.clear();
-    scratch.ids.resize(units.len(), NONE);
+    scratch.ids.resize(units.len(), None);
     scratch.work = Work::default();
     for (index, unit) in units.iter().enumerate().take(forms.len()) {
         if unit.eligible {
-            scratch.ids[index] = forms.id(index).0 as u32;
+            scratch.ids[index] = Some(forms.id(index).0 as u32);
         }
     }
 }

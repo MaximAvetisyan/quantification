@@ -679,6 +679,58 @@ fn a_join_is_rejected_when_the_ids_match_but_the_masked_bytes_differ() {
 }
 
 #[test]
+fn a_template_id_whose_low_32_bits_are_the_sentinel_is_still_loaded() {
+    let lines = [
+        get(1),
+        reply(0),
+        pool(0),
+        header(0, 0),
+        get(2),
+        reply(1),
+        pool(1),
+        header(0, 1),
+    ];
+    let span = join(&lines);
+    let units = split_span(&span, UNICODE);
+    assert_eq!(units.len(), 8);
+    let masked: Vec<Vec<u8>> = lines.iter().map(|line| mask(&normalize(line))).collect();
+    for role in 0..4 {
+        assert_eq!(masked[role], masked[role + 4], "role {role} copy");
+        assert_ne!(
+            masked[role],
+            masked[(role + 1) % 4],
+            "role {role} is its own"
+        );
+    }
+    let run = |ids: [u64; 8]| -> (StageStats, Vec<Commit>) {
+        let parts: Vec<(&[u8], u64)> = masked
+            .iter()
+            .zip(ids)
+            .map(|(form, id)| (form.as_slice(), id))
+            .collect();
+        let mut ledger = new_ledger(&units);
+        let handoff = hand_templated(&parts, false);
+        let stats = seven(
+            &handoff,
+            &mut ledger,
+            MAX_BLOCK_LINES,
+            &mut Stage7Scratch::default(),
+        );
+        (stats, ledger.commits().to_vec())
+    };
+    let (sentinel, sentinel_commits) = run([0, 1, 2, 0xffff_ffff, 0, 1, 2, 0xffff_ffff]);
+    let (control, control_commits) = run([0, 1, 2, 3, 0, 1, 2, 3]);
+    assert_eq!(sentinel, control);
+    assert_eq!(sentinel_commits, control_commits);
+    assert_eq!(sentinel.templated_blocks, 1);
+    let commit = &sentinel_commits[0];
+    assert_eq!(commit.kind, CommitKind::TemplatedBlock);
+    assert_eq!((commit.first, commit.last, commit.count), (0, 7, 1));
+    assert_eq!(commit.anchor, units[0].range.start..units[3].range.end);
+    assert_removal_invariant(&units, commit);
+}
+
+#[test]
 fn a_below_threshold_block_stays_verbatim() {
     let narrow = lines_span(&[b"a 1", b"a 2"]);
     let units = split_span(&narrow, UNICODE);
@@ -1122,4 +1174,8 @@ fn the_templ_blocks_module_has_no_forbidden_determinism_inputs() {
     assert!(!source.contains("mask_into"));
     assert!(!source.contains("normalize_into"));
     assert!(!source.contains("span"));
+    assert!(
+        !source.contains("u32::MAX"),
+        "no in-band sentinel: a real template id must never read as not loaded"
+    );
 }

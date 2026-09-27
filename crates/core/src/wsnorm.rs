@@ -3,6 +3,13 @@ use std::ops::Range;
 use crate::fingerprint::fingerprint;
 use crate::stage1::Unit;
 
+#[cfg(target_endian = "big")]
+compile_error!(
+    "wsnorm::next_byte and plain_run load words little-endian and read the index \
+     from trailing_zeros, so a big-endian target would return wrong offsets; port \
+     the byte search before building for one"
+);
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Column {
     pub bytes: Vec<u8>,

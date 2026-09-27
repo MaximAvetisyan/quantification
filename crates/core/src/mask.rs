@@ -20,7 +20,7 @@ pub const MASK_LIST: [Mask; 6] = [
 ];
 
 impl Mask {
-    pub fn placeholder(self) -> &'static [u8] {
+    pub const fn placeholder(self) -> &'static [u8] {
         match self {
             Self::Ts => b"<ts>",
             Self::Ip => b"<ip>",
@@ -80,10 +80,43 @@ impl Probe {
     }
 }
 
-const GROWTH: usize = 5;
+const SHORTEST: [(Mask, usize); 6] = [
+    (Mask::Ts, 10),
+    (Mask::Ip, 3),
+    (Mask::Uuid, 36),
+    (Mask::Hex, 16),
+    (Mask::Dur, 2),
+    (Mask::Num, 1),
+];
+
+const fn growth() -> usize {
+    let mut at = 0;
+    let mut worst = 1;
+    while at < SHORTEST.len() {
+        let (mask, consumed) = SHORTEST[at];
+        let placeholder = mask.placeholder().len();
+        let whole = placeholder / consumed;
+        let need = if placeholder % consumed == 0 {
+            whole
+        } else {
+            whole + 1
+        };
+        if need > worst {
+            worst = need;
+        }
+        at += 1;
+    }
+    worst
+}
+
+const GROWTH: usize = growth();
+
+pub const fn mask_bound(len: usize) -> usize {
+    len * GROWTH + 8
+}
 
 pub fn mask(ws_line: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ws_line.len() * GROWTH + 8);
+    let mut out = Vec::with_capacity(mask_bound(ws_line.len()));
     mask_into(ws_line, &mut out);
     out
 }
@@ -93,8 +126,8 @@ pub fn mask_into(ws_line: &[u8], out: &mut Vec<u8>) {
     out.truncate(len);
 }
 
-pub fn mask_len(ws_line: &[u8], out: &mut Vec<u8>) -> usize {
-    let bound = ws_line.len() * GROWTH + 8;
+fn mask_len(ws_line: &[u8], out: &mut Vec<u8>) -> usize {
+    let bound = mask_bound(ws_line.len());
     if out.len() < bound {
         out.resize(bound, 0);
     }
@@ -452,4 +485,46 @@ fn num_at(line: &[u8], at: usize, probe: &Probe) -> Option<usize> {
         }
     }
     Some(end - at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WITNESS: [(&[u8], Mask); 6] = [
+        (b"2026-08-26", Mask::Ts),
+        (b"::1", Mask::Ip),
+        (b"123e4567-e89b-12d3-a456-426614174000", Mask::Uuid),
+        (b"0123456789abcdef", Mask::Hex),
+        (b"5s", Mask::Dur),
+        (b"5", Mask::Num),
+    ];
+
+    #[test]
+    fn the_growth_bound_is_the_worst_paired_placeholder_ratio() {
+        assert_eq!(
+            SHORTEST.iter().map(|(entry, _)| *entry).collect::<Vec<_>>(),
+            MASK_LIST.to_vec(),
+            "every mask in the frozen list is paired with its shortest form"
+        );
+        for (index, (input, entry)) in WITNESS.iter().enumerate() {
+            let (_, consumed) = SHORTEST[index];
+            assert_eq!(*entry, SHORTEST[index].0, "input {input:?}");
+            assert_eq!(input.len(), consumed, "input {input:?}");
+            assert_eq!(mask(input), entry.placeholder(), "input {input:?}");
+            assert!(
+                entry.placeholder().len() <= GROWTH * consumed,
+                "input {input:?} needs a larger bound"
+            );
+        }
+        let worst = SHORTEST
+            .iter()
+            .map(|(entry, consumed)| entry.placeholder().len().div_ceil(*consumed))
+            .max()
+            .expect("a mask in the frozen list");
+        assert_eq!(GROWTH, worst);
+        for len in 0..64usize {
+            assert!(mask_bound(len) >= len, "bound for {len} bytes");
+        }
+    }
 }

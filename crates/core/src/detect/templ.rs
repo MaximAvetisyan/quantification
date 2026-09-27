@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use crate::fingerprint::{FingerprintTable, Insert, fingerprint};
 use crate::ledger::{CommitKind, CommitOutcome, Ledger, Proposal, StageStats};
-use crate::mask::mask_len;
+use crate::mask::{mask_bound, mask_into};
 use crate::stage1::Unit;
 use crate::wsnorm::Column;
 
@@ -17,7 +17,7 @@ pub struct Scratch {
 impl Scratch {
     pub fn with_capacity(form: usize) -> Self {
         Self {
-            form: Vec::with_capacity(form * 5 + 8),
+            form: Vec::with_capacity(mask_bound(form)),
         }
     }
 
@@ -47,10 +47,11 @@ impl Forms {
             units: Vec::with_capacity(units.len()),
         };
         for index in 0..units.len() {
-            let len = mask_len(column.get(index), &mut scratch.form);
-            let masked = forms.bytes.len()..forms.bytes.len() + len;
-            forms.bytes.extend_from_slice(&scratch.form[..len]);
-            let hash = fingerprint(&scratch.form[..len]);
+            mask_into(column.get(index), &mut scratch.form);
+            let form = &scratch.form;
+            let masked = forms.bytes.len()..forms.bytes.len() + form.len();
+            forms.bytes.extend_from_slice(form);
+            let hash = fingerprint(form);
             let id = match table.insert_hashed(&forms.bytes, masked.clone(), index, hash) {
                 Insert::New => TemplateId(hash as u64),
                 Insert::Duplicate(rep) => forms.units[rep].id,

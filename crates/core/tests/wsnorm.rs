@@ -1,6 +1,6 @@
 use quantification_core::config::MarkerStyle;
 use quantification_core::stage1::split_span;
-use quantification_core::wsnorm::{normalize, normalize_into};
+use quantification_core::wsnorm::{next_byte, normalize, normalize_into};
 
 const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 
@@ -122,6 +122,33 @@ fn transform_is_idempotent_and_trims_collapsed_space() {
                 !once.windows(2).any(|w| w == b"  "),
                 "double space in {input:?}"
             );
+        }
+    }
+}
+
+fn naive(raw: &[u8], from: usize, byte: u8) -> usize {
+    (from..=raw.len())
+        .find(|at| raw.get(*at) == Some(&byte))
+        .unwrap_or(raw.len())
+}
+
+#[test]
+fn the_word_scan_finds_a_byte_at_every_offset_of_the_word() {
+    let filler: Vec<u8> = (0..40u8).map(|at| b'a' + at % 26).collect();
+    for len in 0..24usize {
+        for target in [b' ', b'\\', b'q', 0u8] {
+            for offset in 0..8usize {
+                let mut raw = filler[..len].to_vec();
+                raw.resize(len.max(offset + 1), b'z');
+                raw[offset] = target;
+                for from in 0..=raw.len() {
+                    assert_eq!(
+                        next_byte(&raw, from, target),
+                        naive(&raw, from, target),
+                        "byte {target:?} at {offset} of a {len}-byte run, from {from}"
+                    );
+                }
+            }
         }
     }
 }

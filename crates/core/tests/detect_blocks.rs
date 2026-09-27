@@ -1,10 +1,13 @@
+use std::mem::size_of;
+
 use quantification_core::config::{
     MAX_BLOCK_LINES, MAX_LINE_BYTES, MAX_RECORD_BYTES, MIN_BLOCK_LINES, MarkerStyle,
 };
-use quantification_core::detect::blocks::{Scratch, repeated_blocks};
+use quantification_core::detect::blocks::{Scratch, UnitId, repeated_blocks};
 use quantification_core::detect::exact::exact_runs;
-use quantification_core::detect::templ::{Forms, Scratch as TemplScratch};
+use quantification_core::detect::templ::{Forms, Scratch as TemplScratch, Template, TemplateId};
 use quantification_core::detect::wsruns::ws_runs;
+use quantification_core::fingerprint::fingerprint;
 use quantification_core::ledger::{
     Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, marker_len, profitable,
 };
@@ -66,6 +69,38 @@ fn stage_as(
 
 fn stage(span: &[u8], ledger: &mut Ledger<'_>, scratch: &mut Scratch) -> StageStats {
     stage_as(span, ledger, MIN_BLOCK_LINES, MAX_BLOCK_LINES, scratch)
+}
+
+fn stage_with_forms(
+    span: &[u8],
+    forms: Option<&Forms>,
+    ledger: &mut Ledger<'_>,
+    scratch: &mut Scratch,
+) -> StageStats {
+    let column = column_of(span, ledger);
+    repeated_blocks(
+        &column,
+        forms,
+        ledger,
+        MIN_BLOCK_LINES,
+        MAX_BLOCK_LINES,
+        scratch,
+    )
+}
+
+fn hand_forms(parts: &[(&[u8], u64)]) -> Forms {
+    let mut bytes = Vec::new();
+    let mut units = Vec::new();
+    for (part, id) in parts {
+        let masked = bytes.len()..bytes.len() + part.len();
+        bytes.extend_from_slice(part);
+        units.push(Template {
+            masked,
+            id: TemplateId(*id),
+            hash: fingerprint(part),
+        });
+    }
+    Forms { bytes, units }
 }
 
 fn record(len: usize, pad: &[u8]) -> Vec<u8> {
@@ -996,14 +1031,19 @@ fn repeated_blocks_is_deterministic() {
 }
 
 #[test]
-fn the_id_columns_hold_each_unit_once() {
-    let span = generated_span(50, 0x1234_5678_9abc_def0);
-    let units = split_span(&span, UNICODE);
-    let mut scratch = Scratch::with_capacity(units.len());
-    let mut ledger = new_ledger(&units);
-    let stats = stage(&span, &mut ledger, &mut scratch);
+fn the_id_columns_survive_a_sentinel_valued_template_id() {
+    assert_eq!(
+        size_of::<UnitId>(),
+        2 * size_of::<u32>(),
+        "an out-of-domain unloaded state must not widen the id column"
+    );
+    let wide = generated_span(50, 0x1234_5678_9abc_def0);
+    let wide_units = split_span(&wide, UNICODE);
+    let mut scratch = Scratch::with_capacity(wide_units.len());
+    let mut ledger = new_ledger(&wide_units);
+    let stats = stage(&wide, &mut ledger, &mut scratch);
     assert!(stats.block_repeats > 5);
-    assert_eq!(scratch.reserved(), units.len());
+    assert_eq!(scratch.reserved(), wide_units.len());
     let small: [&[u8]; 4] = [L0, L1, L0, L1];
     let small_span = lines_span(&small);
     let small_units = split_span(&small_span, UNICODE);
@@ -1012,12 +1052,42 @@ fn the_id_columns_hold_each_unit_once() {
         stage(&small_span, &mut small_ledger, &mut scratch).block_repeats,
         1
     );
-    assert_eq!(scratch.reserved(), units.len());
+    assert_eq!(scratch.reserved(), wide_units.len());
     let mut grown = Scratch::default();
-    let mut grown_ledger = new_ledger(&units);
-    assert_eq!(stage(&span, &mut grown_ledger, &mut grown), stats);
-    assert!(grown.reserved() <= 2 * units.len());
-    assert!(scratch.reserved() < span.len());
+    let mut grown_ledger = new_ledger(&wide_units);
+    assert_eq!(stage(&wide, &mut grown_ledger, &mut grown), stats);
+    assert!(grown.reserved() <= 2 * wide_units.len());
+    assert!(scratch.reserved() < wide.len());
+
+    let masked: Vec<Vec<u8>> = small.iter().map(|line| mask(&normalize(line))).collect();
+    assert_ne!(masked[0], masked[1], "the two roles mask differently");
+    let with_ids = |ids: [u64; 4]| -> (StageStats, Vec<Commit>) {
+        let parts: Vec<(&[u8], u64)> = masked
+            .iter()
+            .zip(ids)
+            .map(|(form, id)| (form.as_slice(), id))
+            .collect();
+        let mut ledger = new_ledger(&small_units);
+        let forms = hand_forms(&parts);
+        let mut scratch = Scratch::default();
+        let stats = stage_with_forms(&small_span, Some(&forms), &mut ledger, &mut scratch);
+        assert!(!scratch.degraded());
+        (stats, ledger.commits().to_vec())
+    };
+    let (control, control_commits) = with_ids([0, 1, 0, 1]);
+    let (sentinel, sentinel_commits) =
+        with_ids([0xffff_ffff, 0x1_ffff_ffff, 0xffff_ffff, 0x1_ffff_ffff]);
+    assert_eq!(control, sentinel);
+    assert_eq!(control_commits, sentinel_commits);
+    assert_eq!(sentinel.block_repeats, 1);
+    let commit = &sentinel_commits[0];
+    assert_eq!(commit.kind, CommitKind::Block);
+    assert_eq!((commit.first, commit.last, commit.count), (0, 3, 1));
+    assert_eq!(
+        commit.anchor,
+        small_units[0].range.start..small_units[1].range.end
+    );
+    assert_removal_invariant(&small_units, commit);
 }
 
 #[test]
@@ -1086,4 +1156,12 @@ fn the_blocks_module_has_no_forbidden_determinism_inputs() {
     assert!(source.contains("FingerprintTable"));
     assert!(source.contains("Proposal::repeat"));
     assert!(source.contains("CommitKind::Block"));
+    assert!(
+        source.contains("pub type UnitId = Option<u32>;"),
+        "an id column's unloaded state must be out of the value domain"
+    );
+    assert!(
+        !source.contains("u32::MAX"),
+        "no in-band sentinel: a real id must never read as not loaded"
+    );
 }

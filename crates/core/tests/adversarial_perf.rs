@@ -120,7 +120,10 @@ fn capped(name: &str, work: (u64, u64, u64, bool), lines: u64, factor: u64) {
         scanned <= lines,
         "{name}: {scanned} scanned for {lines} units"
     );
-    let _ = verifications;
+    assert!(
+        verifications <= compares,
+        "{name}: {verifications} verifying memcmps for {compares} compares is past the cap"
+    );
 }
 
 fn count(haystack: &[u8], needle: &[u8]) -> usize {

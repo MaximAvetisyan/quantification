@@ -11,11 +11,11 @@ pub struct Work {
     pub scanned: u64,
 }
 
-pub const NONE: u32 = u32::MAX;
+pub type UnitId = Option<u32>;
 
 pub struct Scratch {
-    ids: Vec<u32>,
-    coarse: Vec<u32>,
+    ids: Vec<UnitId>,
+    coarse: Vec<UnitId>,
     work: Work,
     degraded: bool,
 }
@@ -123,11 +123,11 @@ fn load(
                 return false;
             }
         };
-        scratch.ids[index] = rep as u32;
-        scratch.coarse[index] = match forms {
+        scratch.ids[index] = Some(rep as u32);
+        scratch.coarse[index] = Some(match forms {
             Some(forms) => forms.id(index).0 as u32,
             None => rep as u32,
-        };
+        });
     }
     true
 }
@@ -135,15 +135,15 @@ fn load(
 fn reset(scratch: &mut Scratch, units: usize) {
     for column in [&mut scratch.ids, &mut scratch.coarse] {
         column.clear();
-        column.resize(units, NONE);
+        column.resize(units, None);
     }
 }
 
 pub(crate) struct Domain<'a, S, W, C> {
-    pub ids: &'a [u32],
+    pub ids: &'a [UnitId],
     pub same_bytes: S,
     pub left_wall: W,
-    pub coarse_ids: &'a [u32],
+    pub coarse_ids: &'a [UnitId],
     pub coarse_same: C,
 }
 
@@ -168,7 +168,7 @@ pub(crate) fn windowed_blocks<
     let mut run = 0;
     while at < ids.len() {
         run = run.max(at);
-        while run < ids.len() && !ledger.is_committed(run) && ids[run] != NONE {
+        while run < ids.len() && !ledger.is_committed(run) && ids[run].is_some() {
             work.scanned += 1;
             run += 1;
         }
@@ -221,7 +221,7 @@ where
 {
     at > 0
         && !ledger.is_committed(at - 1)
-        && domain.ids[at - 1] != NONE
+        && domain.ids[at - 1].is_some()
         && (domain.left_wall)(at - 1, at)
 }
 
@@ -258,7 +258,7 @@ where
     true
 }
 
-fn equal_tail(ids: &[u32], first: usize, second: usize, len: usize, compares: &mut u64) -> bool {
+fn equal_tail(ids: &[UnitId], first: usize, second: usize, len: usize, compares: &mut u64) -> bool {
     for at in 1..len {
         *compares += 1;
         if ids[first + at] != ids[second + at] {
@@ -269,7 +269,7 @@ fn equal_tail(ids: &[u32], first: usize, second: usize, len: usize, compares: &m
 }
 
 fn copies(
-    ids: &[u32],
+    ids: &[UnitId],
     at: usize,
     length: usize,
     room: usize,
