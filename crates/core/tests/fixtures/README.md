@@ -7,7 +7,7 @@ exercise exist (W1.x/W2.x), so this corpus never has to break meaning.
 ## Rules
 
 - **Additive only.** Never change an existing fixture's meaning; add a new
-  file instead (TASKS.md W0.3: "corpus grows forever").
+  file instead — the corpus grows forever.
 - UTF-8 bytes, LF line endings, kebab-case filenames.
 - Every file below is listed with its purpose and normative DESIGN § ref.
 

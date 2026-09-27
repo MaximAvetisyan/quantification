@@ -265,7 +265,7 @@ fn check(pass: &mut Vec<String>, fail: &mut Vec<String>, name: &str, ok: bool, d
 }
 
 fn print_report(r: &Report) {
-    println!("quantification W4.3 perf gate (DESIGN.md §8, TASKS.md gate M3)");
+    println!("quantification perf gate (DESIGN.md §8)");
     println!("hardware: {}", hardware());
     println!("affinity: {}", affinity());
     println!(
