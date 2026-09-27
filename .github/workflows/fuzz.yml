@@ -1,11 +1,14 @@
 name: fuzz
 
 on:
-  workflow_dispatch:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
 
 jobs:
-  fuzz:
+  smoke:
+    name: every target, 200 runs, ASan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -14,10 +17,63 @@ jobs:
         with:
           components: rust-src
       - uses: taiki-e/install-action@cargo-fuzz
-      - name: run every target (TASKS.md W0.4 exit criterion, W2 fuzz coverage)
+      - name: the toolchain this run used
+        run: |
+          rustc --version --verbose
+          cargo fuzz --version
+      - name: every target builds and runs 200 execs
         working-directory: fuzz
         run: |
-          cargo fuzz run fuzz_sniff    -- -runs=200
-          cargo fuzz run fuzz_locator  -- -runs=200
-          cargo fuzz run fuzz_splitter -- -runs=200
-          cargo fuzz run fuzz_pipeline -- -runs=200
+          cargo fuzz run fuzz_sniff    --sanitizer address -- -runs=200
+          cargo fuzz run fuzz_locator  --sanitizer address -- -runs=200
+          cargo fuzz run fuzz_splitter --sanitizer address -- -runs=200
+          cargo fuzz run fuzz_pipeline --sanitizer address -- -runs=200
+      - name: triage, any crash artifact is a blocker (DESIGN.md 12)
+        if: always()
+        run: |
+          ls -l fuzz/artifacts || true
+          if [ -n "$(ls -A fuzz/artifacts 2>/dev/null)" ]; then
+            echo "::error::a fuzz target crashed; its input is in this run's artifacts"
+            exit 1
+          fi
+
+  soak:
+    name: ${{ matrix.target }}, 15 minutes, ASan
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_sniff, fuzz_locator, fuzz_splitter, fuzz_pipeline]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: the toolchain this run used
+        run: |
+          rustc --version --verbose
+          cargo fuzz --version
+      - name: 15 minutes of coverage-guided fuzzing
+        working-directory: fuzz
+        run: >
+          cargo fuzz run ${{ matrix.target }} --sanitizer address
+          -- -max_total_time=900 -print_final_stats=1
+      - name: triage, any crash artifact is a blocker (DESIGN.md 12)
+        if: always()
+        run: |
+          ls -l fuzz/artifacts || true
+          if [ -n "$(ls -A fuzz/artifacts 2>/dev/null)" ]; then
+            echo "::error::${{ matrix.target }} crashed; its input is in this run's artifacts"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}
+          retention-days: 7
+          path: |
+            fuzz/artifacts
+            fuzz/corpus

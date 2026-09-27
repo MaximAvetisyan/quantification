@@ -4134,6 +4134,129 @@ exit criteria. Gates M1–M4 are blocking milestones.
     §13.4 reference corpus, so its numbers are indicative only — it becomes a
     decision input when that corpus is ratified.
 - **W4.5 Continuous fuzzing** (§12) — live from W1 onward; triage weekly.
+  Status: **complete; the build break a prior wave flagged is fixed, all four
+  targets were re-run here at 200 000 execs each with zero failures, and the
+  continuous-fuzzing schedule plus the §12 triage cadence are recorded
+  (2026-09-27).**
+  - **The build break, first.** `fuzz/fuzz_targets/fuzz_splitter.rs` still
+    called the pre-W2.6 one-argument `stage1::split_span(data)`, so the fuzz
+    crate did not compile (`E0061: this function takes 2 arguments but 1
+    argument was supplied`) and the later targets' recorded clean runs were
+    not reproducible. `git log` puts the stale call in W0.4/W1.2 and the
+    signature change in W2.6; the target was never revisited. Fixed first,
+    before any run count below is quoted.
+  - **The target now takes a style and checks two styles.** `split_span`
+    takes a `MarkerStyle`, so the target runs its whole body under **both**
+    `Ascii` and `Unicode` and then asserts that **the two styles produce
+    identical unit ranges** — the style may change eligibility, never where
+    the span is cut.
+  - **The rebuild assertion, and what "non-vacuous" costs.** The prior wave's
+    `a6e582c` did add a real check (the gap must be a `,` or a run of
+    boundary escapes), and that part survived; but the
+    `assert_eq!(out, data, "units and joiners must rebuild the span")` line is
+    **still structurally incapable of failing** — `out` is assembled from
+    slices of `data` at ranges that the two overlap assertions have already
+    constrained to be ascending and disjoint, so the equality is a theorem
+    about the loop, not a fact about the splitter. It is kept (it is the
+    statement of the tiling property) but it is no longer the only thing
+    standing behind the target. The properties that replaced it, and that
+    **were demonstrated to fire on real production regressions** (each
+    mutation applied to `crates/core/src/stage1.rs`, fuzzed, then reverted;
+    `git diff` on `src/` is empty):
+    | mutation | what the fuzzer said |
+    |---|---|
+    | `is_line_boundary` also accepts `b"000B"` | `a gap is empty, a record comma, or nothing but line boundaries: [92, 117, 48, 48, 48, 66]` |
+    | `escape_at` reads `\u` as 5 bytes instead of 6 | `a unit is one line and holds no line boundary: 0..7` |
+    | `push_line` returns early for the `Unicode` style | `the marker style may change eligibility, never the unit ranges` |
+    The reference scanner that judges this is written in the target from the
+    §4.2 rules (`\n`, `\u000A`, `\u000a`; a `\u` escape is 6 bytes) and is
+    independent of `stage1::escape_at`/`is_line_boundary`/`next_byte`, so the
+    two paths must agree by construction, not by shared code.
+  - **The other three targets were confirmed live the same way**, by mutating
+    each target's own oracle for a 20 000-exec run and confirming the panic
+    (`fuzz_sniff`: `a JSON schema needs an object root`; `fuzz_locator`:
+    `span Span { start: 24, end: 27, ... } is not a string interior`;
+    `fuzz_pipeline`: the `twice.len() < out.len()` recompression bound). All
+    three were restored and re-run clean afterwards.
+  - **The runs actually observed, on this box** (stable 1.98.0, cargo-fuzz
+    0.13.2, seeded from the retained corpora already in the working tree):
+    | target | execs | wall | edges cov | features | corpus | new units | peak rss |
+    |---|---|---|---|---|---|---|---|
+    | `fuzz_sniff` | **200 000** | 0 s | 140 | 591 → 597 | 346 → 352 | 165 | 29 MB |
+    | `fuzz_locator` | **200 000** | 7 s | 540 | 2 303 → 2 370 | 896 → 931 | 259 | 30 MB |
+    | `fuzz_splitter` | **200 000** | 88 s | 214 → 217 | 729 → 791 | 213 → 261 | 876 | 33 MB |
+    | `fuzz_pipeline` | **200 000** | 279 s | 1 361 → 1 380 | 6 272 → 6 506 | 1 619 → 1 782 | 1 376 | 70 MB |
+    **Zero crashes, zero artifacts, in all four.** That is 800 000 execs
+    total, against retained corpora of 1 802 / 3 492 / 2 741 / 7 375 files
+    (162 MB, all gitignored). Two of the runs are worth reading as
+    *throughput*, not coverage: `fuzz_sniff` retires 200 000 execs in under a
+    second because the sniff surface is small, while `fuzz_pipeline` needs
+    279 s for the same count because every exec runs the whole pipeline three
+    times (compress, recompress, recompress again).
+  - **The environment caveat, stated plainly.** **Nightly is unreachable from
+    this machine** (`rustup toolchain list` shows only
+    `stable-x86_64-unknown-linux-gnu`), so **every number above was produced
+    with ASan OFF**, via the documented fallback
+    `RUSTC_BOOTSTRAP=1 cargo fuzz run <target> --sanitizer none`. **This
+    record therefore claims no sanitizer coverage whatsoever** — no ASan, no
+    UBSan, no memory-error detection was exercised in this session; only
+    Rust's own panics were. The libFuzzer startup even warns that
+    `__sanitizer_acquire_crash_state` is missing, which is the same fact from
+    the other side. **CI does not have that caveat**: `fuzz.yml` pins
+    `dtolnay/rust-toolchain@nightly` and passes `--sanitizer address`
+    explicitly on every target, so the ASan runs are the ones the schedule
+    produces, and the local numbers above are *not* a substitute for them.
+  - **The continuous-fuzzing schedule** (`.github/workflows/fuzz.yml`).
+    `smoke` runs on every PR and dispatch: all four targets, 200 execs each,
+    real nightly, `--sanitizer address`, and it fails the PR if any crash
+    artifact exists. `soak` runs **daily at 02:17 UTC** on a four-way matrix
+    (one job per target, `fail-fast: false` so one crash does not hide the
+    other three), **15 minutes of coverage-guided fuzzing per target**
+    (`-max_total_time=900 -print_final_stats=1`), with the toolchain version,
+    the per-run stats and the retained corpus uploaded as artifacts kept for
+    7 days. Every job ends with the same explicit triage step, which lists
+    `fuzz/artifacts` and exits 1 when it is non-empty: libFuzzer already fails
+    the run on a crash, and this makes the crashing input visible in the log
+    rather than only in the exit code. The corpus a nightly grows is not fed
+    to the next one (a fresh checkout starts empty), so the retained corpus
+    is a per-run artifact, not an accumulating store.
+  - **The §12 weekly triage cadence**, recorded here because it is a human
+    obligation, not a cron: **once a week**, read the last seven days of
+    `fuzz` runs and, in order — (1) any job that failed, and whether
+    `fuzz/artifacts` holds a reproducer; if it does, that input is a blocker
+    (§12: any fuzz input that panics or produces invalid JSON is a blocker)
+    and the fix lands before the next run; (2) `stat::new_units_added` per
+    target, because a target that suddenly stops adding units has usually
+    lost coverage rather than found stability; (3) `edge coverage` and
+    `features` per target against the table above, which is the baseline
+    these numbers are compared to; (4) corpus growth, since a corpus that
+    doubles in a week has found a new region worth keeping in the golden
+    corpus; (5) whether the **pr** smoke (200 execs) is still enough, or
+    whether a finding class has started needing more than 200 execs to
+    surface. A crash found by `fuzz-determinism` (W4.2) rather than by a
+    fuzzer enters the same queue.
+  - **Gates.** `cargo test --workspace` **505 green, 0 failed, 1 `#[ignore]`d**
+    — unchanged, because W4.5 touches no workspace file;
+    `cargo fmt --all --check` clean and
+    `cargo clippy --workspace --all-targets -- -D warnings` clean (the fuzz
+    crate is excluded from the workspace, so it is clippy-checked by
+    `cargo fuzz build` instead, which is clean under the fallback flags).
+    `cargo fuzz build --sanitizer none` compiles all four targets from
+    scratch, which is the check that was failing before this entry.
+  - **Not done / still open.** No sanitizer run happened locally at all (§
+    above), so a memory-safety bug that only ASan would see is still
+    unexcluded — the first nightly run is what closes that, and until it has
+    run green, §12's "untrusted input" coverage is assertion coverage, not
+    memory-safety coverage. The corpora are not shared between the `fuzz` and
+    `determinism` workflows, so W4.2's fuzz-determinism leg grows its own
+    2 000-run corpus per nightly rather than reusing a richer one; both are
+    one-line changes once a corpus store exists. `fuzz/artifacts`,
+    `fuzz/corpus` and `fuzz/target` are gitignored, so **no reproducer is
+    ever committed** — a crash found in CI is triaged from the artifact
+    alone, and a target that regresses will re-find it only by luck. The
+    daily soak is time-boxed (15 min/target) rather than exec-boxed, so its
+    exec counts will fall on a slower runner; only the weekly trend is
+    meaningful, and the exec counts quoted above are this box's.
 - **W4.6 Offline eval harness** (§12) — tokenizer-based success metric +
   task-quality parity suite. Parallel from W2.9 onward (external models
   needed); **Gate M4** non-blocking until corpus/task suite ratified (§13).
