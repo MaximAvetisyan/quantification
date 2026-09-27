@@ -923,14 +923,28 @@ struct Hostile {
     calls: Cell<u64>,
 }
 
+#[cfg(feature = "bench_stages")]
+fn clock_budget() -> (u64, &'static str) {
+    (
+        4 + 2 * quantification_core::pipeline::Stage::ALL.len() as u64,
+        "the public api reads the clock at the three stage boundaries plus one mark and one read per §4.4 stage under bench_stages",
+    )
+}
+
+#[cfg(not(feature = "bench_stages"))]
+fn clock_budget() -> (u64, &'static str) {
+    (
+        4,
+        "the public api reads the clock only at the three stage boundaries",
+    )
+}
+
 impl Clock for Hostile {
     fn now_ns(&self) -> u64 {
         let next = self.calls.get() + 1;
         self.calls.set(next);
-        assert!(
-            next <= 4,
-            "the public api reads the clock only at the three stage boundaries"
-        );
+        let (budget, why) = clock_budget();
+        assert!(next <= budget, "{why}");
         if next % 2 == 1 { u64::MAX } else { 0 }
     }
 }

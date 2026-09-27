@@ -1,0 +1,38 @@
+name: perf
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: clippy the bench-only feature state (default --all-targets skips it)
+        run: cargo clippy -p quantification-core --features bench_stages --lib --benches -- -D warnings
+      - name: bench fixture (deterministic, non-vacuous, degrades on truncation)
+        run: cargo test -p quantification-core --features bench_stages --test perf_fixture
+      - name: gate M3 (pinned core, warm, p50 and p99, per-stage breakdown)
+        run: >
+          taskset -c 2 cargo bench -p quantification-core
+          --features bench_stages --bench gate
+          -- --iters 30 --json target/perf-gate.json
+      - name: criterion stage benchmarks (pinned core, one bench per DESIGN.md §8 line)
+        if: always()
+        run: taskset -c 2 cargo bench -p quantification-core --features bench_stages --bench stages
+      - name: report
+        if: always()
+        run: cat target/perf-gate.json || echo "no gate report was written"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-gate
+          path: |
+            target/perf-gate.json
+            target/criterion

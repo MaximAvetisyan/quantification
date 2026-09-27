@@ -14,6 +14,73 @@ use crate::stage1;
 
 pub const ALGO_VERSION: &str = "0.1.0";
 
+#[cfg(feature = "bench_stages")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageTimes {
+    ns: [u64; 7],
+}
+
+#[cfg(feature = "bench_stages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Stage {
+    Split = 0,
+    ExactRuns = 1,
+    WsRuns = 2,
+    MaskedForms = 3,
+    Blocks = 4,
+    TemplateGroups = 5,
+    TemplatedBlocks = 6,
+}
+
+#[cfg(feature = "bench_stages")]
+impl Stage {
+    pub const ALL: [Stage; 7] = [
+        Self::Split,
+        Self::ExactRuns,
+        Self::WsRuns,
+        Self::MaskedForms,
+        Self::Blocks,
+        Self::TemplateGroups,
+        Self::TemplatedBlocks,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Split => "stage1_split",
+            Self::ExactRuns => "stage3_exact_runs",
+            Self::WsRuns => "stage4_ws_runs",
+            Self::MaskedForms => "stage6_masked_forms",
+            Self::Blocks => "stage5_blocks",
+            Self::TemplateGroups => "stage6_template_groups",
+            Self::TemplatedBlocks => "stage7_templated_blocks",
+        }
+    }
+}
+
+#[cfg(feature = "bench_stages")]
+impl StageTimes {
+    pub fn get(self, stage: Stage) -> u64 {
+        self.ns[stage as usize]
+    }
+
+    pub fn record(&mut self, stage: Stage, ns: u64) {
+        self.ns[stage as usize] += ns;
+    }
+
+    pub fn total(self) -> u64 {
+        self.ns.iter().sum()
+    }
+
+    pub fn since(self, other: Self) -> Self {
+        let mut out = self;
+        for (slot, base) in out.ns.iter_mut().zip(other.ns) {
+            *slot = slot.saturating_sub(base);
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub bytes_in: u64,
@@ -82,6 +149,8 @@ struct Stages {
     templ: templ::Scratch,
     blocks: blocks::Scratch,
     templ_blocks: templ_blocks::Scratch,
+    #[cfg(feature = "bench_stages")]
+    times: StageTimes,
 }
 
 impl Stages {
@@ -91,6 +160,8 @@ impl Stages {
             templ: templ::Scratch::default(),
             blocks: blocks::Scratch::new(),
             templ_blocks: templ_blocks::Scratch::new(),
+            #[cfg(feature = "bench_stages")]
+            times: StageTimes::default(),
         }
     }
 
@@ -137,6 +208,34 @@ impl Compressor {
             stages: Stages::new(),
             sink: None,
         }
+    }
+
+    #[cfg(feature = "bench_stages")]
+    pub fn last_stage_times(&self) -> StageTimes {
+        self.stages.times
+    }
+
+    #[cfg(feature = "bench_stages")]
+    pub fn reset_stage_times(&mut self) {
+        self.stages.times = StageTimes::default();
+    }
+
+    #[cfg(feature = "bench_stages")]
+    pub fn compact_span_only(&mut self, span: &[u8], options: &ResolvedOptions) -> StageTimes {
+        let before = self.stages.times;
+        let style = resolve_style(options.marker_style, span);
+        let range = 0..span.len();
+        self.commits.clear();
+        let _ = compact_span(
+            span,
+            &range,
+            style,
+            options,
+            &mut self.stages,
+            &mut self.commits,
+            &*self.clock,
+        );
+        self.stages.times.since(before)
     }
 
     pub fn set_sink(&mut self, sink: Box<dyn Sink>) {
@@ -197,7 +296,16 @@ impl Compressor {
                 let range = span.start..span.end;
                 let style = resolve_style(options.marker_style, &payload[range.clone()]);
                 let before = commits.len();
-                let result = compact_span(payload, &range, style, options, stages, commits);
+                let result = compact_span(
+                    payload,
+                    &range,
+                    style,
+                    options,
+                    stages,
+                    commits,
+                    #[cfg(feature = "bench_stages")]
+                    &**clock,
+                );
                 if result.degraded {
                     degraded = true;
                     commits.truncate(before);
@@ -267,9 +375,14 @@ fn compact_span(
     options: &ResolvedOptions,
     stages: &mut Stages,
     merged: &mut Vec<Commit>,
+    #[cfg(feature = "bench_stages")] clock: &dyn Clock,
 ) -> SpanResult {
     let bytes = &payload[range.clone()];
+    #[cfg(feature = "bench_stages")]
+    let mark = clock.now_ns();
     let split = stage1::split_span_counted(bytes, style);
+    #[cfg(feature = "bench_stages")]
+    record(stages, clock, Stage::Split, mark);
     let units = split.units;
     let longest = units
         .iter()
@@ -282,20 +395,34 @@ fn compact_span(
         record_splits: split.record_splits as u64,
         ..StageStats::default()
     };
+    #[cfg(feature = "bench_stages")]
+    let mark = clock.now_ns();
     stats.merge(&exact::exact_runs(
         bytes,
         &mut ledger,
         options.min_group_size,
     ));
+    #[cfg(feature = "bench_stages")]
+    record(stages, clock, Stage::ExactRuns, mark);
     if options.normalize_ws {
+        #[cfg(feature = "bench_stages")]
+        let mark = clock.now_ns();
         stats.merge(&wsruns::ws_runs(
             bytes,
             &mut ledger,
             options.min_group_size,
             &mut stages.ws,
         ));
+        #[cfg(feature = "bench_stages")]
+        record(stages, clock, Stage::WsRuns, mark);
     }
+    #[cfg(feature = "bench_stages")]
+    let mark = clock.now_ns();
     let forms = templ::Forms::build(bytes, &units, &mut stages.templ);
+    #[cfg(feature = "bench_stages")]
+    record(stages, clock, Stage::MaskedForms, mark);
+    #[cfg(feature = "bench_stages")]
+    let mark = clock.now_ns();
     stats.merge(&blocks::repeated_blocks(
         bytes,
         forms.as_ref(),
@@ -304,21 +431,31 @@ fn compact_span(
         MAX_BLOCK_LINES,
         &mut stages.blocks,
     ));
+    #[cfg(feature = "bench_stages")]
+    record(stages, clock, Stage::Blocks, mark);
     let mut degraded = stages.blocks.degraded();
     if options.template_dedup
         && let Some(forms) = &forms
     {
+        #[cfg(feature = "bench_stages")]
+        let mark = clock.now_ns();
         stats.merge(&templ::template_groups(
             forms,
             &mut ledger,
             options.min_group_size,
         ));
+        #[cfg(feature = "bench_stages")]
+        record(stages, clock, Stage::TemplateGroups, mark);
+        #[cfg(feature = "bench_stages")]
+        let mark = clock.now_ns();
         stats.merge(&templ_blocks::templated_blocks(
             Some(forms),
             &mut ledger,
             MAX_BLOCK_LINES,
             &mut stages.templ_blocks,
         ));
+        #[cfg(feature = "bench_stages")]
+        record(stages, clock, Stage::TemplatedBlocks, mark);
     }
     degraded |= forms.is_none();
     merged.extend(
@@ -328,6 +465,12 @@ fn compact_span(
             .map(|commit| shift(commit, range.start)),
     );
     SpanResult { stats, degraded }
+}
+
+#[cfg(feature = "bench_stages")]
+fn record(stages: &mut Stages, clock: &dyn Clock, stage: Stage, start: u64) {
+    let ns = clock.now_ns().saturating_sub(start);
+    stages.times.record(stage, ns);
 }
 
 fn shift(commit: &Commit, base: usize) -> Commit {

@@ -1,4 +1,3 @@
-pub mod benches;
 pub mod locator;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1279,8 +1279,16 @@ fn timings_never_reach_the_payload() {
     assert_eq!(monotonic.commits, fixed.commits);
     assert_eq!(fixed.stats.elapsed_detect_ns, 0);
     assert_eq!(counted.stats.elapsed_detect_ns, 1_000_000_000);
-    assert_eq!(counted.stats.elapsed_compact_ns, 1_000_000_000);
     assert_eq!(counted.stats.elapsed_splice_ns, 1_000_000_000);
+    #[cfg(feature = "bench_stages")]
+    let compact_reads = 2 * quantification_core::pipeline::Stage::ALL.len() as u64 + 1;
+    #[cfg(not(feature = "bench_stages"))]
+    let compact_reads = 1;
+    assert_eq!(
+        counted.stats.elapsed_compact_ns,
+        compact_reads * 1_000_000_000,
+        "the compaction window is priced in clock reads: one per stage mark, one per record, and the closing boundary"
+    );
 }
 
 #[test]
@@ -1376,9 +1384,17 @@ fn the_pipeline_module_has_no_forbidden_determinism_inputs() {
     ] {
         assert!(!uses(source, banned), "the pipeline must not use {banned}");
     }
-    assert!(
-        source.matches("now_ns()").count() == 4,
-        "the clock is read exactly four times: the three stage boundaries"
+    let marks = source.matches("let mark = clock.now_ns();").count();
+    #[cfg(feature = "bench_stages")]
+    assert_eq!(
+        marks,
+        quantification_core::pipeline::Stage::ALL.len(),
+        "one mark per §4.4 stage"
+    );
+    assert_eq!(
+        source.matches("now_ns()").count(),
+        4 + marks + 1,
+        "the only clock reads are the four stage boundaries, one mark per §4.4 stage and the bench_stages record helper"
     );
     let (before_clock, after_clock) = source
         .split_once("impl Clock for MonotonicClock")
