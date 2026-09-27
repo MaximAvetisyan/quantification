@@ -129,7 +129,7 @@ runs the `docker build` above with registry access.
 
 `k8s/quantification.yaml` holds a `Deployment` and a `Service` for that image,
 and `k8s/README.md` is the contract the manifest assumes; read it for the
-details. Three things in it interact with the server's own behaviour:
+details. Five things in it interact with the server's own behaviour:
 
 * `terminationGracePeriodSeconds: 30` against the container's
   `QUANT_SHUTDOWN_GRACE_MS: "25000"`. The grace period has to stay above the
@@ -137,15 +137,36 @@ details. Three things in it interact with the server's own behaviour:
   process is `SIGKILL`ed mid-drain. The manifest sets the grace explicitly so
   the relationship is auditable in the manifest instead of being whatever the
   binary happens to default to.
-* `replicas: 1` is a **correctness constraint for `/v1/restore`, not a scaling
+* `replicas: 1` is a **steady-state constraint for `/v1/restore`, not a scaling
   knob**: the CCR store is per-pod and in-process, so a `restore_id` only
-  resolves on the pod that issued it and a second replica can answer a valid id
-  with `404`. Compression itself is stateless and scales. `k8s/README.md` gives
-  the two supported ways to run more than one pod.
+  resolves on the pod that issued it, and a second replica can answer a valid id
+  with `404`. Compression itself is stateless and scales.
+* **`RollingUpdate` with `maxSurge: 1, maxUnavailable: 0` does not close that
+  hole, and `replicas: 1` does not close it either.** `maxUnavailable: 0` is
+  precisely why the old and new pods *coexist*: both are Ready, both are in the
+  Service endpoints, each has its own empty store, and the old pod is not sent
+  `SIGTERM` until the new one is Ready. So a compress on the old pod and a
+  restore on the new one is the same `404`, reintroduced on **every deploy**,
+  node drain and eviction. `replicas: 1` bounds *steady-state* exposure to one
+  pod; it was never buying rollout safety.
+* Therefore a **`404` from `/v1/restore` has two legitimate causes** — the id
+  expired (15-min TTL) or was evicted (64 MiB bound), *or* the compress and the
+  restore landed on different pods during a rollout — and the response cannot
+  distinguish them. `404` is not the assertion "this id never existed". Callers
+  must treat a restore miss as **non-fatal and retryable** and proceed with the
+  compressed bytes, which are the deliverable. `k8s/README.md` gives the two
+  recipes for real consistency — `strategy: {type: Recreate}` (full downtime per
+  deploy, correct only at one replica, and still not across the deploy boundary
+  itself) and moving the store out of process (the real fix, and the one
+  recommended if restore is load-bearing) — with the trade-offs.
 * `readinessProbe` on `/readyz` at `periodSeconds: 1, failureThreshold: 1`, and
   `livenessProbe` on `/healthz` at `periodSeconds: 10`: the drain flips
   `/readyz` to `503`, and the pod has to leave the Service endpoints before the
-  listener closes ~2 s later.
+  listener closes ~2 s later. Of that 2 s settle, up to ~1 s is spent waiting
+  for the kubelet's next probe to even observe the flip, so the dataplane
+  propagation budget is roughly **1 s, not 2 s**. `progressDeadlineSeconds: 120`
+  (default 600) turns a wedged rollout into a `Failed` condition in two minutes
+  instead of ten; with `maxUnavailable: 0` it costs no availability.
 
 `/healthz` is an unconditional `200 {"status":"ok"}` and deliberately stays that
 way for the whole drain: it is the liveness probe, and a red liveness probe
@@ -254,7 +275,7 @@ failure mode:
 | Bad option value, unknown query key, bad envelope | `400`, `invalid_options` / `invalid_argument` |
 | `strict_validate` build and a payload that does not parse | `400`, `malformed` |
 | Body over 64 MiB | `413` |
-| `/v1/restore` without the `ccr` feature | `501`; unknown or expired id with it: `404` |
+| `/v1/restore` without the `ccr` feature | `501`; a miss with it: `404` — either the id expired/evicted, or (in a multi-pod deployment) the compress and the restore landed on different pods. A `404` is non-fatal and retryable, never "this id never existed" |
 
 `422` is reserved for an explicitly pinned `content_type` and never fires on its
 own.
@@ -511,15 +532,18 @@ recorded as open in the repo history:
   outright. The targets compile only under `cargo fuzz`'s own build. The
   CI-runs-only fuzz legs (ASan smoke, 15-minute soak, retained-corpus
   determinism replay) have therefore not been exercised locally.
-* **The container image has never been built and the manifest has never been
-  applied to a cluster.** No registry was reachable from the machine the
-  Dockerfile was written on (every pull failed with `net/http: TLS handshake
-  timeout`), so neither base image could be fetched and no image exists. What
-  was done is native: the same `cargo build --release --locked … --features
-  ccr`, the binary started and exercised over real sockets, and `ldd` on it.
-  The drain behaviour, the distroless runtime stage, the non-root UID and the
-  probes are therefore read off the source, not observed on a pod. See the
-  Docker section above and `k8s/README.md`.
+* **The container image has never been built, and the manifest has never been
+  applied to a cluster.** No registry is reachable from this machine — a
+  `docker pull rust:1.98-bookworm` fails here today with `net/http: TLS
+  handshake timeout` — so neither base image can be fetched and no image exists
+  locally. What was done is native: the same `cargo build --release --locked …
+  --features ccr`, the binary started and exercised over real sockets, and
+  `ldd` on it. The drain behaviour, the distroless runtime stage and the probes
+  are therefore read off the source, not observed on a pod. `kubectl`,
+  `kubeconform` and `yamllint` are not installed, so the manifest has had **no
+  schema validation at all**, only a structural re-check of selectors, probe
+  port names, targetPorts and the grace-above-drain relationship. See the Docker
+  section above and `k8s/README.md`.
 
 Also open, and worth knowing before relying on this:
 
