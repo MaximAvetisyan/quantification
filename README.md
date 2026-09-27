@@ -383,7 +383,7 @@ entries (847098 bytes)`, all byte-equal, in 11 s. The CPU-feature half of the
 ## Development
 
 ```sh
-cargo test --workspace                 # 537 passed, 0 failed, 6 ignored
+cargo test --workspace                 # 538 passed, 0 failed, 6 ignored
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -523,17 +523,18 @@ recorded as open in the repo history:
 
 Also open, and worth knowing before relying on this:
 
-* `cargo test --workspace --all-features` was green in every run here — 550
-  passed, 0 failed, 6 ignored, twice — so the flake an earlier revision of this
-  README reported under that heading did not reproduce:
-  `quantification-eval`'s `the_command_transport_pipes_the_prompt_and_reports_a_missing_program`
-  passed 12 runs in a row. The race that would cause it is still in the code,
-  though, so treat the suite as green-and-racy rather than fixed:
-  `Injected::run_command` (`crates/eval/src/tasks.rs`) folds the stdin writer's
-  result into its `ok`, and `sh -c 'exit 3'` closes stdin immediately, so an
-  `EPIPE` on the prompt write can turn a clean "`exited with`" failure into
-  "`did not finish`". `cargo test --workspace` with default features is 537
-  passed, 0 failed, 6 ignored.
+* The command transport's stdin-write/exit race is fixed, not merely quiet.
+  `Injected::run_command` (`crates/eval/src/tasks.rs`) no longer lets the
+  prompt write veto the report: the read error, the write error and the exit
+  status are collected separately and judged in priority order — no status,
+  then a non-success status, then a read error, then a write error — and
+  `ErrorKind::BrokenPipe` on the stdin write is a normal outcome rather than a
+  failure. It is pinned by
+  `a_child_that_closes_stdin_early_is_reported_by_its_exit_status`
+  (`crates/eval/tests/eval.rs`): `sh -c 'exec 0<&-; exit 37'` with an 8 MiB
+  prompt the child never reads, its zero-exit variant, and 16 repetitions of
+  the original 1-byte case. `cargo test --workspace` is 538 passed and
+  `cargo test --workspace --all-features` 550, both 0 failed, 6 ignored.
 * `crates/server/tests/shutdown.rs` (8 tests) binds real sockets and has been
   seen to fail on a busy machine with a connection reset in the SIGTERM drain
   path; it passed in every run here, including four full `cargo test
