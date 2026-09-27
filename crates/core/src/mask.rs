@@ -80,48 +80,66 @@ impl Probe {
     }
 }
 
+const GROWTH: usize = 5;
+
 pub fn mask(ws_line: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ws_line.len());
+    let mut out = Vec::with_capacity(ws_line.len() * GROWTH + 8);
     mask_into(ws_line, &mut out);
     out
 }
 
 pub fn mask_into(ws_line: &[u8], out: &mut Vec<u8>) {
-    out.clear();
+    let len = mask_len(ws_line, out);
+    out.truncate(len);
+}
+
+pub fn mask_len(ws_line: &[u8], out: &mut Vec<u8>) -> usize {
+    let bound = ws_line.len() * GROWTH + 8;
+    if out.len() < bound {
+        out.resize(bound, 0);
+    }
+    let (buf, len) = (out.as_mut_slice(), ws_line.len());
     let mut at = 0;
-    while at < ws_line.len() {
+    let mut end = 0;
+    while at < len {
         if CLASS[ws_line[at] as usize] & STOP == 0 {
-            out.push(ws_line[at]);
+            buf[end] = ws_line[at];
+            end += 1;
             at += 1;
             continue;
         }
-        if let Some(len) = escape_unit(ws_line, at) {
-            copy(out, &ws_line[at..at + len]);
-            at += len;
+        if let Some(unit) = escape_unit(ws_line, at) {
+            end = copy(buf, end, &ws_line[at..at + unit]);
+            at += unit;
             continue;
         }
         let probe = Probe::at(ws_line, at);
         match hit(ws_line, at, &probe) {
-            Some((mask, len)) => {
-                copy(out, mask.placeholder());
-                at += len;
+            Some((mask, hit_len)) => {
+                end = copy(buf, end, mask.placeholder());
+                at += hit_len;
             }
             None => {
-                out.push(ws_line[at]);
+                buf[end] = ws_line[at];
+                end += 1;
                 at += 1;
             }
         }
     }
+    end
 }
 
-fn copy(out: &mut Vec<u8>, bytes: &[u8]) {
+fn copy(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
     if bytes.len() > 8 {
-        out.extend_from_slice(bytes);
-        return;
+        buf[at..at + bytes.len()].copy_from_slice(bytes);
+        return at + bytes.len();
     }
+    let mut end = at;
     for &byte in bytes {
-        out.push(byte);
+        buf[end] = byte;
+        end += 1;
     }
+    end
 }
 
 fn hit(line: &[u8], at: usize, probe: &Probe) -> Option<(Mask, usize)> {

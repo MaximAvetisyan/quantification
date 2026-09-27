@@ -71,42 +71,54 @@ pub fn normalize(raw: &[u8]) -> Vec<u8> {
 
 pub fn normalize_into(raw: &[u8], out: &mut Vec<u8>) {
     out.clear();
+    out.extend_from_slice(raw);
+    let buf = out.as_mut_slice();
     let mut pending = false;
     let mut at = 0;
+    let mut end = 0;
     while at < raw.len() {
         let start = at;
         at = plain_run(raw, at);
         if at > start {
             if pending {
-                if !out.is_empty() {
-                    out.push(b' ');
+                if end > 0 {
+                    buf[end] = b' ';
+                    end += 1;
                 }
                 pending = false;
             }
-            push(out, &raw[start..at]);
+            if end < start {
+                move_bytes(buf, end, start, at - start);
+                end += at - start;
+            } else {
+                end = at;
+            }
             continue;
         }
         let (len, collapse) = unit(raw, at);
         if collapse {
             pending = true;
         } else {
-            if pending && !out.is_empty() {
-                out.push(b' ');
+            if pending && end > 0 {
+                buf[end] = b' ';
+                end += 1;
             }
             pending = false;
-            push(out, &raw[at..at + len]);
+            move_bytes(buf, end, at, len);
+            end += len;
         }
         at += len;
     }
+    out.truncate(end);
 }
 
-fn push(out: &mut Vec<u8>, bytes: &[u8]) {
-    if bytes.len() > 8 {
-        out.extend_from_slice(bytes);
+fn move_bytes(buf: &mut [u8], to: usize, from: usize, len: usize) {
+    if len > 8 {
+        buf.copy_within(from..from + len, to);
         return;
     }
-    for &byte in bytes {
-        out.push(byte);
+    for at in 0..len {
+        buf[to + at] = buf[from + at];
     }
 }
 

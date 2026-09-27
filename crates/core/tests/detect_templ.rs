@@ -699,7 +699,7 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
         out.stats.template_groups > 3,
         "the generator produced no groups"
     );
-    assert_eq!(scratch.reserved(), widest);
+    assert_eq!(scratch.reserved(), widest * 5 + 8);
     let few = span_with(
         br"\n",
         &[many[0].as_bytes(), many[1].as_bytes(), many[2].as_bytes()],
@@ -710,7 +710,7 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
         six(&few, &mut small, 3, &mut scratch).stats.template_groups,
         1
     );
-    assert_eq!(scratch.reserved(), widest);
+    assert_eq!(scratch.reserved(), widest * 5 + 8);
     let mut grown = Scratch::default();
     let mut other = new_ledger(&units);
     let other_out = six(&span, &mut other, 3, &mut grown);
@@ -718,7 +718,7 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
     let reference_out = six(&span, &mut reference, 3, &mut scratch);
     assert_eq!(other_out, reference_out);
     assert_eq!(other.commits(), ledger.commits());
-    assert!(grown.reserved() <= 2 * widest);
+    assert!(grown.reserved() <= 2 * (widest * 5 + 8));
 }
 
 #[test]
@@ -820,7 +820,7 @@ fn the_templ_module_has_no_forbidden_determinism_inputs() {
     ] {
         assert!(!uses(banned), "template groups must not use {banned}");
     }
-    assert!(source.contains("mask_into"));
+    assert!(source.contains("mask_len"));
     assert!(source.contains("column.get(index)"));
     assert!(!source.contains("normalize_into"));
     assert!(source.contains("FingerprintTable::for_keys"));
