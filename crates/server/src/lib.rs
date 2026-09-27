@@ -3,7 +3,11 @@ mod headers;
 mod options;
 
 use std::collections::BTreeMap;
+use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -18,13 +22,20 @@ use quantification_core::ccr;
 use quantification_core::config::REQUEST_BODY_LIMIT;
 use quantification_core::locator::{self, SpanClass};
 use serde_json::json;
+use tokio::sync::watch;
 
 pub const CCR_ENABLED: bool = cfg!(feature = "ccr");
 pub const SPAN_PREVIEW_LIMIT: usize = 64;
 
+pub const SHUTDOWN_GRACE_MS: &str = "QUANT_SHUTDOWN_GRACE_MS";
+pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 25_000;
+pub const ENDPOINT_SETTLE_MS: u64 = 2_000;
+
 const JSON: &str = "application/json";
 const PLAIN: &str = "text/plain; version=0.0.4; charset=utf-8";
 const OCTET: &str = "application/octet-stream";
+
+const DRAINING: &[u8] = b"{\"status\":\"draining\"}";
 
 const COMPRESS: u8 = 0;
 const DETECT: u8 = 1;
@@ -82,6 +93,7 @@ impl ccr::Sink for SinkHandle {
 pub struct State {
     metrics: Arc<Mutex<Metrics>>,
     store: Option<Arc<dyn RestoreStore>>,
+    draining: Arc<AtomicBool>,
 }
 
 pub fn app(state: State) -> Router {
@@ -107,6 +119,7 @@ impl State {
         Self {
             metrics: Arc::new(Mutex::new(Metrics::default())),
             store: shared_store(),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -114,6 +127,7 @@ impl State {
         Self {
             metrics: Arc::new(Mutex::new(Metrics::default())),
             store: Some(store),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -121,11 +135,20 @@ impl State {
         Self {
             metrics: Arc::new(Mutex::new(Metrics::default())),
             store: None,
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn store(&self) -> Option<Arc<dyn RestoreStore>> {
         self.store.clone()
+    }
+
+    pub fn drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    pub fn draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     fn record(&self, route: u8, status: StatusCode, in_len: u64, out_len: u64, degraded: bool) {
@@ -145,6 +168,142 @@ impl State {
         let response = reply(fault.status, JSON, Bytes::from(body));
         self.record(route, fault.status, 0, out_len, false);
         response
+    }
+}
+
+#[derive(Debug)]
+pub enum ServeError {
+    Http(std::io::Error),
+    Grpc(tonic::transport::Error),
+    GraceExpired(Duration),
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(error) => write!(f, "the http server failed: {error}"),
+            Self::Grpc(error) => write!(f, "the grpc server failed: {error}"),
+            Self::GraceExpired(budget) => write!(
+                f,
+                "in-flight work outlived the {}ms {SHUTDOWN_GRACE_MS} grace period",
+                budget.as_millis()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ServeError {}
+
+impl ServeError {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::GraceExpired(_) => 2,
+            Self::Http(_) | Self::Grpc(_) => 1,
+        }
+    }
+}
+
+pub fn shutdown_grace(raw: Option<&str>) -> Result<Duration, String> {
+    match raw {
+        None => Ok(Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS)),
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|_| {
+                format!("{SHUTDOWN_GRACE_MS}={raw} is not a whole number of milliseconds")
+            }),
+    }
+}
+
+fn settle(grace: Duration) -> Duration {
+    (grace / 4).min(Duration::from_millis(ENDPOINT_SETTLE_MS))
+}
+
+async fn released(mut drained: watch::Receiver<bool>) {
+    let _ = drained.wait_for(|draining| *draining).await;
+}
+
+async fn await_both(
+    http: impl Future<Output = Result<(), std::io::Error>>,
+    grpc: impl Future<Output = Result<(), tonic::transport::Error>>,
+) -> Result<(), ServeError> {
+    let (http, grpc) = tokio::join!(http, grpc);
+    http.map_err(ServeError::Http)?;
+    grpc.map_err(ServeError::Grpc)
+}
+
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    state: State,
+    service: grpc::Service,
+    grpc_address: SocketAddr,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+) -> Result<(), ServeError> {
+    let settle = settle(grace);
+    let (drain, drained) = watch::channel(false);
+    let mut http = Box::pin(
+        axum::serve(listener, app(state.clone()))
+            .with_graceful_shutdown(released(drained.clone()))
+            .into_future(),
+    );
+    let mut grpc = Box::pin(
+        tonic::transport::Server::builder()
+            .add_service(grpc::server(service))
+            .serve_with_shutdown(grpc_address, released(drained)),
+    );
+    let mut shutdown = Box::pin(shutdown);
+    let first = tokio::select! {
+        biased;
+        () = &mut shutdown => First::Signalled,
+        served = &mut http => First::Http(served.map_err(ServeError::Http)),
+        served = &mut grpc => First::Grpc(served.map_err(ServeError::Grpc)),
+    };
+    state.drain();
+    match first {
+        First::Signalled => {
+            let release = async move {
+                tokio::time::sleep(settle).await;
+                let _ = drain.send(true);
+            };
+            bounded(release_and_drain(release, http, grpc), grace).await
+        }
+        First::Http(served) => {
+            let _ = drain.send(true);
+            let sibling = async { grpc.await.map_err(ServeError::Grpc) };
+            bounded(sibling, grace).await.and(served)
+        }
+        First::Grpc(served) => {
+            let _ = drain.send(true);
+            let sibling = async { http.await.map_err(ServeError::Http) };
+            bounded(sibling, grace).await.and(served)
+        }
+    }
+}
+
+enum First {
+    Signalled,
+    Http(Result<(), ServeError>),
+    Grpc(Result<(), ServeError>),
+}
+
+async fn release_and_drain(
+    release: impl Future<Output = ()>,
+    http: impl Future<Output = Result<(), std::io::Error>>,
+    grpc: impl Future<Output = Result<(), tonic::transport::Error>>,
+) -> Result<(), ServeError> {
+    let (_, served) = tokio::join!(release, await_both(http, grpc));
+    served
+}
+
+async fn bounded(
+    finished: impl Future<Output = Result<(), ServeError>>,
+    budget: Duration,
+) -> Result<(), ServeError> {
+    match tokio::time::timeout(budget, finished).await {
+        Ok(result) => result,
+        Err(_) => Err(ServeError::GraceExpired(budget)),
     }
 }
 
@@ -449,7 +608,14 @@ async fn healthz() -> Response {
     )
 }
 
-async fn readyz() -> Response {
+async fn readyz(AxumState(state): AxumState<State>) -> Response {
+    if state.draining() {
+        return reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            JSON,
+            Bytes::from_static(DRAINING),
+        );
+    }
     reply(
         StatusCode::OK,
         JSON,
