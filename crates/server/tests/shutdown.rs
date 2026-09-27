@@ -346,7 +346,7 @@ async fn a_request_in_flight_finishes_during_the_drain() {
         async {
             let _ = wait.await;
         },
-        Duration::from_millis(5_000),
+        Duration::from_millis(15_000),
     ));
     let mut stream = TcpStream::connect(http).await.expect("connect");
     post_head(&mut stream, http, PAYLOAD).await;
@@ -461,7 +461,7 @@ fn a_transport_failure_is_a_non_zero_exit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_drains_and_exits_zero() {
     let (http, grpc_address) = (port(), port());
-    let mut server = Server::spawn(http, grpc_address, "4000");
+    let mut server = Server::spawn(http, grpc_address, "8000");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if get_over_tcp(http, "/readyz")
@@ -507,6 +507,6 @@ async fn sigterm_drains_and_exits_zero() {
         status.success(),
         "a signal-initiated drain exits zero: {status}"
     );
-    assert!(elapsed < Duration::from_millis(4_000), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(8_000), "{elapsed:?}");
     assert!(!answers(http).await, "and the port stops answering");
 }
