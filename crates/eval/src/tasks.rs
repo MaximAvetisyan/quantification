@@ -168,33 +168,43 @@ fn run_command(spec: &ProviderSpec, argv: &[String], prompt: &str) -> Result<Str
     let mut stdout = child.stdout.take().expect("a piped stdout");
     let mut answer = Vec::new();
     let mut status: Option<ExitStatus> = None;
-    let ok = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || stdin.write_all(prompt.as_bytes()).is_ok());
-        let read = stdout.read_to_end(&mut answer);
-        let waited = child.wait();
-        status = waited.as_ref().ok().copied();
-        writer.join().unwrap_or(false) && read.is_ok() && waited.is_ok()
+    let mut read_error: Option<String> = None;
+    let mut write_error: Option<String> = None;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(prompt.as_bytes()));
+        if let Err(e) = stdout.read_to_end(&mut answer) {
+            read_error = Some(e.to_string());
+        }
+        status = child.wait().ok();
+        write_error = match writer.join() {
+            Ok(Err(e)) if e.kind() != std::io::ErrorKind::BrokenPipe => Some(e.to_string()),
+            Ok(_) => None,
+            Err(_) => Some("the prompt writer panicked".to_string()),
+        };
     });
-    if !ok {
+    let Some(status) = status else {
         return Err(ModelError::new(
             spec.id,
-            format!("{program} did not finish"),
+            format!("{program} could not be waited for"),
+        ));
+    };
+    if !status.success() {
+        return Err(ModelError::new(
+            spec.id,
+            format!("{program} exited with {status}"),
         ));
     }
-    match status {
-        Some(status) if status.success() => {}
-        Some(status) => {
-            return Err(ModelError::new(
-                spec.id,
-                format!("{program} exited with {status}"),
-            ));
-        }
-        None => {
-            return Err(ModelError::new(
-                spec.id,
-                format!("{program} could not be waited for"),
-            ));
-        }
+    if let Some(e) = read_error {
+        return Err(ModelError::new(
+            spec.id,
+            format!("cannot read the answer from {program}: {e}"),
+        ));
+    }
+    if let Some(e) = write_error {
+        return Err(ModelError::new(
+            spec.id,
+            format!("cannot write the prompt to {program}: {e}"),
+        ));
     }
     String::from_utf8(answer).map_err(|e| ModelError::new(spec.id, e.to_string()))
 }

@@ -774,6 +774,43 @@ fn the_command_transport_pipes_the_prompt_and_reports_a_missing_program() {
 }
 
 #[test]
+fn a_child_that_closes_stdin_early_is_reported_by_its_exit_status() {
+    let sh = |script: &str| {
+        tasks::Injected::command(
+            PROVIDERS[0],
+            vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
+        )
+    };
+    let unread = "x".repeat(8 << 20);
+    let error = sh("exec 0<&-; exit 37")
+        .complete(&unread)
+        .expect_err("a child that never reads the prompt and fails must fail");
+    assert_eq!(error.provider, "openai");
+    assert!(
+        error.reason.contains("exited with") && error.reason.contains("37"),
+        "the child exit is the failure, not the prompt write: {}",
+        error.reason
+    );
+    assert_eq!(
+        sh("exec 0<&-; printf answer")
+            .complete(&unread)
+            .expect("a child that closes stdin early and exits zero still answers"),
+        "answer",
+        "an unread prompt is not a transport failure"
+    );
+    for at in 0..16 {
+        let error = sh("exit 3")
+            .complete("x")
+            .expect_err("a non-zero exit must fail");
+        assert!(
+            error.reason.contains("exited with"),
+            "run {at}: the write/exit race changed the report: {}",
+            error.reason
+        );
+    }
+}
+
+#[test]
 fn the_task_report_says_not_measured_when_no_provider_was_called() {
     let text = report::task_report(false, "no provider was called", &[]);
     assert!(text.contains("NOT MEASURED"), "{text}");
