@@ -84,7 +84,7 @@ fn assert_removal_invariant(units: &[Unit], group: &Range<usize>, removed: &Rang
 #[test]
 fn removal_range_is_the_member_union_plus_inter_member_joiners() {
     let span = line_span(6, 9);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 6);
     for group in [0..1, 0..6, 1..4, 2..5, 5..6, 3..4] {
         let removed = removal_range(&units, group.clone());
@@ -100,7 +100,7 @@ fn removal_range_is_the_member_union_plus_inter_member_joiners() {
 #[test]
 fn removal_range_keeps_the_joiner_of_every_surviving_neighbour() {
     let span = line_span(4, 30);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let first = committed(ledger(&units).try_commit(Proposal::run(0..2, CommitKind::ExactRun)));
     let last = committed(ledger(&units).try_commit(Proposal::run(2..4, CommitKind::ExactRun)));
     assert_eq!(first.removed.start, 0);
@@ -117,7 +117,7 @@ fn removal_range_keeps_the_joiner_of_every_surviving_neighbour() {
 #[test]
 fn removal_range_spans_mixed_line_boundary_joiner_forms() {
     let span = br"a\nbb\u000Acc\u000Add".to_vec();
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 4);
     assert_eq!(&span[units[0].range.clone()], b"a");
     assert_eq!(&span[units[1].range.clone()], b"bb");
@@ -141,7 +141,7 @@ fn removal_range_spans_mixed_line_boundary_joiner_forms() {
 #[test]
 fn removal_range_spans_concatenated_boundary_joiners() {
     let span = br"a\n\u000Ab\n\u000Ac".to_vec();
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 3);
     assert_eq!(joiner(&units, 0, span.len()).len(), 8);
     assert_eq!(joiner(&units, 1, span.len()).len(), 8);
@@ -156,7 +156,7 @@ fn removal_range_spans_concatenated_boundary_joiners() {
 fn removal_range_over_stage1b_comma_separators() {
     let span = dump(&vec![200; 400]);
     assert!(span.len() > MAX_LINE_BYTES);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 400);
     assert_eq!(units[0].range.len(), 201);
     assert_eq!(units[399].range.len(), 201);
@@ -185,7 +185,7 @@ fn removal_range_handles_line_and_record_joiners_in_one_span() {
     let mut span = line_span(3, 30);
     span.extend_from_slice(br"\n");
     span.extend_from_slice(&dump(&vec![200; 400]));
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 3 + 400);
     assert_eq!(&span[joiner(&units, 0, span.len())], br"\n");
     assert_eq!(&span[joiner(&units, 2, span.len())], br"\n");
@@ -223,7 +223,7 @@ fn removal_range_handles_line_and_record_joiners_in_one_span() {
 
 #[test]
 fn removal_range_over_a_single_member_group() {
-    let units = split_span(&line_span(3, 5));
+    let units = split_span(&line_span(3, 5), UNICODE);
     for index in 0..3 {
         let group = index..index + 1;
         let removed = removal_range(&units, group.clone());
@@ -236,7 +236,7 @@ fn removal_range_over_a_single_member_group() {
 #[test]
 fn ledger_never_inflates_removed_bytes_after_earlier_commits() {
     let span = line_span(12, 30);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = ledger(&units);
     committed(ledger.try_commit(Proposal::run(6..9, CommitKind::ExactRun)));
     let residual: Vec<Unit> = ledger.residual().map(|(_, unit)| unit.clone()).collect();
@@ -287,7 +287,7 @@ fn gate_rejects_exact_equality() {
     assert_eq!(count, 2);
     let marker = marker_len(UNICODE, CommitKind::ExactRun, count);
     let span = line_span(3, 11);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(span.len(), 3 * 11 + 2 * 2);
     assert_eq!(11 + marker, span.len());
     let mut ledger = ledger(&units);
@@ -318,7 +318,7 @@ fn gate_commits_one_byte_below_equality_and_keeps_verbatim_above() {
     let count = Proposal::run(0..3, CommitKind::ExactRun).count;
     let marker = marker_len(UNICODE, CommitKind::ExactRun, count);
     assert_eq!(marker, 26);
-    let wide = split_span(&line_span(3, 12));
+    let wide = split_span(&line_span(3, 12), UNICODE);
     let mut wide_ledger = ledger(&wide);
     assert_eq!(
         committed(wide_ledger.try_commit(Proposal::run(0..3, CommitKind::ExactRun)))
@@ -326,7 +326,7 @@ fn gate_commits_one_byte_below_equality_and_keeps_verbatim_above() {
             .len(),
         3 * 12 + 4
     );
-    let narrow = split_span(&line_span(3, 10));
+    let narrow = split_span(&line_span(3, 10), UNICODE);
     let mut ledger = ledger(&narrow);
     assert_eq!(
         ledger.try_commit(Proposal::run(0..3, CommitKind::ExactRun)),
@@ -341,14 +341,14 @@ fn gate_boundary_holds_for_the_ascii_style_too() {
     let count = Proposal::run(0..3, CommitKind::WsRun).count;
     let marker = marker_len(ASCII, CommitKind::WsRun, count);
     assert_eq!(marker, 32);
-    let exact = split_span(&line_span(3, 14));
+    let exact = split_span(&line_span(3, 14), UNICODE);
     assert_eq!(14 + marker, 3 * 14 + 4);
     let mut ledger = Ledger::new(&exact, ASCII);
     assert_eq!(
         ledger.try_commit(Proposal::run(0..3, CommitKind::WsRun)),
         CommitOutcome::BelowThreshold
     );
-    let wider = split_span(&line_span(3, 15));
+    let wider = split_span(&line_span(3, 15), UNICODE);
     let mut ledger = Ledger::new(&wider, ASCII);
     assert_eq!(
         committed(ledger.try_commit(Proposal::run(0..3, CommitKind::WsRun)))
@@ -382,7 +382,7 @@ fn gate_is_a_pure_function_of_its_inputs() {
 
 #[test]
 fn below_threshold_groups_stay_verbatim_and_reusable() {
-    let units = split_span(&line_span(3, 4));
+    let units = split_span(&line_span(3, 4), UNICODE);
     let mut ledger = ledger(&units);
     assert_eq!(
         ledger.try_commit(Proposal::run(0..3, CommitKind::ExactRun)),
@@ -488,7 +488,7 @@ fn marker_len_is_pinned_for_every_kind_and_style() {
 
 #[test]
 fn emitted_order_follows_anchor_offsets_not_discovery_order() {
-    let units = split_span(&line_span(6, 40));
+    let units = split_span(&line_span(6, 40), UNICODE);
     let mut ledger = ledger(&units);
     let last = committed(ledger.try_commit(Proposal::new(4..6, 1, 1, CommitKind::Block)));
     let first = committed(ledger.try_commit(Proposal::new(0..2, 1, 1, CommitKind::ExactRun)));
@@ -515,7 +515,7 @@ fn emitted_order_follows_anchor_offsets_not_discovery_order() {
 
 #[test]
 fn emitted_order_is_stable_across_repeated_detector_orders() {
-    let units = split_span(&line_span(4, 40));
+    let units = split_span(&line_span(4, 40), UNICODE);
     let orders: [Vec<Range<usize>>; 3] =
         [vec![0..2, 2..4], vec![2..4, 0..2], vec![2..4, 0..1, 0..2]];
     let mut rendered = Vec::new();
@@ -539,7 +539,7 @@ fn emitted_order_is_stable_across_repeated_detector_orders() {
 
 #[test]
 fn a_group_that_is_not_a_whole_number_of_copies_is_rejected() {
-    let units = split_span(&line_span(5, 30));
+    let units = split_span(&line_span(5, 30), UNICODE);
     let mut partial = ledger(&units);
     let proposal = Proposal::repeat(0..5, 2, CommitKind::Block);
     assert_eq!(
@@ -570,7 +570,7 @@ fn a_group_that_is_not_a_whole_number_of_copies_is_rejected() {
 
 #[test]
 fn block_anchors_cover_the_whole_first_occurrence() {
-    let units = split_span(&line_span(6, 30));
+    let units = split_span(&line_span(6, 30), UNICODE);
     let mut ledger = ledger(&units);
     let commit = committed(ledger.try_commit(Proposal::repeat(0..6, 2, CommitKind::Block)));
     assert_eq!(commit.anchor, removal_range(&units, 0..2));
@@ -589,7 +589,7 @@ fn block_anchors_cover_the_whole_first_occurrence() {
 
 #[test]
 fn run_proposals_derive_the_omitted_count_from_the_group() {
-    let units = split_span(&line_span(5, 20));
+    let units = split_span(&line_span(5, 20), UNICODE);
     let proposal = Proposal::run(1..4, CommitKind::WsRun);
     assert_eq!(proposal.anchor_units, 1);
     assert_eq!(proposal.count, 2);
@@ -610,7 +610,7 @@ fn run_proposals_derive_the_omitted_count_from_the_group() {
 #[test]
 fn a_two_member_run_renders_one_omitted_copy() {
     let span = line_span(2, 30);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let anchor = &span[units[0].range.clone()];
     let commit = commit_of(&units, Proposal::run(0..2, CommitKind::ExactRun));
     assert_eq!(commit.count, 1);
@@ -629,7 +629,7 @@ fn a_two_member_run_renders_one_omitted_copy() {
 #[test]
 fn a_ten_member_run_renders_nine_omitted_copies() {
     let span = line_span(10, 20);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let anchor = &span[units[0].range.clone()];
     let commit = commit_of(&units, Proposal::run(0..10, CommitKind::ExactRun));
     assert_eq!(commit.count, 9);
@@ -648,7 +648,7 @@ fn a_ten_member_run_renders_nine_omitted_copies() {
 #[test]
 fn an_eleven_member_run_renders_ten_omitted_copies_across_the_width_carry() {
     let span = line_span(11, 20);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let anchor = &span[units[0].range.clone()];
     let commit = commit_of(&units, Proposal::run(0..11, CommitKind::ExactRun));
     assert_eq!(commit.count, 10);
@@ -667,7 +667,7 @@ fn an_eleven_member_run_renders_ten_omitted_copies_across_the_width_carry() {
 #[test]
 fn a_two_hundred_copy_run_renders_one_hundred_ninety_nine() {
     let span = line_span(200, 20);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let anchor = &span[units[0].range.clone()];
     let commit = commit_of(&units, Proposal::run(0..200, CommitKind::ExactRun));
     assert_eq!(commit.count, 199);
@@ -687,7 +687,7 @@ fn a_two_hundred_copy_run_renders_one_hundred_ninety_nine() {
 #[test]
 fn a_block_group_of_two_three_unit_copies_renders_one_omitted_copy() {
     let span = line_span(6, 20);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let anchor = &span[removal_range(&units, 0..3)];
     let commit = commit_of(&units, Proposal::repeat(0..6, 3, CommitKind::Block));
     assert_eq!(commit.count, 1);
@@ -706,7 +706,7 @@ fn a_block_group_of_two_three_unit_copies_renders_one_omitted_copy() {
 #[test]
 fn a_block_group_of_three_two_unit_copies_renders_two_omitted_copies() {
     let span = line_span(6, 20);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let anchor = &span[removal_range(&units, 0..2)];
     let commit = commit_of(&units, Proposal::repeat(0..6, 2, CommitKind::Block));
     assert_eq!(commit.count, 2);
@@ -724,7 +724,7 @@ fn a_block_group_of_three_two_unit_copies_renders_two_omitted_copies() {
 
 #[test]
 fn the_gate_prices_the_width_of_the_emitted_omitted_count() {
-    let ten = split_span(&line_span(10, 1));
+    let ten = split_span(&line_span(10, 1), UNICODE);
     let ten_commit = commit_of(&ten, Proposal::run(0..10, CommitKind::ExactRun));
     assert_eq!(ten_commit.count, 9);
     assert_eq!(ten_commit.anchor.len(), 1);
@@ -733,7 +733,7 @@ fn the_gate_prices_the_width_of_the_emitted_omitted_count() {
     assert!(!profitable(UNICODE, CommitKind::ExactRun, 9, 1, 27));
     assert!(profitable(UNICODE, CommitKind::ExactRun, 9, 1, 28));
     assert!(!profitable(UNICODE, CommitKind::ExactRun, 10, 1, 28));
-    let eleven = split_span(&line_span(11, 1));
+    let eleven = split_span(&line_span(11, 1), UNICODE);
     let eleven_commit = commit_of(&eleven, Proposal::run(0..11, CommitKind::ExactRun));
     assert_eq!(eleven_commit.count, 10);
     assert_eq!(eleven_commit.anchor.len(), 1);
@@ -754,7 +754,7 @@ fn the_gate_prices_the_width_of_the_emitted_omitted_count() {
 
 #[test]
 fn earlier_stage_ownership_blocks_later_overlaps() {
-    let units = split_span(&line_span(6, 40));
+    let units = split_span(&line_span(6, 40), UNICODE);
     let mut ledger = ledger(&units);
     committed(ledger.try_commit(Proposal::run(2..5, CommitKind::ExactRun)));
     assert!(!ledger.is_free(2..5));
@@ -785,7 +785,7 @@ fn earlier_stage_ownership_blocks_later_overlaps() {
 
 #[test]
 fn adjacent_commits_do_not_overlap() {
-    let units = split_span(&line_span(4, 40));
+    let units = split_span(&line_span(4, 40), UNICODE);
     let mut ledger = ledger(&units);
     let first = committed(ledger.try_commit(Proposal::run(0..2, CommitKind::ExactRun)));
     let second = committed(ledger.try_commit(Proposal::run(2..4, CommitKind::WsRun)));
@@ -799,7 +799,7 @@ fn ineligible_units_are_never_committed() {
     let mut records = vec![MAX_RECORD_BYTES + 1, 200, 200, 200];
     records.extend(std::iter::repeat_n(&200, 400));
     let span = dump(&records);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), records.len());
     assert!(!units[0].eligible);
     assert!(units[1].eligible);
@@ -821,7 +821,7 @@ fn ineligible_units_are_never_committed() {
 
 #[test]
 fn invalid_groups_and_anchors_are_rejected() {
-    let units = split_span(&line_span(3, 40));
+    let units = split_span(&line_span(3, 40), UNICODE);
     let mut ledger = ledger(&units);
     assert_eq!(
         ledger.try_commit(Proposal::run(1..1, CommitKind::ExactRun)),
@@ -858,7 +858,7 @@ fn invalid_groups_and_anchors_are_rejected() {
 
 #[test]
 fn marker_style_must_be_resolved_before_committing() {
-    let units = split_span(&line_span(2, 10));
+    let units = split_span(&line_span(2, 10), UNICODE);
     let resolved = Ledger::new(&units, UNICODE);
     assert_eq!(resolved.marker_style(), UNICODE);
     assert_eq!(resolved.units().len(), units.len());
@@ -868,7 +868,7 @@ fn marker_style_must_be_resolved_before_committing() {
 #[test]
 #[should_panic(expected = "the caller resolves Auto before committing")]
 fn auto_marker_style_is_refused() {
-    let units = split_span(&line_span(2, 10));
+    let units = split_span(&line_span(2, 10), UNICODE);
     let _ = Ledger::new(&units, MarkerStyle::Auto);
 }
 
@@ -910,7 +910,7 @@ fn every_commit_keeps_the_removal_invariant() {
     mixed.extend_from_slice(br"\n");
     mixed.extend_from_slice(&dump(&vec![200; 406]));
     for span in [dump(&vec![200; 406]), mixed] {
-        let units = split_span(&span);
+        let units = split_span(&span, UNICODE);
         let mut ledger = ledger(&units);
         let mut attempted = 0;
         for group in [0..1, 0..3, 3..5, 1..3, units.len() - 2..units.len()] {
@@ -992,7 +992,7 @@ fn stage_stats_counters_are_plain_per_detector_data() {
 
 #[test]
 fn stage_stats_from_ledger_commits_cover_every_detector() {
-    let units = split_span(&line_span(8, 40));
+    let units = split_span(&line_span(8, 40), UNICODE);
     let mut ledger = ledger(&units);
     let mut stats = StageStats::default();
     for (group, kind) in [

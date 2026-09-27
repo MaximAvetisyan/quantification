@@ -4,6 +4,8 @@ use crate::fingerprint::{FingerprintTable, Insert, fingerprint};
 use crate::ledger::{CommitKind, CommitOutcome, Ledger, Proposal, StageStats};
 use crate::wsnorm::normalize_into;
 
+use super::templ::Forms;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Work {
     pub compares: u64,
@@ -61,6 +63,7 @@ impl Scratch {
 
 pub fn repeated_blocks(
     span: &[u8],
+    forms: Option<&Forms>,
     ledger: &mut Ledger<'_>,
     min_block_lines: u32,
     max_block_lines: u32,
@@ -76,13 +79,19 @@ pub fn repeated_blocks(
         block(&scratch.norm, &scratch.arena, first, len)
             == block(&scratch.norm, &scratch.arena, second, len)
     };
+    let mut left_wall =
+        |before: usize, first: usize| forms.is_some_and(|forms| forms.same(before, first));
+    let mut domain = Domain {
+        ids: &scratch.ids,
+        same_bytes: &mut same_bytes,
+        left_wall: &mut left_wall,
+    };
     windowed_blocks(
         ledger,
-        &scratch.ids,
+        &mut domain,
         min,
         max,
         CommitKind::Block,
-        &mut same_bytes,
         &mut scratch.work,
     )
 }
@@ -139,15 +148,24 @@ fn block<'a>(
     &arena[first.start..last.end]
 }
 
-pub(crate) fn windowed_blocks(
+pub(crate) struct Domain<'a, S, W> {
+    pub ids: &'a [Option<usize>],
+    pub same_bytes: S,
+    pub left_wall: W,
+}
+
+pub(crate) fn windowed_blocks<
+    S: FnMut(usize, usize, usize) -> bool,
+    W: FnMut(usize, usize) -> bool,
+>(
     ledger: &mut Ledger<'_>,
-    ids: &[Option<usize>],
+    domain: &mut Domain<'_, S, W>,
     min_block_lines: usize,
     max_block_lines: usize,
     kind: CommitKind,
-    same_bytes: &mut impl FnMut(usize, usize, usize) -> bool,
     work: &mut Work,
 ) -> StageStats {
+    let ids = domain.ids;
     let min = min_block_lines.max(1);
     let max = max_block_lines.max(1);
     let mut stats = StageStats::default();
@@ -165,10 +183,13 @@ pub(crate) fn windowed_blocks(
         while length >= min {
             if equal(ids, at, at + length, length, work) {
                 work.verifications += 1;
-                if same_bytes(at, at + length, length)
-                    && anchor_is_match_free(ids, at, length, min, same_bytes, work)
+                if (domain.same_bytes)(at, at + length, length)
+                    && anchor_is_match_free(ids, at, length, min, &mut domain.same_bytes, work)
                 {
-                    let copies = copies(ids, at, length, room, same_bytes, work);
+                    if wall_blocks(ledger, domain, at) {
+                        break;
+                    }
+                    let copies = copies(ids, at, length, room, &mut domain.same_bytes, work);
                     let group = at..at + copies * length;
                     if let CommitOutcome::Committed(commit) =
                         ledger.try_commit(Proposal::repeat(group.clone(), length, kind))
@@ -184,6 +205,17 @@ pub(crate) fn windowed_blocks(
         at = next;
     }
     stats
+}
+
+fn wall_blocks<S, W>(ledger: &Ledger<'_>, domain: &mut Domain<'_, S, W>, at: usize) -> bool
+where
+    S: FnMut(usize, usize, usize) -> bool,
+    W: FnMut(usize, usize) -> bool,
+{
+    at > 0
+        && !ledger.is_committed(at - 1)
+        && domain.ids[at - 1].is_some()
+        && (domain.left_wall)(at - 1, at)
 }
 
 fn anchor_is_match_free(

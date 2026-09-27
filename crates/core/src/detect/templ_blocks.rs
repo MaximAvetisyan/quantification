@@ -1,7 +1,7 @@
-use crate::detect::blocks::{Work, windowed_blocks};
+use crate::detect::blocks::{Domain, Work, windowed_blocks};
 use crate::ledger::{CommitKind, Ledger, StageStats};
 
-use super::templ::{Forms, Templated};
+use super::templ::Forms;
 
 const MIN_PERIOD: usize = 1;
 
@@ -41,26 +41,30 @@ impl Scratch {
 }
 
 pub fn templated_blocks(
-    templated: &Templated,
+    forms: Option<&Forms>,
     ledger: &mut Ledger<'_>,
     max_block_lines: u32,
     scratch: &mut Scratch,
 ) -> StageStats {
-    if templated.degraded {
+    let Some(forms) = forms else {
         return StageStats::default();
-    }
-    let forms = &templated.forms;
+    };
     load(ledger, forms, scratch);
     let mut same = |first: usize, second: usize, length: usize| {
         masked(forms, first, length) == masked(forms, second, length)
     };
+    let mut left_wall = |before: usize, first: usize| forms.same(before, first);
+    let mut domain = Domain {
+        ids: &scratch.ids,
+        same_bytes: &mut same,
+        left_wall: &mut left_wall,
+    };
     windowed_blocks(
         ledger,
-        &scratch.ids,
+        &mut domain,
         MIN_PERIOD,
         max_block_lines.max(1) as usize,
         CommitKind::TemplatedBlock,
-        &mut same,
         &mut scratch.work,
     )
 }

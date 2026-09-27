@@ -1,9 +1,12 @@
+use quantification_core::config::MarkerStyle;
 use quantification_core::fingerprint::{
     FingerprintTable, HASH_SEED, Insert, KEY_BYTES_PER_UNIT, MAX_SLOTS, MIN_SLOTS, fingerprint,
     marker_checksum,
 };
 use quantification_core::stage1::split_span;
 use quantification_core::wsnorm::normalize_into;
+
+const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 
 const GOLDEN: [(&[u8], u128, u16); 4] = [
     (b"", 0x99aa_06d3_0147_98d8_6001_c324_468d_497f, 0x94c2),
@@ -128,7 +131,7 @@ fn lookups_do_not_depend_on_insertion_order() {
 #[test]
 fn raw_domain_groups_repeated_units_only() {
     let span = br"2026-08-26T10:00:00Z INFO hc 10.0.0.1 ok\n2026-08-26T10:00:00Z INFO hc 10.0.0.1 ok\n2026-08-26T10:00:01Z INFO hc 10.0.0.1 ok\n2026-08-26T10:00:00Z INFO hc 10.0.0.1 ok";
-    let units = split_span(span);
+    let units = split_span(span, UNICODE);
     assert_eq!(units.len(), 4);
     let mut table = FingerprintTable::for_keys(span.len());
     let mut reps = Vec::new();
@@ -154,7 +157,7 @@ fn raw_domain_groups_repeated_units_only() {
 #[test]
 fn ws_domain_groups_padded_duplicates() {
     let span = br"a\tb\na  b\na\t\tb\nc\td";
-    let units = split_span(span);
+    let units = split_span(span, UNICODE);
     let mut arena = Vec::new();
     let mut ranges = Vec::new();
     for unit in &units {

@@ -133,7 +133,7 @@ fn generated_span(lines: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn a_raw_identical_run_commits_one_exact_run() {
     let span = line_span(5, 40);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&span, &mut ledger, 3);
     assert_eq!(stats.exact_runs, 1);
@@ -157,7 +157,7 @@ fn below_threshold_runs_stay_verbatim_and_do_not_block_the_next_run() {
     lines.extend(vec![vec![b'y'; 40]; 3]);
     let borrowed: Vec<&[u8]> = lines.iter().map(|line| line.as_slice()).collect();
     let span = span_with(br"\n", &borrowed);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&span, &mut ledger, 3);
     assert_eq!(stats.exact_runs, 1);
@@ -177,7 +177,7 @@ fn below_threshold_runs_stay_verbatim_and_do_not_block_the_next_run() {
     let lines: Vec<Vec<u8>> = vec![vec![b'x'; 20]; 3];
     let borrowed: Vec<&[u8]> = lines.iter().map(|line| line.as_slice()).collect();
     let wide = span_with(br"\n", &borrowed);
-    let units = split_span(&wide);
+    let units = split_span(&wide, UNICODE);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&wide, &mut ledger, 3);
     assert_eq!(stats.exact_runs, 1);
@@ -194,7 +194,7 @@ fn the_raw_domain_does_not_merge_padding_variants() {
     let mut lines: Vec<&[u8]> = vec![padded; 3];
     lines.extend(vec![plain; 3]);
     let span = span_with(br"\n", &lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&span, &mut ledger, 3);
     assert_eq!(stats.exact_runs, 2);
@@ -216,7 +216,7 @@ fn raw_identical_lines_commit_regardless_of_the_normalize_ws_option() {
     let padded: &[u8] = br"INFO hc\t10.0.0.1 ok 0123456789";
     let lines: [&[u8]; 4] = [padded, padded, padded, br"INFO hc 10.0.0.1 ok 0123456789"];
     let span = span_with(br"\n", &lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let stats = exact_runs(&span, &mut first, 3);
@@ -234,7 +234,7 @@ fn raw_identical_lines_commit_regardless_of_the_normalize_ws_option() {
 #[test]
 fn the_count_width_is_priced_at_the_decimal_carry() {
     let ten = line_span(10, 1);
-    let units = split_span(&ten);
+    let units = split_span(&ten, UNICODE);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&ten, &mut ledger, 3);
     assert_eq!(stats.exact_runs, 1);
@@ -244,7 +244,7 @@ fn the_count_width_is_priced_at_the_decimal_carry() {
     assert!(!profitable(UNICODE, CommitKind::ExactRun, 10, 1, 28));
     assert!(profitable(UNICODE, CommitKind::ExactRun, 9, 1, 28));
     let eleven = line_span(11, 1);
-    let units = split_span(&eleven);
+    let units = split_span(&eleven, UNICODE);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&eleven, &mut ledger, 3);
     assert_eq!(stats.exact_runs, 1);
@@ -266,7 +266,7 @@ fn an_over_cap_record_wall_splits_runs_without_being_grouped() {
     records.extend(std::iter::repeat_n(&200, 200));
     let span = dump(&records);
     assert!(span.len() > MAX_LINE_BYTES);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 401);
     let wall = 200;
     assert!(!units[wall].eligible);
@@ -296,7 +296,7 @@ fn an_over_cap_record_wall_splits_runs_without_being_grouped() {
 #[test]
 fn stage1b_records_group_in_the_raw_domain() {
     let span = dump(&vec![200; 400]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 400);
     assert!(span[units[0].range.clone()].starts_with(b"[{"));
     assert!(span[units[399].range.clone()].ends_with(b"}]"));
@@ -329,7 +329,7 @@ fn the_removal_rule_covers_line_and_record_joiners_in_one_span() {
     span.extend_from_slice(&span_with(br"\u000A", &[&second, &second, &second]));
     span.extend_from_slice(br"\n");
     span.extend_from_slice(&dump(&vec![200; 400]));
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 6 + 400);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&span, &mut ledger, 3);
@@ -371,7 +371,7 @@ fn leftmost_first_discovery_in_anchor_offset_order() {
     let x = vec![b'x'; 40];
     let y = vec![b'y'; 40];
     let span = span_with(br"\n", &[&a, &a, &a, &x, &b, &b, &b, &b, &y, &c, &c, &c]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 12);
     let mut ledger = new_ledger(&units);
     let stats = exact_runs(&span, &mut ledger, 3);
@@ -400,7 +400,7 @@ fn leftmost_first_discovery_in_anchor_offset_order() {
 #[test]
 fn a_run_never_straddles_a_region_committed_by_an_earlier_stage() {
     let span = line_span(6, 40);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let earlier = ledger.try_commit(Proposal::repeat(2..4, 1, CommitKind::Block));
     assert!(matches!(earlier, CommitOutcome::Committed(_)));
@@ -445,7 +445,7 @@ fn a_run_never_straddles_a_region_committed_by_an_earlier_stage() {
 #[test]
 fn min_group_size_bounds_the_smallest_group() {
     let pair = line_span(2, 40);
-    let units = split_span(&pair);
+    let units = split_span(&pair, UNICODE);
     let mut ledger = new_ledger(&units);
     assert_eq!(exact_runs(&pair, &mut ledger, 3), StageStats::default());
     assert_eq!(ledger.commits().len(), 0);
@@ -456,7 +456,7 @@ fn min_group_size_bounds_the_smallest_group() {
     assert_eq!((commit.first, commit.last, commit.count), (0, 1, 1));
     assert_eq!(render(UNICODE, commit.kind, commit.count, b"x").len(), 26);
     let triple = line_span(3, 40);
-    let units = split_span(&triple);
+    let units = split_span(&triple, UNICODE);
     let mut ledger = new_ledger(&units);
     assert_eq!(exact_runs(&triple, &mut ledger, 4), StageStats::default());
     assert_eq!(ledger.commits().len(), 0);
@@ -466,16 +466,16 @@ fn min_group_size_bounds_the_smallest_group() {
 #[test]
 fn empty_ineligible_and_single_unit_spans_commit_nothing() {
     let empty: &[u8] = b"";
-    let empty_units = split_span(empty);
+    let empty_units = split_span(empty, UNICODE);
     let mut ledger = new_ledger(&empty_units);
     assert_eq!(exact_runs(empty, &mut ledger, 3), StageStats::default());
     let single = br"only one line";
-    let single_units = split_span(single);
+    let single_units = split_span(single, UNICODE);
     let mut ledger = new_ledger(&single_units);
     assert_eq!(exact_runs(single, &mut ledger, 3), StageStats::default());
     assert_eq!(ledger.commits().len(), 0);
     let wall = vec![b'z'; MAX_LINE_BYTES + 1];
-    let units = split_span(&wall);
+    let units = split_span(&wall, UNICODE);
     assert_eq!(units.len(), 1);
     assert!(!units[0].eligible);
     let mut ledger = new_ledger(&units);
@@ -487,7 +487,7 @@ fn empty_ineligible_and_single_unit_spans_commit_nothing() {
 #[test]
 fn exact_runs_is_deterministic() {
     let span = generated_span(400, 0x5eed_1234_abcd_0303);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let stats = exact_runs(&span, &mut first, 3);
@@ -501,7 +501,7 @@ fn exact_runs_is_deterministic() {
     assert_eq!(exact_runs(&span, &mut first, 3), StageStats::default());
     assert_eq!(first.commits(), second.commits());
     let wide = generated_span(400, 0x1111_2222_3333_4444);
-    let units = split_span(&wide);
+    let units = split_span(&wide, UNICODE);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     assert_eq!(

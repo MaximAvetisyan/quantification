@@ -3,10 +3,12 @@ use quantification_core::config::{
 };
 use quantification_core::detect::blocks::{Scratch, repeated_blocks};
 use quantification_core::detect::exact::exact_runs;
+use quantification_core::detect::templ::{Forms, Scratch as TemplScratch};
 use quantification_core::detect::wsruns::{Scratch as WsScratch, ws_runs};
 use quantification_core::ledger::{
     Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, marker_len, profitable,
 };
+use quantification_core::mask::mask;
 use quantification_core::render::render;
 use quantification_core::stage1::{Unit, split_span};
 use quantification_core::wsnorm::normalize;
@@ -43,8 +45,19 @@ fn lines_span(lines: &[&[u8]]) -> Vec<u8> {
     span_with(br"\n", lines)
 }
 
+fn stage_as(
+    span: &[u8],
+    ledger: &mut Ledger<'_>,
+    min: u32,
+    max: u32,
+    scratch: &mut Scratch,
+) -> StageStats {
+    let forms = Forms::build(span, ledger.units(), &mut TemplScratch::default());
+    repeated_blocks(span, forms.as_ref(), ledger, min, max, scratch)
+}
+
 fn stage(span: &[u8], ledger: &mut Ledger<'_>, scratch: &mut Scratch) -> StageStats {
-    repeated_blocks(span, ledger, MIN_BLOCK_LINES, MAX_BLOCK_LINES, scratch)
+    stage_as(span, ledger, MIN_BLOCK_LINES, MAX_BLOCK_LINES, scratch)
 }
 
 fn record(len: usize, pad: &[u8]) -> Vec<u8> {
@@ -229,7 +242,7 @@ fn generated_span(groups: usize, seed: u64) -> Vec<u8> {
 fn a_block_behind_header_lines_commits() {
     let lines: [&[u8]; 8] = [H0, H1, L0, L1, L0P, L1P, L0Q, L1Q];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 8);
     let mut exact = new_ledger(&units);
     assert_eq!(exact_runs(&span, &mut exact, 3), StageStats::default());
@@ -265,7 +278,7 @@ fn a_block_behind_header_lines_commits() {
 fn the_leftmost_start_beats_a_longer_block_that_starts_later() {
     let lines: [&[u8]; 8] = [L0, L1, L0, L1, C0, L0, L1, C0];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(
         norm_block(&span, &units, 2, 3),
         norm_block(&span, &units, 5, 3)
@@ -283,7 +296,7 @@ fn the_leftmost_start_beats_a_longer_block_that_starts_later() {
     assert_removal_invariant(&units, commit);
     let tail: [&[u8]; 6] = [L0, L1, C0, L0, L1, C0];
     let tail_span = lines_span(&tail);
-    let tail_units = split_span(&tail_span);
+    let tail_units = split_span(&tail_span, UNICODE);
     let mut tail_ledger = new_ledger(&tail_units);
     assert_eq!(
         stage(&tail_span, &mut tail_ledger, &mut scratch).block_repeats,
@@ -302,7 +315,7 @@ fn the_leftmost_start_beats_a_longer_block_that_starts_later() {
 fn the_longest_candidate_at_a_start_wins() {
     let lines: [&[u8]; 8] = [L0, L1, L0, L1, L0, L1, L0, L1];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
     assert_eq!(stage(&span, &mut ledger, &mut scratch).block_repeats, 1);
@@ -326,7 +339,7 @@ fn the_longest_candidate_at_a_start_wins() {
 fn the_chain_stops_at_the_first_divergent_copy() {
     let lines: [&[u8]; 8] = [L0, L1, L0, L1, L0, L1, L0, LZ];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_ne!(
         norm_block(&span, &units, 4, 2),
         norm_block(&span, &units, 6, 2)
@@ -351,7 +364,7 @@ fn the_chain_stops_at_the_first_divergent_copy() {
 fn a_two_copy_block_costs_exactly_one_verification_memcmp() {
     let lines: [&[u8]; 4] = [L0, L1, L0, L1];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
     assert_eq!(stage(&span, &mut ledger, &mut scratch).block_repeats, 1);
@@ -368,7 +381,7 @@ fn a_two_copy_block_costs_exactly_one_verification_memcmp() {
 fn a_below_threshold_block_stays_verbatim_and_remains_free() {
     let narrow: [&[u8]; 4] = [br"a\tb", br"c d", br"a  b", br"c\td"];
     let span = lines_span(&narrow);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 4);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -393,7 +406,7 @@ fn a_below_threshold_block_stays_verbatim_and_remains_free() {
     );
     let wide: [&[u8]; 4] = [L0, L1, L0, L1];
     let wide_span = lines_span(&wide);
-    let wide_units = split_span(&wide_span);
+    let wide_units = split_span(&wide_span, UNICODE);
     let mut wide_ledger = new_ledger(&wide_units);
     assert_eq!(
         stage(&wide_span, &mut wide_ledger, &mut scratch).block_repeats,
@@ -411,11 +424,11 @@ fn the_gate_boundary_is_the_emitted_count() {
     };
     for (units, expected) in [(8usize, 0u64), (10, 1)] {
         let span = alternating(units);
-        let parsed = split_span(&span);
+        let parsed = split_span(&span, UNICODE);
         assert_eq!(parsed.len(), units);
         let mut ledger = new_ledger(&parsed);
         let mut scratch = Scratch::default();
-        let stats = repeated_blocks(
+        let stats = stage_as(
             &span,
             &mut ledger,
             MIN_BLOCK_LINES,
@@ -446,21 +459,21 @@ fn the_gate_boundary_is_the_emitted_count() {
 fn min_and_max_block_lines_bound_the_candidate_lengths() {
     let lines: [&[u8]; 5] = [H0, L0, L1, L0P, L1P];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut scratch = Scratch::default();
     let mut ledger = new_ledger(&units);
     assert_eq!(
-        repeated_blocks(&span, &mut ledger, 3, MAX_BLOCK_LINES, &mut scratch),
+        stage_as(&span, &mut ledger, 3, MAX_BLOCK_LINES, &mut scratch),
         StageStats::default()
     );
     let mut ledger = new_ledger(&units);
     assert_eq!(
-        repeated_blocks(&span, &mut ledger, 9, MAX_BLOCK_LINES, &mut scratch),
+        stage_as(&span, &mut ledger, 9, MAX_BLOCK_LINES, &mut scratch),
         StageStats::default()
     );
     let mut ledger = new_ledger(&units);
     assert_eq!(
-        repeated_blocks(
+        stage_as(
             &span,
             &mut ledger,
             MIN_BLOCK_LINES,
@@ -478,11 +491,11 @@ fn min_and_max_block_lines_bound_the_candidate_lengths() {
         .collect();
     let borrowed: Vec<&[u8]> = long.iter().map(|line| line.as_slice()).collect();
     let wide = lines_span(&borrowed);
-    let wide_units = split_span(&wide);
+    let wide_units = split_span(&wide, UNICODE);
     assert_eq!(wide_units.len(), 210);
     let mut ledger = new_ledger(&wide_units);
     assert_eq!(
-        repeated_blocks(
+        stage_as(
             &wide,
             &mut ledger,
             MIN_BLOCK_LINES,
@@ -493,7 +506,7 @@ fn min_and_max_block_lines_bound_the_candidate_lengths() {
     );
     assert_eq!(ledger.commits().len(), 0);
     let mut ledger = new_ledger(&wide_units);
-    let stats = repeated_blocks(&wide, &mut ledger, MIN_BLOCK_LINES, 128, &mut scratch);
+    let stats = stage_as(&wide, &mut ledger, MIN_BLOCK_LINES, 128, &mut scratch);
     assert_eq!(stats.block_repeats, 1);
     let commit = &ledger.commits()[0];
     assert_eq!((commit.first, commit.last, commit.count), (0, 209, 2));
@@ -508,7 +521,7 @@ fn min_and_max_block_lines_bound_the_candidate_lengths() {
 fn the_anchor_is_the_entire_raw_first_occurrence() {
     let lines: [&[u8]; 4] = [L0, L1, L0P, L1P];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_ne!(&span[units[0].range.clone()], &span[units[2].range.clone()]);
     assert_eq!(
         norm_block(&span, &units, 0, 2),
@@ -537,7 +550,7 @@ fn a_repeated_record_block_in_a_single_line_dump_commits() {
     records.extend(filler(400, 1000));
     let span = dump(&records);
     assert!(span.len() > MAX_LINE_BYTES);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 606);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -560,6 +573,69 @@ fn a_repeated_record_block_in_a_single_line_dump_commits() {
 }
 
 #[test]
+fn a_record_anchor_head_that_would_glue_to_a_mask_equal_record_is_refused() {
+    let records = record_a(0);
+    let masked = mask(&normalize(&records));
+    assert_eq!(masked, mask(&normalize(&record_a(1))));
+    assert_eq!(masked, mask(&normalize(&record_b(1))));
+    let tail: Vec<Vec<u8>> = vec![
+        records.clone(),
+        record_a(1),
+        record_b(1),
+        record_a(1),
+        record_b(1),
+    ];
+    let walled: Vec<Vec<u8>> = filler(200, 0)
+        .into_iter()
+        .chain(tail.clone())
+        .chain(filler(400, 1000))
+        .collect();
+    let span = dump(&walled);
+    assert!(span.len() > MAX_LINE_BYTES);
+    let units = split_span(&span, UNICODE);
+    assert_eq!(units.len(), walled.len());
+    assert_eq!(
+        units[0].range,
+        0..units[1].range.start - 1,
+        "records are adjacent"
+    );
+    assert!(span[units[200].range.clone()].starts_with(&tail[0][..]));
+    assert!(span[units[201].range.clone()].starts_with(&tail[1][..]));
+    let mut ledger = new_ledger(&units);
+    let mut scratch = Scratch::default();
+    assert_eq!(
+        stage(&span, &mut ledger, &mut scratch),
+        StageStats::default(),
+        "a {}-record anchor whose head abuts a mask-equal record is refused",
+        units.len()
+    );
+    assert_eq!(ledger.commits().len(), 0);
+    assert_eq!(apply(&span, &ledger), span);
+
+    let mut free = tail.clone();
+    free[0] = unique_record(7);
+    let records: Vec<Vec<u8>> = filler(200, 0)
+        .into_iter()
+        .chain(free)
+        .chain(filler(400, 1000))
+        .collect();
+    let span = dump(&records);
+    let units = split_span(&span, UNICODE);
+    let mut ledger = new_ledger(&units);
+    assert_eq!(
+        stage(&span, &mut ledger, &mut scratch).block_repeats,
+        1,
+        "the same candidate commits once the record before it masks differently"
+    );
+    let commit = &ledger.commits()[0];
+    assert_eq!((commit.first, commit.last, commit.count), (201, 204, 1));
+    let anchor = &span[commit.anchor.clone()];
+    assert!(anchor.starts_with(&record_a(1)[..]));
+    assert!(anchor.ends_with(&record_b(1)[..]));
+    assert_removal_invariant(&units, commit);
+}
+
+#[test]
 fn a_block_never_folds_an_over_cap_record() {
     let mut records = filler(200, 0);
     records.extend(copies(2));
@@ -568,7 +644,7 @@ fn a_block_never_folds_an_over_cap_record() {
     records.extend(filler(400, 1000));
     let span = dump(&records);
     assert!(span.len() > MAX_LINE_BYTES);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 609);
     let wall = 204;
     assert!(!units[wall].eligible);
@@ -591,7 +667,7 @@ fn a_block_never_folds_an_over_cap_record() {
     assert!(ledger.is_free(wall..wall + 1));
     records.remove(wall);
     let whole = dump(&records);
-    let whole_units = split_span(&whole);
+    let whole_units = split_span(&whole, UNICODE);
     assert_eq!(whole_units.len(), 608);
     let mut whole_ledger = new_ledger(&whole_units);
     assert_eq!(
@@ -611,7 +687,7 @@ fn a_block_never_folds_an_over_cap_record() {
 fn a_block_never_straddles_a_committed_region() {
     let lines: [&[u8]; 6] = [L0, L1, L0, L1, L0, L1];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     assert!(matches!(
         ledger.try_commit(Proposal::run(2..4, CommitKind::ExactRun)),
@@ -632,7 +708,7 @@ fn a_block_never_straddles_a_committed_region() {
     );
     let long: [&[u8]; 12] = [L0, L1, L0, L1, L0, L1, L0, L1, L0, L1, L0, L1];
     let span = lines_span(&long);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     assert!(matches!(
         ledger.try_commit(Proposal::run(2..4, CommitKind::ExactRun)),
@@ -650,7 +726,7 @@ fn a_block_never_straddles_a_committed_region() {
 fn stage_five_commits_only_what_stages_three_and_four_left() {
     let lines: [&[u8]; 7] = [E0, E0, E0, L0, L1, L0P, L1P];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 7);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -679,14 +755,19 @@ fn stage_five_commits_only_what_stages_three_and_four_left() {
 
 #[test]
 fn a_block_whose_anchor_itself_repeats_is_never_committed() {
-    let lines: [&[u8]; 10] = [L0, L1, C0, L1, C0, L0, L1, C0, L1, C0];
+    let lines: [&[u8]; 10] = [H0, L1, C0, L1, C0, H0, L1, C0, L1, C0];
     let span = lines_span(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 10);
     assert_eq!(
         norm_block(&span, &units, 0, 5),
         norm_block(&span, &units, 5, 5),
         "the five-line candidate is a real repeat"
+    );
+    assert_ne!(
+        mask(&normalize(H0)),
+        mask(&normalize(L1)),
+        "the wall must not fire here: H0 masks differently from the anchor head"
     );
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -708,6 +789,34 @@ fn a_block_whose_anchor_itself_repeats_is_never_committed() {
 }
 
 #[test]
+fn a_block_whose_anchor_head_would_glue_to_a_mask_equal_neighbour_is_refused() {
+    let lines: [&[u8]; 10] = [L0, L1, C0, L1, C0, L0, L1, C0, L1, C0];
+    let span = lines_span(&lines);
+    let units = split_span(&span, UNICODE);
+    assert_eq!(units.len(), 10);
+    assert_eq!(
+        mask(&normalize(L0)),
+        mask(&normalize(L1)),
+        "the head of a two-line anchor masks equal to the line before it"
+    );
+    assert_eq!(
+        norm_block(&span, &units, 0, 5),
+        norm_block(&span, &units, 5, 5),
+        "the five-line candidate is a real repeat"
+    );
+    let mut ledger = new_ledger(&units);
+    let mut scratch = Scratch::default();
+    assert_eq!(
+        stage(&span, &mut ledger, &mut scratch),
+        StageStats::default(),
+        "every candidate head is walled off, so nothing commits"
+    );
+    assert_eq!(ledger.commits().len(), 0);
+    assert_eq!(ledger.residual().count(), units.len());
+    assert_eq!(apply(&span, &ledger), span);
+}
+
+#[test]
 fn a_unique_line_flood_degrades_to_pass_through() {
     let mut lines: Vec<Vec<u8>> = vec![L0.to_vec(), L1.to_vec(), L0P.to_vec(), L1P.to_vec()];
     for index in 0..200_000u32 {
@@ -718,7 +827,7 @@ fn a_unique_line_flood_degrades_to_pass_through() {
     }
     let borrowed: Vec<&[u8]> = lines.iter().map(|line| line.as_slice()).collect();
     let span = lines_span(&borrowed);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 200_004);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -733,7 +842,7 @@ fn a_unique_line_flood_degrades_to_pass_through() {
     assert!(scratch.degraded());
     let control: [&[u8]; 8] = [H0, H1, L0, L1, L0P, L1P, L0Q, L1Q];
     let control_span = lines_span(&control);
-    let control_units = split_span(&control_span);
+    let control_units = split_span(&control_span, UNICODE);
     let mut control_ledger = new_ledger(&control_units);
     assert_eq!(
         stage(&control_span, &mut control_ledger, &mut scratch).block_repeats,
@@ -747,7 +856,7 @@ fn a_periodic_payload_stays_within_the_capped_work_bound() {
     let period = MAX_BLOCK_LINES as usize * 2 + 1;
     let lines = 40_000;
     let span = periodic_span(period, lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), lines);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -770,7 +879,7 @@ fn a_periodic_payload_stays_within_the_capped_work_bound() {
         work.compares + work.scanned
     );
     let short = periodic_span(period, lines / 2);
-    let short_units = split_span(&short);
+    let short_units = split_span(&short, UNICODE);
     let mut short_ledger = new_ledger(&short_units);
     let mut short_scratch = Scratch::default();
     assert_eq!(
@@ -787,7 +896,7 @@ fn a_periodic_payload_stays_within_the_capped_work_bound() {
     let mut tail_span = lines_span(&[L0, L1, L0P, L1P]);
     tail_span.extend_from_slice(br"\n");
     tail_span.extend_from_slice(&periodic_span(period, 2000));
-    let tail_units = split_span(&tail_span);
+    let tail_units = split_span(&tail_span, UNICODE);
     assert_eq!(tail_units.len(), 2004);
     let mut tail_ledger = new_ledger(&tail_units);
     let mut tail_scratch = Scratch::default();
@@ -805,7 +914,7 @@ fn a_periodic_payload_stays_within_the_capped_work_bound() {
 #[test]
 fn repeated_blocks_is_deterministic() {
     let span = generated_span(60, 0x5eed_1234_abcd_0303);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let mut scratch = Scratch::default();
@@ -827,7 +936,7 @@ fn repeated_blocks_is_deterministic() {
         assert_removal_invariant(&units, commit);
     }
     let other_span = generated_span(60, 0x0f0f_0f0f_0f0f_0f0f);
-    let other_units = split_span(&other_span);
+    let other_units = split_span(&other_span, UNICODE);
     let mut third = new_ledger(&other_units);
     let mut fourth = new_ledger(&other_units);
     assert_eq!(
@@ -840,7 +949,7 @@ fn repeated_blocks_is_deterministic() {
 #[test]
 fn the_scratch_holds_each_residual_unit_once() {
     let span = generated_span(50, 0x1234_5678_9abc_def0);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let widest = units.iter().map(|unit| unit.range.len()).max().unwrap();
     let normalized: usize = units
         .iter()
@@ -856,7 +965,7 @@ fn the_scratch_holds_each_residual_unit_once() {
     assert!(arena <= 2 * span.len());
     let small: [&[u8]; 4] = [L0, L1, L0, L1];
     let small_span = lines_span(&small);
-    let small_units = split_span(&small_span);
+    let small_units = split_span(&small_span, UNICODE);
     let mut small_ledger = new_ledger(&small_units);
     assert_eq!(
         stage(&small_span, &mut small_ledger, &mut scratch).block_repeats,
@@ -874,14 +983,14 @@ fn the_scratch_holds_each_residual_unit_once() {
 fn empty_narrow_and_wall_spans_commit_nothing() {
     let mut scratch = Scratch::default();
     let empty: &[u8] = b"";
-    let units = split_span(empty);
+    let units = split_span(empty, UNICODE);
     let mut ledger = new_ledger(&units);
     assert_eq!(
         stage(empty, &mut ledger, &mut scratch),
         StageStats::default()
     );
     let single: &[u8] = br"only one line here";
-    let units = split_span(single);
+    let units = split_span(single, UNICODE);
     let mut ledger = new_ledger(&units);
     assert_eq!(
         stage(single, &mut ledger, &mut scratch),
@@ -889,14 +998,14 @@ fn empty_narrow_and_wall_spans_commit_nothing() {
     );
     let pair: [&[u8]; 2] = [L0, L0];
     let span = lines_span(&pair);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     assert_eq!(
         stage(&span, &mut ledger, &mut scratch),
         StageStats::default()
     );
     let wall = vec![b'z'; MAX_LINE_BYTES + 1];
-    let units = split_span(&wall);
+    let units = split_span(&wall, UNICODE);
     assert_eq!(units.len(), 1);
     assert!(!units[0].eligible);
     let mut ledger = new_ledger(&units);

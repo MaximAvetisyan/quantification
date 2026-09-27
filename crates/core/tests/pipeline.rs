@@ -9,6 +9,7 @@ use quantification_core::config::{
 use quantification_core::fingerprint::marker_checksum;
 use quantification_core::ledger::{Commit, CommitKind, framing};
 use quantification_core::pipeline::{ALGO_VERSION, Clock, Compressor, MonotonicClock, Stats};
+use quantification_core::stage1::carries_marker;
 
 const CHAT_CORPUS: &[&str] = &[
     "schemas/chat-minified.json",
@@ -706,6 +707,70 @@ fn a_block_whose_anchor_hides_a_shorter_period_is_not_a_fixed_point_of_itself() 
     assert!(once.payload.len() < payload.len());
 }
 
+#[test]
+fn two_markers_with_all_decimal_checksums_are_never_merged() {
+    const FIRST: &str = "2026-08-25T22:11:43Z INFO hc 10.0.0.1 GET /v1/users?id=45 took 45ms";
+    const SECOND: &str = "2026-08-25T22:31:45Z INFO hc 10.0.0.1 GET /v1/users?id=20 took 20ms";
+    assert_eq!(marker_checksum(FIRST.as_bytes()), 0x5161);
+    assert_eq!(marker_checksum(SECOND.as_bytes()), 0x9616);
+    let lines = [
+        FIRST.to_string(),
+        FIRST.to_string(),
+        FIRST.to_string(),
+        SECOND.to_string(),
+        SECOND.to_string(),
+        SECOND.to_string(),
+    ];
+    let payload = doc(&[("user", &joined(&lines))]);
+    let once = compress(&payload, &defaults());
+    assert_eq!(once.commits.len(), 2, "two exact runs");
+    assert!(
+        once.commits
+            .iter()
+            .all(|commit| commit.kind == CommitKind::ExactRun && commit.count == 2)
+    );
+    let rendered = text(&once.payload);
+    assert!(
+        rendered.contains("[... x2 identical 5161 ...]")
+            && rendered.contains("[... x2 identical 9616 ...]"),
+        "both markers carry an all-decimal checksum, so their masked forms collide: {rendered}"
+    );
+    let twice = compress(&once.payload, &defaults());
+    assert_eq!(
+        twice.payload, once.payload,
+        "a marker-bearing line is never a candidate, so pass 2 == pass 1"
+    );
+    assert_eq!(twice.commits.len(), 0, "no second-pass commit");
+    assert_eq!(twice.stats.groups_collapsed, 0);
+}
+
+#[test]
+fn a_commit_whose_anchor_head_would_glue_to_a_template_equal_neighbour_is_a_fixed_point() {
+    const LINES: [&str; 5] = [
+        "2026-08-25T11,0:02Z INFO db 1&02 ok",
+        "2026-08-25T11,00:02Z INFO db 10.1&0.2 ok",
+        "2026-08-25T11:1.1&0.2 ok",
+        "2026-08-25T11,00:02Z INFO db 10.1&0.2 ok",
+        "2026-08-25T11:1.1&0.2 ok",
+    ];
+    let payload = LINES.join(r"\n").into_bytes();
+    let once = compress(&payload, &defaults());
+    assert_eq!(
+        once.commits.len(),
+        1,
+        "the two-line block at units 1..4 is walled off"
+    );
+    assert_eq!(once.commits[0].kind, CommitKind::TemplatedBlock);
+    assert_eq!((once.commits[0].first, once.commits[0].last), (0, 1));
+    let twice = compress(&once.payload, &defaults());
+    assert_eq!(
+        twice.payload, once.payload,
+        "the anchor head carries its own marker, so pass 2 finds nothing"
+    );
+    assert_eq!(twice.commits.len(), 0);
+    assert_eq!(twice.stats.groups_collapsed, 0);
+}
+
 struct Rng(u64);
 
 impl Rng {
@@ -789,18 +854,8 @@ fn generated_payloads(count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn output_offset(at: usize, commits: &[Commit]) -> usize {
-    let mut out = at;
-    for commit in commits {
-        if commit.removed.end <= at {
-            out -= commit.removed.len() - commit.anchor.len();
-        }
-    }
-    out
-}
-
 #[test]
-fn generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_anchor() {
+fn every_generated_log_burst_is_a_fixed_point() {
     let opts = defaults();
     let payloads = generated_payloads(GENERATED_BURSTS);
     let mut compressor = Compressor::new();
@@ -809,40 +864,22 @@ fn generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_a
     for payload in &payloads {
         compressor.compress(payload, &opts, &mut out);
         let once = out.clone();
-        let first = compressor.commits().to_vec();
         if once.len() < payload.len() {
             compressed += 1;
         }
         compressor.compress(&once, &opts, &mut out);
         let twice = out.clone();
-        if twice == once {
-            continue;
-        }
-        divergent += 1;
-        let anchors: Vec<(usize, usize)> = first
-            .iter()
-            .map(|commit| {
-                (
-                    output_offset(commit.anchor.start, &first),
-                    output_offset(commit.anchor.end, &first),
-                )
-            })
-            .collect();
-        assert!(
-            !compressor.commits().is_empty(),
-            "a divergence must come from a group, not from nothing"
-        );
-        for commit in compressor.commits() {
+        if twice != once {
+            divergent += 1;
+            let commit = &compressor.commits()[0];
             let removed = &once[commit.removed.clone()];
-            let marker = removed.windows(5).any(|window| window == b" ...]");
-            let anchor = anchors
-                .iter()
-                .any(|(start, end)| commit.removed.start < *end && *start < commit.removed.end);
-            assert!(
-                marker || anchor,
-                "a second pass may only merge over an emitted marker or an anchor, got {:?} over {:?}",
+            panic!(
+                "{} of {} payloads are not fixed points: {:?} over {:?} with anchor {:?}",
+                divergent,
+                payloads.len(),
                 commit.kind,
-                text(&removed[..removed.len().min(120)])
+                text(&removed[..removed.len().min(160)]),
+                text(&once[commit.anchor.clone()]),
             );
         }
         compressor.compress(&twice, &opts, &mut out);
@@ -851,14 +888,16 @@ fn generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_a
             "every payload must reach a fixed point within two recompressions"
         );
     }
-    assert!(
-        compressed * 2 >= payloads.len(),
-        "only {compressed} of {} generated payloads compressed: the corpus is not exercising the stages",
+    assert_eq!(
+        divergent,
+        0,
+        "{} of {} generated payloads are not fixed points",
+        divergent,
         payloads.len()
     );
     assert!(
-        divergent * 100 <= payloads.len() * 5,
-        "{divergent} of {} generated payloads are not fixed points (3.15% measured, 5% ceiling)",
+        compressed * 2 >= payloads.len(),
+        "only {compressed} of {} generated payloads compressed: the corpus is not exercising the stages",
         payloads.len()
     );
 }
@@ -878,6 +917,29 @@ fn prior_marker_text_round_trips_untouched() {
         );
     }
     assert_eq!(run.stats.templated_blocks, 1);
+    for marker in [
+        "\u{27ea}\u{d7}200 identical \u{b7}c5f3\u{27eb}",
+        "\u{27ea}block \u{d7}12 \u{b7}d4e5\u{27eb}",
+    ] {
+        assert!(
+            carries_marker(marker.as_bytes(), MarkerStyle::Unicode),
+            "a unicode marker in a unicode span is never groupable"
+        );
+    }
+    assert!(
+        !carries_marker(
+            "[... x50 rows, template 0abc ...]".as_bytes(),
+            MarkerStyle::Unicode
+        ),
+        "an ascii marker in a unicode span is not one of ours, so this span keeps it eligible"
+    );
+    assert!(
+        carries_marker(
+            "[... x50 rows, template 0abc ...]".as_bytes(),
+            MarkerStyle::Ascii
+        ),
+        "the same bytes are a marker under the ascii style"
+    );
     let again = compress(&run.payload, &defaults());
     assert_eq!(
         again.payload, run.payload,
@@ -1051,12 +1113,12 @@ fn the_options_echo_is_the_resolved_canonical_json() {
         normalize_ws: Some(false),
         template_dedup: Some(false),
         marker_style: Some(MarkerStyle::Ascii),
-        reversible: Some(true),
+        reversible: Some(false),
     });
     let run = compress(&fixture("schemas/chat-minified.json"), &opts);
     assert_eq!(
         run.stats.options_echo,
-        r#"{"scope_policy":"user_and_tools","min_group_size":7,"normalize_ws":false,"template_dedup":false,"marker_style":"ascii","reversible":true}"#
+        r#"{"scope_policy":"user_and_tools","min_group_size":7,"normalize_ws":false,"template_dedup":false,"marker_style":"ascii","reversible":false}"#
     );
 }
 
@@ -1136,27 +1198,25 @@ fn each_span_renders_in_its_own_resolved_style() {
 }
 
 #[test]
-fn reversible_is_echoed_but_still_not_honoured() {
+fn reversible_true_is_rejected() {
+    assert_eq!(
+        resolve(&RawOptions {
+            reversible: Some(true),
+            ..RawOptions::default()
+        }),
+        Err(ResolveError::UnsupportedReversible)
+    );
     let payload = doc(&[("user", &joined(&log_burst(6)))]);
     let off = options(&RawOptions {
         reversible: Some(false),
         ..RawOptions::default()
     });
-    let on = options(&RawOptions {
-        reversible: Some(true),
-        ..RawOptions::default()
-    });
-    let without = compress(&payload, &off);
-    let with = compress(&payload, &on);
-    assert_eq!(with.payload, without.payload);
-    assert_eq!(with.commits, without.commits);
+    let run = compress(&payload, &off);
+    assert_eq!(run.payload, compress(&payload, &defaults()).payload);
     assert!(
-        without
-            .stats
-            .options_echo
-            .ends_with(r#""reversible":false}"#)
+        run.stats.options_echo.ends_with(r#""reversible":false}"#),
+        "an affirmative false promise is the only promise made"
     );
-    assert!(with.stats.options_echo.ends_with(r#""reversible":true}"#));
 }
 
 // ---------------------------------------------------------------- determinism of the plumbing
@@ -1307,6 +1367,7 @@ fn the_pipeline_module_has_no_forbidden_determinism_inputs() {
         "resolve_style",
         "Ledger::new",
         "split_span_counted",
+        "Forms::build",
         "exact_runs",
         "ws_runs",
         "repeated_blocks",
@@ -1322,9 +1383,10 @@ fn the_pipeline_module_has_no_forbidden_determinism_inputs() {
         );
     }
     let call_sites = [
-        "stage1::split_span_counted(bytes)",
+        "stage1::split_span_counted(bytes",
         "exact::exact_runs(",
         "wsruns::ws_runs(",
+        "templ::Forms::build(",
         "blocks::repeated_blocks(",
         "templ::template_groups(",
         "templ_blocks::templated_blocks(",
@@ -1335,7 +1397,7 @@ fn the_pipeline_module_has_no_forbidden_determinism_inputs() {
         .collect();
     assert!(
         order.windows(2).all(|pair| pair[0] < pair[1]),
-        "stages 1/1b, 3, 4, 5, 6 and 7 are called in normative order"
+        "stages 1/1b, 3, 4, the masked pre-pass, 5, 6 and 7 run in normative order"
     );
     let at = |site: &str| source.find(site).unwrap_or_else(|| panic!("{site}"));
     assert!(

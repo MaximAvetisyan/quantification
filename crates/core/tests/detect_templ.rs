@@ -38,6 +38,29 @@ fn new_ledger<'a>(units: &'a [Unit]) -> Ledger<'a> {
     Ledger::new(units, UNICODE)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Six {
+    stats: StageStats,
+    forms: Forms,
+    degraded: bool,
+}
+
+fn six(span: &[u8], ledger: &mut Ledger<'_>, min_group_size: u32, scratch: &mut Scratch) -> Six {
+    let Some(forms) = Forms::build(span, ledger.units(), scratch) else {
+        return Six {
+            stats: StageStats::default(),
+            forms: Forms::default(),
+            degraded: true,
+        };
+    };
+    let stats = template_groups(&forms, ledger, min_group_size);
+    Six {
+        stats,
+        forms,
+        degraded: false,
+    }
+}
+
 fn span_with(sep: &[u8], lines: &[&[u8]]) -> Vec<u8> {
     let mut span = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -159,7 +182,7 @@ fn generated_span(lines: usize) -> Vec<u8> {
 #[test]
 fn a_log_burst_collapses_to_one_representative_and_a_marker() {
     let span = span_with(br"\n", &[L0, L1, L2]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 3);
     let mut exact = new_ledger(&units);
     let mut ws = new_ledger(&units);
@@ -174,7 +197,7 @@ fn a_log_burst_collapses_to_one_representative_and_a_marker() {
 
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert!(!out.degraded);
     assert_eq!(out.stats.template_groups, 1);
     assert_eq!(out.stats.groups_collapsed, 1);
@@ -199,10 +222,10 @@ fn a_log_burst_collapses_to_one_representative_and_a_marker() {
 #[test]
 fn the_anchor_is_the_raw_original_bytes_never_the_masked_form() {
     let span = span_with(br"\n", &[L0, L1, L2]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     let anchor = &span[ledger.commits()[0].anchor.clone()];
     assert_eq!(anchor, L0);
     assert!(anchor.starts_with(b"2026-08-26T10:00:00Z"));
@@ -220,10 +243,10 @@ fn the_anchor_is_the_raw_original_bytes_never_the_masked_form() {
 #[test]
 fn a_group_below_min_group_size_stays_verbatim_and_still_gets_template_ids() {
     let span = span_with(br"\n", &[L0, L1]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats, StageStats::default());
     assert!(!out.degraded);
     assert_eq!(ledger.commits().len(), 0);
@@ -242,7 +265,7 @@ fn a_group_below_min_group_size_stays_verbatim_and_still_gets_template_ids() {
     assert_eq!(out.forms.id(1), id_of(L1));
     assert!(out.forms.same(0, 1));
     assert_masked_domain_forms(&span, &units, &out.forms);
-    let again = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let again = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(again.stats, StageStats::default());
     assert_eq!(again.forms, out.forms);
 }
@@ -250,12 +273,12 @@ fn a_group_below_min_group_size_stays_verbatim_and_still_gets_template_ids() {
 #[test]
 fn min_group_size_bounds_the_smallest_template_group() {
     let pair = span_with(br"\n", &[L0, L1]);
-    let units = split_span(&pair);
+    let units = split_span(&pair, UNICODE);
     for min in [3, 4, 9] {
         let mut ledger = new_ledger(&units);
         let mut scratch = Scratch::default();
         assert_eq!(
-            template_groups(&pair, &mut ledger, min, &mut scratch).stats,
+            six(&pair, &mut ledger, min, &mut scratch).stats,
             StageStats::default(),
             "min {min}"
         );
@@ -265,7 +288,7 @@ fn min_group_size_bounds_the_smallest_template_group() {
         let mut ledger = new_ledger(&units);
         let mut scratch = Scratch::default();
         assert_eq!(
-            template_groups(&pair, &mut ledger, min, &mut scratch)
+            six(&pair, &mut ledger, min, &mut scratch)
                 .stats
                 .template_groups,
             1,
@@ -281,11 +304,11 @@ fn min_group_size_bounds_the_smallest_template_group() {
 fn a_group_the_profitability_gate_rejects_stays_verbatim_and_keeps_its_ids() {
     let narrow: [&[u8]; 3] = [b"a 1", b"a 2", b"a 3"];
     let span = span_with(br"\n", &narrow);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(mask(&normalize(narrow[0])), b"a <num>");
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats, StageStats::default());
     assert!(!profitable(UNICODE, CommitKind::TemplateGroup, 2, 3, 13));
     assert!(ledger.is_free(0..3));
@@ -299,10 +322,10 @@ fn a_group_the_profitability_gate_rejects_stays_verbatim_and_keeps_its_ids() {
 #[test]
 fn leftmost_first_commit_order_with_an_intervening_line() {
     let span = span_with(br"\n", &[L0, L1, L2, ERROR_LINE, L3, L4, L5]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats.template_groups, 2);
     assert_eq!(ledger.commits().len(), 2);
     assert_eq!(
@@ -355,13 +378,13 @@ fn leftmost_first_commit_order_with_an_intervening_line() {
 #[test]
 fn a_template_group_never_straddles_a_committed_region() {
     let span = span_with(br"\n", &[L0, L2, L2, L1, L2, L3]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 6);
     assert_eq!(mask(&normalize(&span[units[5].range.clone()])), MASKED_INFO);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
     assert_eq!(exact_runs(&span, &mut ledger, 2).exact_runs, 1);
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats.template_groups, 1);
     assert_eq!(
         ledger
@@ -415,11 +438,11 @@ fn an_over_cap_record_wall_splits_template_groups() {
     }
     span.push(b']');
     assert!(span.len() > MAX_LINE_BYTES);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 401);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats.template_groups, 2);
     assert_eq!(
         ledger
@@ -455,11 +478,11 @@ fn every_unit_gets_a_masked_form_and_a_template_id() {
         br"\n",
         &[L0, L1, L2, DEBUG_LINE, DEBUG_LINE, DEBUG_LINE, ERROR_LINE],
     );
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
     assert_eq!(exact_runs(&span, &mut ledger, 3).exact_runs, 1);
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats.template_groups, 1);
     assert_eq!(ledger.commits().len(), 2);
     assert_eq!(
@@ -513,13 +536,13 @@ fn every_unit_gets_a_masked_form_and_a_template_id() {
 fn template_ids_are_content_derived_and_deterministic() {
     let lines: [&[u8]; 5] = [L0, L1, ERROR_LINE, L2, L3];
     let span = span_with(br"\n", &lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let mut scratch = Scratch::default();
     let mut other = Scratch::with_capacity(0, 0);
-    let left = template_groups(&span, &mut first, 3, &mut scratch);
-    let right = template_groups(&span, &mut second, 3, &mut other);
+    let left = six(&span, &mut first, 3, &mut scratch);
+    let right = six(&span, &mut second, 3, &mut other);
     assert_eq!(left.forms, right.forms);
     assert_eq!(left.stats, right.stats);
     assert_eq!(first.commits(), second.commits());
@@ -530,9 +553,9 @@ fn template_ids_are_content_derived_and_deterministic() {
     let order = [4usize, 2, 0, 3, 1];
     let permuted: Vec<&[u8]> = order.iter().map(|index| lines[*index]).collect();
     let shuffled = span_with(br"\n", &permuted);
-    let shuffled_units = split_span(&shuffled);
+    let shuffled_units = split_span(&shuffled, UNICODE);
     let mut ledger = new_ledger(&shuffled_units);
-    let other_forms = template_groups(&shuffled, &mut ledger, 3, &mut other).forms;
+    let other_forms = six(&shuffled, &mut ledger, 3, &mut other).forms;
     assert_eq!(other_forms.len(), left.forms.len());
     for (slot, source) in order.iter().enumerate() {
         assert_eq!(other_forms.id(slot), left.forms.id(*source), "slot {slot}");
@@ -554,10 +577,10 @@ fn a_span_of_all_distinct_templates_is_a_no_op() {
     let lines: Vec<String> = (0..count).map(distinct_shape).collect();
     let borrowed: Vec<&[u8]> = lines.iter().map(|line| line.as_bytes()).collect();
     let span = span_with(br"\n", &borrowed);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert!(!out.degraded);
     assert_eq!(out.stats, StageStats::default());
     assert_eq!(ledger.commits().len(), 0);
@@ -585,11 +608,11 @@ fn a_full_fingerprint_table_degrades_the_span_to_pass_through() {
         span.extend_from_slice(distinct_shape(index).as_bytes());
     }
     assert!(span.len() >= MAX_SLOTS * 8 && span.len() < MAX_SLOTS * 16);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), count);
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert!(out.degraded);
     assert_eq!(out.stats, StageStats::default());
     assert_eq!(out.forms, Forms::default());
@@ -599,9 +622,9 @@ fn a_full_fingerprint_table_degrades_the_span_to_pass_through() {
     assert_eq!(apply(&span, &ledger), span);
 
     let repeated = repeated_lines(count, &distinct_shape(0));
-    let repeated_units = split_span(&repeated);
+    let repeated_units = split_span(&repeated, UNICODE);
     let mut wide = new_ledger(&repeated_units);
-    let flood = template_groups(&repeated, &mut wide, 3, &mut scratch);
+    let flood = six(&repeated, &mut wide, 3, &mut scratch);
     assert!(
         !flood.degraded,
         "one distinct template cannot fill the table"
@@ -617,28 +640,28 @@ fn a_full_fingerprint_table_degrades_the_span_to_pass_through() {
 fn empty_single_unit_and_over_cap_spans_commit_nothing() {
     let mut scratch = Scratch::default();
     let empty: &[u8] = b"";
-    let empty_units = split_span(empty);
+    let empty_units = split_span(empty, UNICODE);
     let mut ledger = new_ledger(&empty_units);
-    let out = template_groups(empty, &mut ledger, 3, &mut scratch);
+    let out = six(empty, &mut ledger, 3, &mut scratch);
     assert!(!out.degraded);
     assert_eq!(out.stats, StageStats::default());
     assert!(out.forms.is_empty());
     assert_eq!(out.forms.len(), 0);
 
     let single = br"only one line 2026-08-26T10:00:00Z";
-    let single_units = split_span(single);
+    let single_units = split_span(single, UNICODE);
     let mut ledger = new_ledger(&single_units);
-    let out = template_groups(single, &mut ledger, 3, &mut scratch);
+    let out = six(single, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats, StageStats::default());
     assert_eq!(out.forms.len(), 1);
     assert_eq!(out.forms.masked(0), b"only one line <ts>");
 
     let wall = vec![b'z'; MAX_LINE_BYTES + 1];
-    let wall_units = split_span(&wall);
+    let wall_units = split_span(&wall, UNICODE);
     assert_eq!(wall_units.len(), 1);
     assert!(!wall_units[0].eligible);
     let mut ledger = new_ledger(&wall_units);
-    let out = template_groups(&wall, &mut ledger, 3, &mut scratch);
+    let out = six(&wall, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats, StageStats::default());
     assert_eq!(out.forms.len(), 1);
     assert_eq!(out.forms.masked(0), &wall[..]);
@@ -660,11 +683,11 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
         .collect();
     let borrowed: Vec<&[u8]> = many.iter().map(|line| line.as_bytes()).collect();
     let span = span_with(br"\n", &borrowed);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let widest = units.iter().map(|unit| unit.range.len()).max().unwrap();
     let mut scratch = Scratch::with_capacity(widest, widest);
     let mut ledger = new_ledger(&units);
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert!(
         out.stats.template_groups > 3,
         "the generator produced no groups"
@@ -674,20 +697,18 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
         br"\n",
         &[many[0].as_bytes(), many[1].as_bytes(), many[2].as_bytes()],
     );
-    let few_units = split_span(&few);
+    let few_units = split_span(&few, UNICODE);
     let mut small = new_ledger(&few_units);
     assert_eq!(
-        template_groups(&few, &mut small, 3, &mut scratch)
-            .stats
-            .template_groups,
+        six(&few, &mut small, 3, &mut scratch).stats.template_groups,
         1
     );
     assert_eq!(scratch.reserved(), (widest, widest));
     let mut grown = Scratch::default();
     let mut other = new_ledger(&units);
-    let other_out = template_groups(&span, &mut other, 3, &mut grown);
+    let other_out = six(&span, &mut other, 3, &mut grown);
     let mut reference = new_ledger(&units);
-    let reference_out = template_groups(&span, &mut reference, 3, &mut scratch);
+    let reference_out = six(&span, &mut reference, 3, &mut scratch);
     assert_eq!(other_out, reference_out);
     assert_eq!(other.commits(), ledger.commits());
     assert!(grown.reserved().0 <= 2 * widest);
@@ -697,7 +718,7 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
 #[test]
 fn template_groups_are_deterministic_over_a_generated_span() {
     let span = generated_span(400);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut exact = new_ledger(&units);
     let mut ws = new_ledger(&units);
     let mut ws_scratch = WsScratch::default();
@@ -710,8 +731,8 @@ fn template_groups_are_deterministic_over_a_generated_span() {
     let mut second = new_ledger(&units);
     let mut scratch = Scratch::default();
     let mut other = Scratch::with_capacity(0, 0);
-    let left = template_groups(&span, &mut first, 3, &mut scratch);
-    let right = template_groups(&span, &mut second, 3, &mut other);
+    let left = six(&span, &mut first, 3, &mut scratch);
+    let right = six(&span, &mut second, 3, &mut other);
     assert_eq!(left.forms, right.forms);
     assert_eq!(left.stats, right.stats);
     assert!(
@@ -745,7 +766,7 @@ fn template_groups_are_deterministic_over_a_generated_span() {
     for commit in first.commits() {
         assert_removal_invariant(&units, commit);
     }
-    let again = template_groups(&span, &mut first, 3, &mut scratch);
+    let again = six(&span, &mut first, 3, &mut scratch);
     assert_eq!(again.stats, StageStats::default());
     assert_eq!(again.forms, left.forms);
     assert_eq!(first.commits(), second.commits());
@@ -754,14 +775,14 @@ fn template_groups_are_deterministic_over_a_generated_span() {
 #[test]
 fn a_template_group_is_committed_through_the_ledger_gate() {
     let span = span_with(br"\n", &[L0, L1, L2]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     assert!(matches!(
         ledger.try_commit(Proposal::run(1..3, CommitKind::TemplateGroup)),
         CommitOutcome::Committed(_)
     ));
     let mut scratch = Scratch::default();
-    let out = template_groups(&span, &mut ledger, 3, &mut scratch);
+    let out = six(&span, &mut ledger, 3, &mut scratch);
     assert_eq!(out.stats, StageStats::default());
     assert_eq!(ledger.commits().len(), 1);
     assert_eq!(ledger.commits()[0].first, 1);

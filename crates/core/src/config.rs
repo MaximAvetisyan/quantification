@@ -85,6 +85,7 @@ pub struct ResolvedOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
     UnsupportedScopePolicy(ScopePolicy),
+    UnsupportedReversible,
     MinGroupSizeBelowTwo(u32),
 }
 
@@ -101,6 +102,9 @@ pub fn resolve(raw: &RawOptions) -> Result<ResolvedOptions, ResolveError> {
         Some(1) => return Err(ResolveError::MinGroupSizeBelowTwo(1)),
         Some(n) => n,
     };
+    if raw.reversible == Some(true) {
+        return Err(ResolveError::UnsupportedReversible);
+    }
     Ok(ResolvedOptions {
         scope_policy,
         min_group_size,
@@ -224,7 +228,7 @@ mod tests {
             normalize_ws: Some(false),
             template_dedup: Some(false),
             marker_style: Some(MarkerStyle::Unicode),
-            reversible: Some(true),
+            reversible: Some(false),
         };
         let resolved = resolve(&raw).unwrap();
         assert_eq!(
@@ -235,13 +239,31 @@ mod tests {
                 normalize_ws: false,
                 template_dedup: false,
                 marker_style: MarkerStyle::Unicode,
-                reversible: true,
+                reversible: false,
             }
         );
         assert_eq!(
             resolved.options_echo(),
-            "{\"scope_policy\":\"user_and_tools\",\"min_group_size\":7,\"normalize_ws\":false,\"template_dedup\":false,\"marker_style\":\"unicode\",\"reversible\":true}"
+            "{\"scope_policy\":\"user_and_tools\",\"min_group_size\":7,\"normalize_ws\":false,\"template_dedup\":false,\"marker_style\":\"unicode\",\"reversible\":false}"
         );
+    }
+
+    #[test]
+    fn reversible_true_is_rejected_and_false_resolves() {
+        assert_eq!(
+            resolve(&RawOptions {
+                reversible: Some(true),
+                ..RawOptions::default()
+            }),
+            Err(ResolveError::UnsupportedReversible)
+        );
+        let off = resolve(&RawOptions {
+            reversible: Some(false),
+            ..RawOptions::default()
+        })
+        .unwrap();
+        assert!(!off.reversible);
+        assert!(off.options_echo().ends_with(r#""reversible":false}"#));
     }
 
     #[test]

@@ -444,7 +444,7 @@ fn every_option_reaches_the_echo_in_the_section_six_one_order() {
                 normalize_ws: Some(false),
                 template_dedup: Some(false),
                 marker_style: Some(MarkerStyle::Unicode),
-                reversible: Some(true),
+                reversible: Some(false),
             },
         ),
     );
@@ -456,7 +456,7 @@ fn every_option_reaches_the_echo_in_the_section_six_one_order() {
         stats.options_echo,
         concat!(
             r#"{"scope_policy":"user_and_tools","min_group_size":7,"normalize_ws":false,"#,
-            r#""template_dedup":false,"marker_style":"unicode","reversible":true}"#
+            r#""template_dedup":false,"marker_style":"unicode","reversible":false}"#
         )
     );
 }
@@ -620,22 +620,38 @@ fn a_reserved_option_is_an_options_error_and_not_a_degrade() {
 }
 
 #[test]
-fn reversible_is_accepted_and_echoed_but_still_changes_nothing() {
+fn reversible_true_is_refused_and_false_echoes_false() {
     let payload = chat(&log_lines(4));
-    let (with, stats) = compress(
+    assert_eq!(
+        error_of(
+            &payload,
+            &request(
+                None,
+                RawOptions {
+                    reversible: Some(true),
+                    ..defaults()
+                },
+            ),
+        ),
+        ApiError::Options(ResolveError::UnsupportedReversible)
+    );
+    let (out, stats) = compress(
         &payload,
         &request(
             None,
             RawOptions {
-                reversible: Some(true),
+                reversible: Some(false),
                 ..defaults()
             },
         ),
     );
     let (without, _) = compress(&payload, &Request::default());
-    assert_eq!(with, without);
-    assert!(stats.options_echo.ends_with(r#""reversible":true}"#));
-    assert_eq!(stats.bytes_out, with.len() as u64);
+    assert_eq!(
+        out, without,
+        "reversible=false changes nothing and claims nothing"
+    );
+    assert!(stats.options_echo.ends_with(r#""reversible":false}"#));
+    assert_eq!(stats.bytes_out, out.len() as u64);
 }
 
 // ---------------------------------------------------------------- pass-through

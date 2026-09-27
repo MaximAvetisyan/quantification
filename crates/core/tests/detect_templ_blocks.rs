@@ -5,9 +5,11 @@ use quantification_core::config::{
 use quantification_core::detect::blocks::{Scratch as BlockScratch, repeated_blocks};
 use quantification_core::detect::exact::exact_runs;
 use quantification_core::detect::templ::{
-    Forms, Scratch as TemplScratch, Template, TemplateId, Templated, template_groups,
+    Forms, Scratch as TemplScratch, Template, TemplateId, template_groups,
 };
-use quantification_core::detect::templ_blocks::{Scratch as Stage7Scratch, templated_blocks};
+use quantification_core::detect::templ_blocks::{
+    Scratch as Stage7Scratch, templated_blocks as stage7,
+};
 use quantification_core::detect::wsruns::{Scratch as WsScratch, ws_runs};
 use quantification_core::fingerprint::fingerprint;
 use quantification_core::ledger::{
@@ -108,9 +110,45 @@ fn has(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn six(span: &[u8], ledger: &mut Ledger<'_>) -> Templated {
-    let mut scratch = TemplScratch::default();
-    template_groups(span, ledger, MIN_GROUP_SIZE_DEFAULT, &mut scratch)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Handoff {
+    stats: StageStats,
+    forms: Forms,
+    degraded: bool,
+}
+
+fn six(span: &[u8], ledger: &mut Ledger<'_>) -> Handoff {
+    six_with(span, ledger, &mut TemplScratch::default())
+}
+
+fn six_with(span: &[u8], ledger: &mut Ledger<'_>, scratch: &mut TemplScratch) -> Handoff {
+    let Some(forms) = Forms::build(span, ledger.units(), scratch) else {
+        return Handoff {
+            stats: StageStats::default(),
+            forms: Forms::default(),
+            degraded: true,
+        };
+    };
+    let stats = template_groups(&forms, ledger, MIN_GROUP_SIZE_DEFAULT);
+    Handoff {
+        stats,
+        forms,
+        degraded: false,
+    }
+}
+
+fn seven(
+    handoff: &Handoff,
+    ledger: &mut Ledger<'_>,
+    max: u32,
+    scratch: &mut Stage7Scratch,
+) -> StageStats {
+    stage7(
+        (!handoff.degraded).then_some(&handoff.forms),
+        ledger,
+        max,
+        scratch,
+    )
 }
 
 fn earlier_stages_refuse(span: &[u8], units: &[Unit]) {
@@ -130,9 +168,11 @@ fn earlier_stages_refuse(span: &[u8], units: &[Unit]) {
         ),
         StageStats::default()
     );
+    let forms = Forms::build(span, units, &mut TemplScratch::default());
     assert_eq!(
         repeated_blocks(
             span,
+            forms.as_ref(),
             &mut blocks,
             MIN_BLOCK_LINES,
             MAX_BLOCK_LINES,
@@ -263,8 +303,8 @@ fn hand_forms(parts: &[(&[u8], u64)]) -> Forms {
     Forms { bytes, units }
 }
 
-fn hand_templated(parts: &[(&[u8], u64)], degraded: bool) -> Templated {
-    Templated {
+fn hand_templated(parts: &[(&[u8], u64)], degraded: bool) -> Handoff {
+    Handoff {
         stats: StageStats::default(),
         forms: hand_forms(parts),
         degraded,
@@ -328,7 +368,7 @@ fn record_dump() -> (Vec<u8>, Vec<Unit>, usize, Vec<Vec<u8>>) {
     }
     span.push(b']');
     assert!(span.len() > MAX_LINE_BYTES);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), records.len());
     assert!(!units[wall].eligible);
     (span, units, wall, records)
@@ -337,7 +377,7 @@ fn record_dump() -> (Vec<u8>, Vec<Unit>, usize, Vec<Vec<u8>>) {
 #[test]
 fn an_access_log_burst_collapses_into_one_whole_block_anchor() {
     let (span, lines) = access_burst(3);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 9);
     earlier_stages_refuse(&span, &units);
 
@@ -372,7 +412,7 @@ fn an_access_log_burst_collapses_into_one_whole_block_anchor() {
         b"<ts> INFO pool <ip> conns <num> idle <num> took <dur>"
     );
 
-    let stats = templated_blocks(
+    let stats = seven(
         &handoff,
         &mut ledger,
         MAX_BLOCK_LINES,
@@ -411,7 +451,7 @@ fn an_access_log_burst_collapses_into_one_whole_block_anchor() {
 #[test]
 fn a_stack_trace_differing_only_in_addresses_collapses() {
     let (span, lines) = stack_span(3);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 9);
     earlier_stages_refuse(&span, &units);
 
@@ -443,7 +483,7 @@ fn a_stack_trace_differing_only_in_addresses_collapses() {
         b"at com.example.Svc.handle(Svc.java:<num>) pc=<num>x<hex>"
     );
 
-    let stats = templated_blocks(
+    let stats = seven(
         &handoff,
         &mut ledger,
         MAX_BLOCK_LINES,
@@ -471,7 +511,7 @@ fn a_stack_trace_differing_only_in_addresses_collapses() {
 #[test]
 fn an_interleaved_request_response_pair_collapses_at_period_two() {
     let (span, lines) = interleaved(3);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 6);
     let mut ledger = new_ledger(&units);
     let handoff = six(&span, &mut ledger);
@@ -483,7 +523,7 @@ fn an_interleaved_request_response_pair_collapses_at_period_two() {
     assert_ne!(handoff.forms.id(0), handoff.forms.id(1));
     assert_eq!(handoff.forms.id(0), handoff.forms.id(2));
 
-    let stats = templated_blocks(
+    let stats = seven(
         &handoff,
         &mut ledger,
         MAX_BLOCK_LINES,
@@ -511,7 +551,7 @@ fn an_interleaved_request_response_pair_collapses_at_period_two() {
 fn the_minimum_period_of_one_fires_on_a_single_adjacent_pair() {
     let lines = [get(1), get(2)];
     let span = join(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 2);
     let mut ledger = new_ledger(&units);
     let handoff = six(&span, &mut ledger);
@@ -520,7 +560,7 @@ fn the_minimum_period_of_one_fires_on_a_single_adjacent_pair() {
     assert!(!handoff.forms.is_empty());
 
     let mut work = Stage7Scratch::default();
-    let stats = templated_blocks(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work);
+    let stats = seven(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work);
     assert_eq!(stats.templated_blocks, 1);
     assert_eq!(ledger.commits().len(), 1);
     let commit = &ledger.commits()[0];
@@ -551,10 +591,10 @@ fn the_minimum_period_of_one_fires_on_a_single_adjacent_pair() {
 #[test]
 fn the_anchor_is_the_entire_raw_first_occurrence_with_its_values() {
     let (span, lines) = interleaved(2);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut ledger = new_ledger(&units);
     let handoff = six(&span, &mut ledger);
-    templated_blocks(
+    seven(
         &handoff,
         &mut ledger,
         MAX_BLOCK_LINES,
@@ -589,7 +629,7 @@ fn the_anchor_is_the_entire_raw_first_occurrence_with_its_values() {
 fn a_join_is_rejected_when_the_ids_match_but_the_masked_bytes_differ() {
     let lines = [get(1), reply(0), get(2), reply(1)];
     let span = join(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 4);
     let masked: Vec<Vec<u8>> = lines.iter().map(|line| mask(&normalize(line))).collect();
     let agreeing: Vec<(&[u8], u64)> = masked
@@ -610,7 +650,7 @@ fn a_join_is_rejected_when_the_ids_match_but_the_masked_bytes_differ() {
     assert!(!collided.forms.same(0, 2));
     let mut ledger = new_ledger(&units);
     let mut work = Stage7Scratch::default();
-    let stats = templated_blocks(&collided, &mut ledger, MAX_BLOCK_LINES, &mut work);
+    let stats = seven(&collided, &mut ledger, MAX_BLOCK_LINES, &mut work);
     assert_eq!(stats, StageStats::default());
     assert_eq!(ledger.commits().len(), 0);
     assert_eq!(ledger.residual().count(), 4);
@@ -624,7 +664,7 @@ fn a_join_is_rejected_when_the_ids_match_but_the_masked_bytes_differ() {
     let mut ledger = new_ledger(&units);
     let mut work = Stage7Scratch::default();
     assert_eq!(
-        templated_blocks(&agreeing, &mut ledger, MAX_BLOCK_LINES, &mut work).templated_blocks,
+        seven(&agreeing, &mut ledger, MAX_BLOCK_LINES, &mut work).templated_blocks,
         1
     );
     let commit = &ledger.commits()[0];
@@ -637,7 +677,7 @@ fn a_join_is_rejected_when_the_ids_match_but_the_masked_bytes_differ() {
 #[test]
 fn a_below_threshold_block_stays_verbatim() {
     let narrow = lines_span(&[b"a 1", b"a 2"]);
-    let units = split_span(&narrow);
+    let units = split_span(&narrow, UNICODE);
     assert_eq!(units.len(), 2);
     let mut ledger = new_ledger(&units);
     let handoff = six(&narrow, &mut ledger);
@@ -645,7 +685,7 @@ fn a_below_threshold_block_stays_verbatim() {
     assert_eq!(handoff.forms.masked(0), handoff.forms.masked(1));
     let mut work = Stage7Scratch::default();
     assert_eq!(
-        templated_blocks(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
+        seven(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
         StageStats::default()
     );
     assert!(!profitable(UNICODE, CommitKind::TemplatedBlock, 1, 3, 8));
@@ -657,11 +697,11 @@ fn a_below_threshold_block_stays_verbatim() {
 
     let lines = [get(1), get(2)];
     let wide = join(&lines);
-    let wide_units = split_span(&wide);
+    let wide_units = split_span(&wide, UNICODE);
     let mut wide_ledger = new_ledger(&wide_units);
     let handoff = six(&wide, &mut wide_ledger);
     assert_eq!(
-        templated_blocks(&handoff, &mut wide_ledger, MAX_BLOCK_LINES, &mut work).templated_blocks,
+        seven(&handoff, &mut wide_ledger, MAX_BLOCK_LINES, &mut work).templated_blocks,
         1
     );
     assert!(work.reserved() >= wide_units.len());
@@ -671,7 +711,7 @@ fn a_below_threshold_block_stays_verbatim() {
 fn a_degraded_stage_six_makes_stage_seven_a_no_op() {
     let lines = [get(1), reply(0), get(2), reply(1)];
     let span = join(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let masked: Vec<Vec<u8>> = lines.iter().map(|line| mask(&normalize(line))).collect();
     let parts: Vec<(&[u8], u64)> = masked
         .iter()
@@ -681,7 +721,7 @@ fn a_degraded_stage_six_makes_stage_seven_a_no_op() {
     let mut control = new_ledger(&units);
     let mut work = Stage7Scratch::default();
     assert_eq!(
-        templated_blocks(
+        seven(
             &hand_templated(&parts, false),
             &mut control,
             MAX_BLOCK_LINES,
@@ -697,7 +737,7 @@ fn a_degraded_stage_six_makes_stage_seven_a_no_op() {
     let handoff = six(&span, &mut ledger);
     assert!(!handoff.degraded);
     let mut fresh = Stage7Scratch::default();
-    let stats = templated_blocks(
+    let stats = seven(
         &hand_templated(&parts, true),
         &mut ledger,
         MAX_BLOCK_LINES,
@@ -726,13 +766,13 @@ fn the_leftmost_start_wins_then_the_longest_candidate() {
     lines.push(reply(4));
     lines.push(pool(7));
     let span = join(&lines);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 10);
     let mut ledger = new_ledger(&units);
     let handoff = six(&span, &mut ledger);
     assert_eq!(handoff.stats, StageStats::default());
     assert_eq!(
-        templated_blocks(
+        seven(
             &handoff,
             &mut ledger,
             MAX_BLOCK_LINES,
@@ -750,11 +790,11 @@ fn the_leftmost_start_wins_then_the_longest_candidate() {
 
     let tail = &lines[4..];
     let tail_span = join(tail);
-    let tail_units = split_span(&tail_span);
+    let tail_units = split_span(&tail_span, UNICODE);
     let mut tail_ledger = new_ledger(&tail_units);
     let handoff = six(&tail_span, &mut tail_ledger);
     assert_eq!(
-        templated_blocks(
+        seven(
             &handoff,
             &mut tail_ledger,
             MAX_BLOCK_LINES,
@@ -776,7 +816,7 @@ fn the_leftmost_start_wins_then_the_longest_candidate() {
 #[test]
 fn a_templated_block_never_straddles_a_committed_region() {
     let (span, _) = interleaved(4);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 8);
     let mut ledger = new_ledger(&units);
     assert!(matches!(
@@ -787,7 +827,7 @@ fn a_templated_block_never_straddles_a_committed_region() {
     assert_eq!(handoff.forms.id(1), handoff.forms.id(3));
     assert_eq!(handoff.forms.id(3), handoff.forms.id(5));
     assert_eq!(
-        templated_blocks(
+        seven(
             &handoff,
             &mut ledger,
             MAX_BLOCK_LINES,
@@ -820,13 +860,87 @@ fn a_templated_block_never_straddles_a_committed_region() {
     }
 }
 
+fn hexed(role: &str, run: usize, gap: &str) -> Vec<u8> {
+    format!("{role}{gap}{}", "9".repeat(run)).into_bytes()
+}
+
+#[test]
+fn a_two_unit_anchor_head_that_would_glue_to_a_template_equal_neighbour_is_refused() {
+    let walled: Vec<Vec<u8>> = vec![
+        hexed("a", 16, "  "),
+        hexed("a", 16, " "),
+        hexed("b", 98, " "),
+        hexed("a", 16, " "),
+        hexed("b", 98, " "),
+    ];
+    let span = join(&walled);
+    let units = split_span(&span, UNICODE);
+    assert_eq!(units.len(), 5);
+    let mut ledger = new_ledger(&units);
+    let handoff = six(&span, &mut ledger);
+    assert_eq!(handoff.stats, StageStats::default());
+    for (index, role) in [(0usize, b'a'), (1, b'a'), (2, b'b'), (3, b'a'), (4, b'b')] {
+        let mut form = vec![role];
+        form.extend_from_slice(b" <hex>");
+        assert_eq!(handoff.forms.masked(index), form, "unit {index}");
+    }
+    for (left, right) in [(0, 1), (1, 3), (2, 4)] {
+        assert!(
+            handoff.forms.same(left, right),
+            "{left} and {right} mask equal"
+        );
+    }
+    assert!(!handoff.forms.same(0, 2));
+    assert!(!profitable(UNICODE, CommitKind::TemplatedBlock, 1, 19, 39));
+    assert!(profitable(
+        UNICODE,
+        CommitKind::TemplatedBlock,
+        1,
+        18 + 2 + 100,
+        18 + 2 + 100 + 2 + 18 + 2 + 100
+    ));
+    assert_eq!(
+        seven(
+            &handoff,
+            &mut ledger,
+            MAX_BLOCK_LINES,
+            &mut Stage7Scratch::default()
+        ),
+        StageStats::default(),
+        "a profitable two-unit candidate is refused because its anchor head would glue"
+    );
+    assert_eq!(ledger.commits().len(), 0);
+    assert_eq!(apply(&span, &ledger), span);
+
+    let mut free = walled.clone();
+    free[0] = hexed("c", 16, "  ");
+    let span = join(&free);
+    let units = split_span(&span, UNICODE);
+    let mut ledger = new_ledger(&units);
+    let handoff = six(&span, &mut ledger);
+    assert_eq!(
+        seven(
+            &handoff,
+            &mut ledger,
+            MAX_BLOCK_LINES,
+            &mut Stage7Scratch::default()
+        )
+        .templated_blocks,
+        1,
+        "the same candidate commits once the neighbour masks differently"
+    );
+    let commit = &ledger.commits()[0];
+    assert_eq!((commit.first, commit.last, commit.count), (1, 4, 1));
+    assert_removal_invariant(&units, commit);
+}
+
 #[test]
 fn an_over_cap_record_wall_splits_templated_blocks() {
     let (span, units, wall, records) = record_dump();
     let mut ledger = new_ledger(&units);
     let handoff = six(&span, &mut ledger);
     assert_eq!(handoff.stats.template_groups, 0);
-    let stats = templated_blocks(
+    let stats = seven(
         &handoff,
         &mut ledger,
         MAX_BLOCK_LINES,
@@ -861,7 +975,7 @@ fn a_span_whose_table_filled_in_stage_six_passes_through_stage_seven() {
     for index in 0..count {
         push_line(&mut span, format!("{} row 7 42", tag(index)).as_bytes());
     }
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), count);
     let mut ledger = new_ledger(&units);
     let handoff = six(&span, &mut ledger);
@@ -869,7 +983,7 @@ fn a_span_whose_table_filled_in_stage_six_passes_through_stage_seven() {
     assert_eq!(handoff.stats, StageStats::default());
     assert!(handoff.forms.is_empty());
     let mut work = Stage7Scratch::default();
-    let stats = templated_blocks(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work);
+    let stats = seven(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work);
     assert_eq!(stats, StageStats::default());
     assert_eq!(
         work.work(),
@@ -884,21 +998,21 @@ fn a_span_whose_table_filled_in_stage_six_passes_through_stage_seven() {
 #[test]
 fn templated_blocks_are_deterministic_over_a_generated_span() {
     let span = generated_span(40);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 280);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let mut other = TemplScratch::with_capacity(0, 0);
     let left = six(&span, &mut first);
-    let right = template_groups(&span, &mut second, MIN_GROUP_SIZE_DEFAULT, &mut other);
+    let right = six_with(&span, &mut second, &mut other);
     assert_eq!(left.forms, right.forms);
     assert_eq!(left.stats, right.stats);
     assert_eq!(left.stats.template_groups, 40);
     assert_eq!(left.stats.groups_collapsed, 40);
     let mut wide = Stage7Scratch::with_capacity(units.len());
     let mut narrow = Stage7Scratch::default();
-    let left_stats = templated_blocks(&left, &mut first, MAX_BLOCK_LINES, &mut wide);
-    let right_stats = templated_blocks(&right, &mut second, MAX_BLOCK_LINES, &mut narrow);
+    let left_stats = seven(&left, &mut first, MAX_BLOCK_LINES, &mut wide);
+    let right_stats = seven(&right, &mut second, MAX_BLOCK_LINES, &mut narrow);
     assert_eq!(left_stats, right_stats);
     assert_eq!(left_stats.templated_blocks, 40);
     assert_eq!(left_stats.groups_collapsed, 40);
@@ -914,7 +1028,7 @@ fn templated_blocks_are_deterministic_over_a_generated_span() {
     for commit in first.commits() {
         assert_removal_invariant(&units, commit);
     }
-    let again = templated_blocks(&left, &mut first, MAX_BLOCK_LINES, &mut wide);
+    let again = seven(&left, &mut first, MAX_BLOCK_LINES, &mut wide);
     assert_eq!(again, StageStats::default());
     assert_eq!(first.commits(), second.commits());
 }
@@ -923,30 +1037,30 @@ fn templated_blocks_are_deterministic_over_a_generated_span() {
 fn empty_single_unit_and_over_cap_spans_commit_nothing() {
     let mut work = Stage7Scratch::default();
     let empty: &[u8] = b"";
-    let units = split_span(empty);
+    let units = split_span(empty, UNICODE);
     let mut ledger = new_ledger(&units);
     let handoff = six(empty, &mut ledger);
     assert_eq!(
-        templated_blocks(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
+        seven(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
         StageStats::default()
     );
     let single = br"only one line 2026-08-26T10:00:00Z 10.0.0.1";
-    let units = split_span(single);
+    let units = split_span(single, UNICODE);
     let mut ledger = new_ledger(&units);
     let handoff = six(single, &mut ledger);
     assert_eq!(
-        templated_blocks(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
+        seven(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
         StageStats::default()
     );
     let wall = vec![b'z'; MAX_LINE_BYTES + 1];
-    let units = split_span(&wall);
+    let units = split_span(&wall, UNICODE);
     assert_eq!(units.len(), 1);
     assert!(!units[0].eligible);
     let mut ledger = new_ledger(&units);
     let handoff = six(&wall, &mut ledger);
     assert_eq!(handoff.forms.len(), 1);
     assert_eq!(
-        templated_blocks(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
+        seven(&handoff, &mut ledger, MAX_BLOCK_LINES, &mut work),
         StageStats::default()
     );
     assert!(ledger.is_free(0..1));

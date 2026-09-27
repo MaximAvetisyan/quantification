@@ -1,5 +1,8 @@
+use quantification_core::config::MarkerStyle;
 use quantification_core::mask::{MASK_LIST, Mask, mask, mask_into};
 use quantification_core::wsnorm::normalize;
+
+const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 
 const PRIORITY: [(&[u8], &[u8]); 4] = [
     (
@@ -235,7 +238,7 @@ fn masking_is_idempotent_and_never_rematches_a_placeholder() {
 fn ws_normalized_input_groups_near_duplicates() {
     let span = br"2026-08-26T10:00:00Z INFO hc 10.0.0.1 took 12ms\n2026-08-26T10:00:01Z INFO hc 10.0.0.2 took 13ms\n2026-08-26T10:00:02Z WARN hc 10.0.0.1 took 12ms";
     let mut forms = Vec::new();
-    for line in quantification_core::stage1::split_span(span) {
+    for line in quantification_core::stage1::split_span(span, UNICODE) {
         let ws = normalize(&span[line.range.clone()]);
         forms.push(mask(&ws));
     }

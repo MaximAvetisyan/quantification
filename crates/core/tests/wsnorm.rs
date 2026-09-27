@@ -1,5 +1,8 @@
+use quantification_core::config::MarkerStyle;
 use quantification_core::stage1::split_span;
 use quantification_core::wsnorm::{normalize, normalize_into};
+
+const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 
 const GOLDEN: [(&[u8], &[u8]); 22] = [
     (b"", b""),
@@ -58,7 +61,7 @@ fn mixed_boundary_forms_split_into_equal_ws_lines() {
     let n_form = br"2026-08-26T10:00:00Z\tINFO\thc  10.0.0.1 ok\n2026-08-26T10:00:01Z\tINFO\thc  10.0.0.1 ok";
     let u_form = br"2026-08-26T10:00:00Z\tINFO\thc  10.0.0.1 ok\u000A2026-08-26T10:00:01Z\tINFO\thc  10.0.0.1 ok";
     let forms = |span: &[u8]| {
-        split_span(span)
+        split_span(span, UNICODE)
             .iter()
             .map(|unit| normalize(&span[unit.range.clone()]))
             .collect::<Vec<Vec<u8>>>()

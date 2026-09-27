@@ -1687,9 +1687,18 @@ exit criteria. Gates M1–M4 are blocking milestones.
     decisions and are recorded here rather than taken; until one is made,
     DESIGN.md:344-346 and the §12 property at 733 are **not** established for
     arbitrary input, and this hunk no longer claims otherwise.
+    **Superseded 2026-09-27 by W2.10:** candidate (ii) is what an independent
+    design review then ruled, in the (ii)-shaped form "a unit carrying a
+    well-formed §4.5 marker is never a candidate" — implemented as one
+    `Unit.eligible` predicate at stage 1 rather than as a per-detector rule, so
+    the §4.5 grammar and every golden are untouched. The measured residual for
+    (B) and for mechanism (C) is now **0 / 20 000**.
   A **third** mechanism (C: a commit's anchor abutting a surviving neighbour
   its own stage could not see) was found by the new fuzz target and is not
   fixed either; the W2 review record below has its 173-byte reproducer.
+  **Both B and C are fixed by W2.10** (2026-09-27): (B) by the stage-1 marker
+  eligibility predicate, (C) by the masked-domain admission wall in
+  `detect::blocks`; the reproducer is now a fixed point.
   The property is now *enforced* rather than sampled, in
   `recompressing_an_output_is_a_fixed_point` (the 26 fixtures, unchanged) and in
   the new `generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_anchor`
@@ -1864,6 +1873,282 @@ exit criteria. Gates M1–M4 are blocking milestones.
     W0.4 recorded); `cargo metadata --locked --manifest-path fuzz/Cargo.toml`
     still succeeds — adding a `[[bin]]` does not touch the lock. No new
     dependency, no golden file and no DESIGN.md change.
+
+- **W2.10 Idempotence: markers are never groupable + the anchor-adjacency wall**
+  (W2 review follow-up, 2026-09-27) — the two residual mechanisms the W2.9 hunk
+  recorded as unfixed (item (6) **B** and the **C** reproducer) are now closed.
+  **Files changed:** `crates/core/src/{stage1,stage1b,config,pipeline}.rs`,
+  `crates/core/src/detect/{templ,templ_blocks,blocks}.rs`,
+  `crates/core/tests/{pipeline,stage1_split,detect_blocks,detect_templ_blocks,api}.rs`.
+  No new dependency, no new fixture, **no golden file changed** (see below), and
+  DESIGN.md is **not** amended — the amendments the review requires are quoted in
+  the last sub-item and belong to DESIGN.md's owner.
+
+  - **(B) mechanism closed at the stage-1 chokepoint: `Unit.eligible`.** The
+    review rejected remapping `CCCC` to a letter alphabet (it lowers the rate
+    ~100×, not to zero) and ruled for one eligibility predicate instead, because
+    `Unit.eligible` is already honoured by all five detectors
+    (`detect/exact.rs:26,33`, `detect/wsruns.rs` through `walk_runs`,
+    `detect/blocks.rs:102`, `detect/templ.rs:120,127`, `detect/templ_blocks.rs:74`
+    — the review's citations, i.e. line numbers as of before this hunk).
+    It is implemented once, in `stage1.rs`:
+    `pub fn carries_marker(unit: &[u8], style: MarkerStyle) -> bool` plus the
+    grammar check itself, which is **derived from the renderer rather than
+    restated**: the five §4.5 `CORE`s come from `ledger::CommitKind::core` and the
+    `OPEN`/`SEP`/`CLOSE` framing from `ledger::framing`, so the predicate cannot
+    drift from `render.rs`. Cost, per the review: a first-byte skip scan for the
+    `OPEN` token per unit (so a line without it is one linear pass and nothing
+    else), then O(1) validation of the ten possible `CORE`s, **allocation-free and
+    integer-only**; `MarkerStyle::Auto` (never reached in production — the
+    pipeline resolves the style per span — one `resolve_style` call per eligible
+    span, inside `compact_span` — and `Ledger::new` refuses `Auto`) recognizes
+    *both* styles, and a resolved style recognizes only its own, which is why the
+    12 chat goldens are unaffected. Two shapes are
+    deliberately **not** matched: the bare `OPEN` token (so `[... ` — which §4.5
+    itself calls plausible in real logs — does not become mass-ineligible) and
+    anything that is not a *well-formed* marker (`[… x identical …]`, a missing
+    close, a 3- or 5-hex checksum, an uppercase hex digit, an unknown core). The
+    same predicate runs on the stage-1b record path
+    (`stage1b::segment_line`), because a stage-1b record is a unit like any other
+    and an emitted marker rides a record's last line too.
+    **One signature change, propagated mechanically:** `stage1::split_span` and
+    `split_span_counted` now take the resolved `MarkerStyle` as a second argument
+    (the pipeline passes the same `style` it gives `Ledger::new`; every test call
+    site passes its file's `UNICODE` constant). Splitting the eligibility
+    decision from the span — the point of keying on the resolved style — is worth
+    more than the ~190 mechanical edits, and the compiler checked every one.
+  - **(C) mechanism closed by an admission wall, coarser domain, right at the
+    chokepoint the review named.** `detect/templ.rs`'s masked arena is now a
+    **pre-pass** (`Forms::build(span, units, scratch) -> Option<Forms>`) that
+    `pipeline::compact_span` runs *before* stage 5 — the first stage whose anchor
+    can be more than one unit — and `template_groups(forms, ledger, min)` is the
+    bare windowed walk that consumes it, so stage 6 masks exactly once (the
+    review's "DELETES stage 6's duplicate masking"). The arena is handed to
+    `blocks::windowed_blocks` as a **second closure beside the existing
+    `same_bytes`** (`left_wall: (before, first) -> bool`, one call to
+    `Forms::same`), and the check is one `&&` chain in
+    `blocks::wall_blocks`: *refuse the commit when the unit immediately before
+    `removed.start` — i.e. `at - 1` when it is unclaimed and eligible, which is
+    exactly the unit that abuts the anchor in the spliced output — masks equal to
+    the anchor's first unit.* It runs only after `equal` + `same_bytes` +
+    `anchor_is_match_free` have all passed, i.e. at most once per candidate that
+    would otherwise have committed, and it `break`s the `L` descent (the wall does
+    not depend on `L`) so the scan moves to the next start. **The right boundary
+    needs no wall** because the marker rides the anchor's *last* line, and fix (B)
+    makes that unit ineligible in the next pass; the left boundary is the only one
+    where a bare anchor line survives, which is why the wall exists. The
+    comparison domain is the **masked** one and that is complete rather than
+    merely conservative: masking is a pure function of the ws-normalized form, so
+    `raw-equal ⊂ ws-equal ⊂ mask-equal`, and the coarsest domain is therefore a
+    superset of every domain any later pass can use.
+  - **Why the wall is allowed to over-refuse, and where it actually bites.** The
+    wall is strictly coarser than stage 5's own ws domain, so it can only refuse a
+    commit the committing stage could have made: the output grows, never
+    corrupts. This is documented rather than worked around. One stage-5 test had
+    to be re-pinned because of it: `a_block_whose_anchor_itself_repeats_is_never_committed`
+    used `[L0,L1,C0,L1,C0,L0,…]`, whose anchor head `L1` masks equal to the line
+    before it, so the wall now refuses both of its candidates; the payload's
+    period-5 head is `H0` instead, which masks differently, and every assertion in
+    that test (two refusals, two commits, `verifications == 4`, anchors) is
+    unchanged. The refusal itself is now pinned by its own test,
+    `a_block_whose_anchor_head_would_glue_to_a_mask_equal_neighbour_is_refused`
+    (commit) plus `a_record_anchor_head_that_would_glue_to_a_mask_equal_record_is_refused`
+    (the same wall on the **stage-1b record** path, with a control half in which
+    the record before the anchor masks differently and the identical candidate
+    commits) and, for stage 7, by
+    `a_two_unit_anchor_head_that_would_glue_to_a_template_equal_neighbour_is_refused`
+    (also with its control half). The control halves are what make these tests
+    about the wall and not about the profitability gate: each one asserts
+    `profitable(...)` for the very candidate that is refused, and then asserts
+    that the same candidate commits once the neighbour's masked form differs.
+  - **One recorded non-reachability, stated rather than tested.** A *single-unit*
+    anchor never needs the wall (its own marker rides it, so fix (B) covers it),
+    but that case cannot be reached either: if `mask(at-1) == mask(at)` then the
+    candidate at `at-1` is a period-1 candidate that the scan examines first, its
+    chain extension is at least as profitable as the later pair (same anchor cost,
+    more removed bytes), and if the chain fails the §4.4 gate so does every pair
+    inside it. A `length > 1` exemption was therefore **not** written: it would be
+    untestable dead code, and the wall without it is safe by the over-refusal
+    argument above. That is also why the fixture with the most markers in the
+    corpus, `edges/prior-markers.json`, is untouched at all: its only commit has a
+    single-unit anchor.
+  - **`reversible: true` is now refused (affirmative-false-promise fix).**
+    `config::ResolveError::UnsupportedReversible` is new and `config::resolve`
+    rejects **only** `Some(true)`, mirroring how `AllMessages`/`ExplicitPaths` are
+    rejected at `config.rs:95-98`; `reversible: false` (and an absent option)
+    still resolves and still echoes `false`, which claims nothing. The reason is
+    §6.2 field 19's `restore_ids` ("iff reversible=true") plus §9's CCR store:
+    echoing `true` next to an empty list lies to a machine client. Tests:
+    `config.rs::reversible_true_is_rejected_and_false_resolves` (unit),
+    `tests/pipeline.rs::reversible_true_is_rejected` (replaces
+    `reversible_is_echoed_but_still_not_honoured`) and
+    `tests/api.rs::reversible_true_is_refused_and_false_echoes_false` (replaces
+    W3.1's `reversible_is_accepted_and_echoed_but_still_changes_nothing`).
+    **W3.4 must re-admit it:** the CCR store, `/v1/restore`, gRPC `Restore` and
+    `Stats.restore_ids` are one change, and the rejection is the single `Some(true)`
+    match arm in `config::resolve` to flip.
+    **Cross-crate consequence, for the transport owner:** the ruling is a
+    behaviour change that two committed transport tests encode — W3.2's
+    `crates/server/tests/http.rs::reversible_is_accepted_and_reserved` (now a 400,
+    not a 200) and W3.3's `crates/proto/src/convert.rs::explicit_false_survives_wire_and_resolves_false`
+    (`resolve` now returns `Err`). Both are outside this hunk's ownership and are
+    **left failing on purpose**; the transport's own `resolve_message` already
+    carries an `UnsupportedReversible` arm (W3.3), so only the two expectations
+    need flipping.
+  - **The golden did *not* have to be re-baselined, and here is why.** This hunk
+    was told to expect `edges/prior-markers.json`'s golden output to change; it
+    does not, and `the_chat_goldens_are_reproduced_byte_for_byte` still passes
+    **without regenerating a single golden file**. Mechanically: the fixture's
+    three marker lines are units 0, 3 and 4, and only its sole commit matters —
+    the stage-7 `TemplatedBlock` over units 1–2, whose anchor is a single unit, so
+    neither fix can touch it (fix (B) makes units 0 and 4 ineligible, which only
+    removes them as candidates for a group they were never in, and the §4.6 mask
+    keys the *ASCII* marker on line 3 to the ascii style, so in this unicode span
+    it stays eligible and is not part of the commit). §12's locator-edge-fixture bullet
+    (DESIGN.md:738-742) still exercises marker nesting under idempotence, and
+    `prior_marker_text_round_trips_untouched` now pins the style keying directly
+    (`carries_marker(.., Unicode)` true for the two unicode markers, false for the
+    ascii one in the same span, true for that same ascii marker under
+    `MarkerStyle::Ascii`).
+  - **The property test is now enforced, not sampled.**
+    `generated_log_bursts_converge_and_only_diverge_over_an_emitted_marker_or_an_anchor`
+    is replaced by **`every_generated_log_burst_is_a_fixed_point`**: the
+    `marker || anchor` escape hatch and its 5% ceiling are gone, `divergent` must
+    be `0`, and a divergence panics with the offending commit's kind, its removed
+    bytes and its anchor. **Measured, not assumed:**
+    * **before** (this hunk's parent, `d370dbb` with the core sources reverted):
+      **550 / 20 000 generated payloads = 2.75%** were not fixed points, every one
+      of them mechanism B (each second-pass commit's removed range contains an
+      emitted `" ...]"`, and the merge is masked-domain-only), and **0** needed a
+      third recompression. (The W2.9 hunk's 9.36% was measured on a different
+      corpus/codepath state; 2.75% is what this tree measures, and the
+      classification is the same.)
+    * **after:** **0 / 20 000 = 0.00%**, and still **0** needing a third
+      recompression. The 2 000-payload corpus the test runs is likewise **0**
+      (the W2.9 hunk recorded 63 / 2 000 = 3.15% there; re-measured here after
+      the fix, as 0).
+    * the fixes cost **nothing measurable** in compression on that corpus: total
+      bytes-in → bytes-out is **41.8%** before and **41.8%** after over the same
+      20 000 payloads.
+    * the generated corpus does **not** reach mechanism C (as the W2.9 hunk
+      already noted), so C is pinned by its dedicated tests only, not by the
+      corpus. Non-vacuity was checked by breaking the code and watching each test
+      fail, then reverting: stubbing `carries_marker` to `false` fails
+      `every_generated_log_burst_is_a_fixed_point` (first of 2 000) and
+      `two_markers_with_all_decimal_checksums_are_never_merged`; stubbing
+      `wall_blocks` to `false` fails
+      `a_commit_whose_anchor_head_would_glue_to_a_template_equal_neighbour_is_a_fixed_point`,
+      `a_block_whose_anchor_head_would_glue_to_a_mask_equal_neighbour_is_refused`,
+      `a_record_anchor_head_that_would_glue_to_a_mask_equal_record_is_refused`
+      and
+      `a_two_unit_anchor_head_that_would_glue_to_a_template_equal_neighbour_is_refused`
+      — and, on the generated corpus, nothing else.
+    * two new regression tests pin the mechanisms by name:
+      `two_markers_with_all_decimal_checksums_are_never_merged` (anchors hashing
+      to `5161` and `9616` — both all-decimal, so both mask to `<num>` — asserting
+      `pass2 == pass1` and no commits) and
+      `a_commit_whose_anchor_head_would_glue_to_a_template_equal_neighbour_is_a_fixed_point`
+      (the mechanism-C payload; note it is **171** bytes as spelled at this hunk's
+      lines 1843-1847, not 173 — the five lines plus four `\n` escapes — and it is
+      now a fixed point at 162 bytes after one pass, with the stage-5 block at
+      units 1..4 refused by the wall and a single stage-7 commit at units 0–1
+      emitted instead).
+  - **Cost, measured, and one behaviour change callers can see.** (a) One extra
+    first-byte scan per unit in stage 1, plus O(1) validation only where an `OPEN`
+    token occurs. (b) The masked pre-pass now runs for **every** span, including
+    `template_dedup = false`, because the admission wall is defined in the masked
+    (coarsest) domain; a §4.4.6 fingerprint table that fills therefore degrades the
+    span to pass-through even with template dedup off, which is §7's own
+    "pathological unique-line floods degrade to pass-through" and the same
+    degradation stage 6 already had on the default path. The end-to-end cost,
+    measured on the 104 385 312-byte generated corpus (20 000 payloads, release
+    build, i7-9700K, best of 5, whole `Compressor::compress` call including detect
+    and splice — so an upper bound on the span-compaction delta, not §8's
+    span-only metric): **32.1 MB/s before, 31.4 MB/s after, i.e. −2.2%.** §8's
+    ≥160 MB/s span-compaction floor is re-measured by W4.3's criterion gate on
+    8 MiB, which this hunk did not run. (c) The pipeline's stage order is
+    unchanged and still normative; the pre-pass is not a stage, and
+    `the_pipeline_module_has_no_forbidden_determinism_inputs` now pins the
+    call-site order as *1, 3, 4, pre-pass, 5, 6, 7*.
+  - **One deviation from the review's suggested call-site, and why.** The review
+    suggested handing the arena to `blocks::windowed_blocks` "as a SECOND closure
+    beside the existing `same_bytes`" with "one boundary check at blocks.rs:168-175";
+    that is what landed, but the two closures travel together in one generic
+    `blocks::Domain { ids, same_bytes, left_wall }` (a single extra parameter
+    would have tripped `clippy::too_many_arguments` at 8/7, and `Domain` keeps the
+    walker monomorphised rather than boxing the two comparisons behind `dyn`).
+    `Templated` is gone: `template_groups` returns `StageStats` and
+    `templated_blocks` takes `Option<&Forms>` (`None` = the degraded span), which
+    is the same information the old struct carried.
+  - **Verification.** `cargo test --workspace` → **438 green, 2 red, 1 ignored**
+    (441 collected) at this hunk's parent `d370dbb`; the two red tests are the
+    transport/proto `reversible` expectations listed above, both in files this
+    hunk does not own. `crates/core` is **370 green**, up from 361: +2 pipeline
+    + 3 `stage1_split` + 2 `detect_blocks` + 1 `detect_templ_blocks` + 1
+    `config` unit = +9, with two `reversible` tests renamed rather than added.
+    `cargo fmt --all --check` clean;
+    `cargo clippy --workspace --all-targets -- -D warnings` clean. The `fuzz/`
+    crate (excluded from the workspace, as W0.4 recorded) is untouched, and
+    the property `fuzz_pipeline` asserts (convergence to a fixed point within two
+    recompressions, never growing) now follows from the fixed point; the crate
+    itself is untouched and was **not** re-run here (no nightly toolchain).
+  - **DESIGN.md amendments this requires — proposed text, DESIGN.md NOT edited.**
+    Four places, each quoted verbatim as it stands today.
+    1. **§4.4 item 1 ("Line split"), lines 322-324** — extend the "excluded from
+       grouping" notion to marker-shaped units. Today:
+       > 1. **Line split**: `memchr`-style scan for `\n` sequences → line slice views.
+       >    Lines longer than `max_line_bytes` are excluded from grouping and handed
+       >    to stage 1b (bounds table memory and worst-case per-line work).
+
+       Propose appending one sentence to that item:
+       >    A unit that contains a well-formed §4.5 marker is likewise excluded
+       >    from grouping: the marker rides a committed group's last unit, so
+       >    admitting it would let a later pass merge two emitted markers whose
+       >    `CCCC` masks to one §4.6 template.
+    2. **§4.5's "Accepted risk" paragraph, lines 441-443** — it currently says
+       marker-shaped text is "documented, not defended against", which is no
+       longer true of the compressor's own output. Today:
+       > Accepted risk: a payload that literally contains marker-shaped text may
+       > confuse downstream consumers. Markers are chosen to be improbable in logs;
+       > documented, not defended against.
+
+       Propose replacing it with:
+       > Accepted risk: a payload that literally contains marker-shaped text may
+       > confuse downstream consumers. Markers are chosen to be improbable in logs;
+       > caller-supplied lookalike text is documented, not defended against. The
+       > compressor's *own* markers are: a unit carrying a well-formed marker is
+       > ineligible for grouping (§4.4.1), which is what makes recompression a
+       > fixed point.
+    3. **§4.4's "Comparison domains (normative)" paragraph, lines 313-320** — note
+       that ADMISSION, not equality, consults the masked domain at the left
+       boundary. Today the whole paragraph is:
+       > **Comparison domains (normative).** Each detector fixes one comparison
+       > domain, used by *both* its fingerprints and its verifying memcmp:
+       > stage 3 — raw bytes; stage 4 — ws-normalized forms (§4.2); stage 5 —
+       > ws-normalized forms; stage 6 — masked forms (ws-normalized input, §4.6);
+       > stage 7 — template ids, verified by memcmp of masked-form bytes. Anchors
+       > are always emitted as raw original bytes regardless of domain. Merging a
+       > pair that is equal in a normalized domain but differs raw (stages 4–7) is
+       > intended and priced into the §4.7 information-loss contract.
+
+       Propose appending:
+       > Admission is not equality and uses the coarsest domain: a block commit
+       > (stages 5 and 7) is refused when the surviving unit immediately before
+       > it masks equal to the anchor's first unit, because the marker rides the
+       > anchor's *last* unit and would leave the head adjacent to a neighbour
+       > the committing stage could not see. The masked domain is a superset of
+       > every domain a later pass can use, so this rule can only over-refuse.
+    4. **§4.4's stage list, items 5 and 7** — one sentence each (same wording, so
+       the two stages cannot diverge). Propose appending to item 5 ("Repeated
+       blocks"), after its "Scan order `(i asc, L desc)` makes the committed block
+       leftmost-then-longest by construction" sentence, and identically to item 7
+       ("Template blocks"), after its "Marker: `⟪templated block ×N⟫`" sentence:
+       > **Admission wall (normative):** a candidate whose surviving predecessor
+       > masks equal to the anchor's first unit is refused; the scan continues at
+       > the next start.
+    §4.4's own idempotence claim (lines 343-346) and §12's property at line 733
+    are then true as written, which is why this hunk asserts `divergent == 0`
+    instead of sampling it.
 
 ## Wave 3 — API & transports (deps W2.9)
 

@@ -53,7 +53,7 @@ fn commits_of(units: &[Unit], style: MarkerStyle, groups: &[(usize, usize)]) -> 
 fn a_multi_commit_span_produces_the_pinned_output_bytes() {
     let body = line(b"x", 40);
     let span = span_of(&[b"head", &body, &body, &body, &body, &body, b"tail"]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 7);
     let commits = commits_of(&units, UNICODE, &[(1, 6)]);
     assert_eq!(commits.len(), 1);
@@ -77,7 +77,7 @@ fn two_commits_in_one_span_are_emitted_in_anchor_offset_order() {
     let first = line(b"a", 50);
     let second = line(b"b", 50);
     let span = span_of(&[&first, &first, &first, b"mid", &second, &second, &second]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let commits = commits_of(&units, UNICODE, &[(4, 7), (0, 3)]);
     let mut out = Vec::new();
     splice_into(&span, &commits, &mut out);
@@ -107,7 +107,7 @@ fn a_commit_at_the_very_start_and_at_the_very_end_of_the_buffer() {
         buffer.extend_from_slice(&tail);
         buffer.extend_from_slice(b"\\n");
     }
-    let units = split_span(&buffer);
+    let units = split_span(&buffer, UNICODE);
     assert_eq!(units.len(), 7);
     let commits = commits_of(&units, UNICODE, &[(0, 3), (4, 7)]);
     let mut out = Vec::new();
@@ -132,7 +132,7 @@ fn no_commits_is_a_byte_for_byte_passthrough() {
         br#"{\"k\":\"v\"}"#.to_vec(),
         Vec::new(),
     ] {
-        let units = split_span(&span);
+        let units = split_span(&span, UNICODE);
         let ledger = Ledger::new(&units, ASCII);
         assert!(ledger.commits().is_empty());
         let mut out = vec![POISON; 128];
@@ -154,7 +154,7 @@ fn a_leading_bom_is_copied_verbatim_and_offsets_stay_absolute() {
         buffer.extend_from_slice(b"\\n");
     }
     buffer.extend_from_slice(b"\\\"}");
-    let units = split_span(&buffer[span_start..])
+    let units = split_span(&buffer[span_start..], UNICODE)
         .iter()
         .map(|unit| Unit {
             range: unit.range.start + span_start..unit.range.end + span_start,
@@ -189,12 +189,17 @@ fn a_poisoned_reused_buffer_never_leaks_a_stale_byte() {
     ]);
     let short = span_of(&[&body, &body, &body]);
     let mut out = Vec::new();
-    let long_len = splice_ledger(&long, &Ledger::new(&split_span(&long), UNICODE), &mut out).len();
+    let long_len = splice_ledger(
+        &long,
+        &Ledger::new(&split_span(&long, UNICODE), UNICODE),
+        &mut out,
+    )
+    .len();
     assert_eq!(long_len, long.len());
     out.clear();
     out.resize(out.capacity().min(4096), POISON);
     assert!(out.iter().all(|&b| b == POISON));
-    let units = split_span(&short);
+    let units = split_span(&short, UNICODE);
     let mut ledger = Ledger::new(&units, UNICODE);
     assert!(matches!(
         ledger.try_commit(Proposal::run(0..3, CommitKind::ExactRun)),
@@ -231,7 +236,7 @@ fn the_output_equals_the_input_everywhere_outside_the_patched_ranges() {
             .collect();
         let borrowed: Vec<&[u8]> = parts.iter().map(|part| part.as_slice()).collect();
         let buffer = span_of(&borrowed);
-        let units = split_span(&buffer);
+        let units = split_span(&buffer, UNICODE);
         let mut groups = Vec::new();
         let mut at = 0;
         while at + 3 <= units.len() {
@@ -284,7 +289,7 @@ fn record_joiners_stay_outside_the_marker() {
         buffer.extend_from_slice(&big);
     }
     buffer.push(b']');
-    let units = split_span(&buffer);
+    let units = split_span(&buffer, UNICODE);
     assert_eq!(units.len(), 5);
     let commits = commits_of(&units, UNICODE, &[(1, 4)]);
     assert_eq!(commits.len(), 1);
@@ -307,7 +312,7 @@ fn commits_out_of_emit_order_are_refused() {
     let first = line(b"a", 50);
     let second = line(b"b", 50);
     let span = span_of(&[&first, &first, &first, &second, &second, &second]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut commits = commits_of(&units, UNICODE, &[(0, 3), (3, 6)]);
     assert_eq!(commits.len(), 2);
     commits.reverse();
@@ -319,7 +324,7 @@ fn commits_out_of_emit_order_are_refused() {
 fn each_commit_renders_in_its_own_style() {
     let body = line(b"x", 40);
     let span = span_of(&[&body, &body, &body, b"mid", &body, &body, &body]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     assert_eq!(units.len(), 7);
     let mut commits = commits_of(&units, UNICODE, &[(0, 3)]);
     commits.append(&mut commits_of(&units, ASCII, &[(4, 7)]));
@@ -352,7 +357,7 @@ fn each_commit_renders_in_its_own_style() {
 fn an_anchor_outside_its_removed_range_is_refused() {
     let body = line(b"x", 40);
     let span = span_of(&[&body, &body, &body, b"tail"]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let mut commits = commits_of(&units, ASCII, &[(0, 3)]);
     commits[0].anchor = units[3].range.clone();
     splice_into(&span, &commits, &mut Vec::new());
@@ -361,7 +366,7 @@ fn an_anchor_outside_its_removed_range_is_refused() {
 #[test]
 fn a_reused_buffer_is_reused_not_reallocated() {
     let span = span_of(&[b"a", b"b", b"c"]);
-    let units = split_span(&span);
+    let units = split_span(&span, UNICODE);
     let ledger = Ledger::new(&units, UNICODE);
     let mut out = Vec::new();
     let capacity = {

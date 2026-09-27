@@ -238,7 +238,7 @@ fn compact_span(
     merged: &mut Vec<Commit>,
 ) -> SpanResult {
     let bytes = &payload[range.clone()];
-    let split = stage1::split_span_counted(bytes);
+    let split = stage1::split_span_counted(bytes, style);
     let units = split.units;
     let longest = units
         .iter()
@@ -264,30 +264,32 @@ fn compact_span(
             &mut stages.ws,
         ));
     }
+    let forms = templ::Forms::build(bytes, &units, &mut stages.templ);
     stats.merge(&blocks::repeated_blocks(
         bytes,
+        forms.as_ref(),
         &mut ledger,
         MIN_BLOCK_LINES,
         MAX_BLOCK_LINES,
         &mut stages.blocks,
     ));
     let mut degraded = stages.blocks.degraded();
-    if options.template_dedup {
-        let templated = templ::template_groups(
-            bytes,
+    if options.template_dedup
+        && let Some(forms) = &forms
+    {
+        stats.merge(&templ::template_groups(
+            forms,
             &mut ledger,
             options.min_group_size,
-            &mut stages.templ,
-        );
-        stats.merge(&templated.stats);
+        ));
         stats.merge(&templ_blocks::templated_blocks(
-            &templated,
+            Some(forms),
             &mut ledger,
             MAX_BLOCK_LINES,
             &mut stages.templ_blocks,
         ));
-        degraded |= templated.degraded;
     }
+    degraded |= forms.is_none();
     merged.extend(
         ledger
             .commits()

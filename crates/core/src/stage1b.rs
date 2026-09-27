@@ -1,5 +1,5 @@
-use crate::config::MAX_RECORD_BYTES;
-use crate::stage1::Unit;
+use crate::config::{MAX_RECORD_BYTES, MarkerStyle};
+use crate::stage1::{Unit, carries_marker};
 
 const SEPARATOR: &[u8; 3] = br"},{";
 
@@ -7,13 +7,13 @@ fn record_eligible(len: usize) -> bool {
     len <= MAX_RECORD_BYTES
 }
 
-pub(crate) fn segment_line(line: &[u8], base: usize) -> Vec<Unit> {
+pub(crate) fn segment_line(line: &[u8], base: usize, style: MarkerStyle) -> Vec<Unit> {
     let end = base + line.len();
     let separators = separators(line, base);
     if separators.is_empty() {
         return vec![Unit {
             range: base..end,
-            eligible: record_eligible(line.len()),
+            eligible: record_eligible(line.len()) && !carries_marker(line, style),
         }];
     }
     let mut units = Vec::with_capacity(separators.len() + 1);
@@ -23,7 +23,8 @@ pub(crate) fn segment_line(line: &[u8], base: usize) -> Vec<Unit> {
         if let Some(len) = stop.checked_sub(start).filter(|len| *len > 0) {
             units.push(Unit {
                 range: start..stop,
-                eligible: record_eligible(len),
+                eligible: record_eligible(len)
+                    && !carries_marker(&line[start - base..stop - base], style),
             });
         }
     }
@@ -31,7 +32,7 @@ pub(crate) fn segment_line(line: &[u8], base: usize) -> Vec<Unit> {
     if start < end {
         units.push(Unit {
             range: start..end,
-            eligible: record_eligible(end - start),
+            eligible: record_eligible(end - start) && !carries_marker(&line[start - base..], style),
         });
     }
     units
