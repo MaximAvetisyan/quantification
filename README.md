@@ -432,7 +432,7 @@ entries (847098 bytes)`, all byte-equal, in 11 s. The CPU-feature half of the
 ## Development
 
 ```sh
-cargo test --workspace                 # 538 passed, 0 failed, 6 ignored
+cargo test --workspace                 # 541 passed, 0 failed, 6 ignored
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -588,12 +588,12 @@ Also open, and worth knowing before relying on this:
   `a_child_that_closes_stdin_early_is_reported_by_its_exit_status`
   (`crates/eval/tests/eval.rs`): `sh -c 'exec 0<&-; exit 37'` with an 8 MiB
   prompt the child never reads, its zero-exit variant, and 16 repetitions of
-  the original 1-byte case. `cargo test --workspace` is 538 passed and
-  `cargo test --workspace --all-features` 550, both 0 failed, 6 ignored.
-* `crates/server/tests/shutdown.rs` (8 tests) binds real sockets and has been
+  the original 1-byte case. `cargo test --workspace` is 541 passed and
+  `cargo test --workspace --all-features` 553, both 0 failed, 6 ignored.
+* `crates/server/tests/shutdown.rs` (9 tests) binds real sockets and has been
   seen to fail on a busy machine with a connection reset in the SIGTERM drain
-  path; it passed in every run here, including four full `cargo test
-  --workspace` runs and two `cargo test --workspace --all-features` runs. A red
+  path; it passed in every run here, including a full `cargo test
+  --workspace` run and a `cargo test --workspace --all-features` run. A red
   drain test on a loaded box is worth a rerun before it is believed.
 * Only the `user_content` and `user_and_tools` scopes exist; `all_messages` and
   `explicit_paths` parse and are then refused. v2 items (Drain-style fuzzy
