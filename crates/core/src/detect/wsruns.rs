@@ -9,6 +9,10 @@ use super::exact::walk_runs;
 pub struct Scratch {
     head: Vec<u8>,
     next: Vec<u8>,
+    head_hash: u128,
+    next_hash: u128,
+    next_at: usize,
+    primed: bool,
 }
 
 impl Scratch {
@@ -16,11 +20,36 @@ impl Scratch {
         Self {
             head: Vec::with_capacity(head),
             next: Vec::with_capacity(next),
+            ..Self::default()
         }
     }
 
     pub fn reserved(&self) -> (usize, usize) {
         (self.head.capacity(), self.next.capacity())
+    }
+
+    fn take_head(&mut self, span: &[u8], left: &Unit) {
+        if self.primed && self.next_at == left.range.start {
+            std::mem::swap(&mut self.head, &mut self.next);
+            std::mem::swap(&mut self.head_hash, &mut self.next_hash);
+            self.primed = false;
+            return;
+        }
+        normalize_into(&span[left.range.clone()], &mut self.head);
+        self.head_hash = fingerprint(&self.head);
+    }
+
+    fn take_next(&mut self, span: &[u8], right: &Unit) {
+        normalize_into(&span[right.range.clone()], &mut self.next);
+        self.next_hash = fingerprint(&self.next);
+        self.next_at = right.range.start;
+        self.primed = true;
+    }
+
+    fn same(&self) -> bool {
+        self.head.len() == self.next.len()
+            && self.head_hash == self.next_hash
+            && self.head == self.next
     }
 }
 
@@ -31,10 +60,9 @@ pub fn ws_runs(
     scratch: &mut Scratch,
 ) -> StageStats {
     let mut same = |left: &Unit, right: &Unit| {
-        normalize_into(&span[left.range.clone()], &mut scratch.head);
-        normalize_into(&span[right.range.clone()], &mut scratch.next);
-        let (head, next) = (&scratch.head, &scratch.next);
-        head.len() == next.len() && fingerprint(head) == fingerprint(next) && head == next
+        scratch.take_head(span, left);
+        scratch.take_next(span, right);
+        scratch.same()
     };
     walk_runs(ledger, min_group_size, CommitKind::WsRun, &mut same)
 }

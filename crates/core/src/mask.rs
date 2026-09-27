@@ -30,16 +30,53 @@ impl Mask {
             Self::Num => b"<num>",
         }
     }
+}
 
-    fn at(self, line: &[u8], at: usize) -> Option<usize> {
-        match self {
-            Self::Ts => ts_at(line, at),
-            Self::Ip => ip_at(line, at),
-            Self::Uuid => uuid_at(line, at),
-            Self::Hex => hex_at(line, at),
-            Self::Dur => dur_at(line, at),
-            Self::Num => num_at(line, at),
+const HEX: u8 = 1;
+const DIGIT: u8 = 2;
+const STOP: u8 = 4;
+
+const CLASS: [u8; 256] = classes();
+
+const fn classes() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut at = 0;
+    while at < 256 {
+        let byte = at as u8;
+        table[at] = if byte.is_ascii_digit() {
+            HEX | DIGIT | STOP
+        } else if byte.is_ascii_hexdigit() {
+            HEX | STOP
+        } else if byte.is_ascii_uppercase() || byte == b':' || byte == b'\\' {
+            STOP
+        } else {
+            0
+        };
+        at += 1;
+    }
+    table
+}
+
+struct Probe {
+    digit: usize,
+    hex: usize,
+}
+
+impl Probe {
+    fn at(line: &[u8], at: usize) -> Self {
+        let mut hex = 0;
+        let mut digit = 0;
+        for &byte in &line[at..] {
+            let class = CLASS[byte as usize];
+            if class & HEX == 0 {
+                break;
+            }
+            if class & DIGIT != 0 && digit == hex {
+                digit = hex + 1;
+            }
+            hex += 1;
         }
+        Self { digit, hex }
     }
 }
 
@@ -53,23 +90,84 @@ pub fn mask_into(ws_line: &[u8], out: &mut Vec<u8>) {
     out.clear();
     let mut at = 0;
     while at < ws_line.len() {
-        if let Some(len) = escape_unit(ws_line, at) {
-            out.extend_from_slice(&ws_line[at..at + len]);
-            at += len;
-        } else if let Some((found, len)) = hit(ws_line, at) {
-            out.extend_from_slice(found.placeholder());
-            at += len;
-        } else {
+        if CLASS[ws_line[at] as usize] & STOP == 0 {
             out.push(ws_line[at]);
             at += 1;
+            continue;
+        }
+        if let Some(len) = escape_unit(ws_line, at) {
+            copy(out, &ws_line[at..at + len]);
+            at += len;
+            continue;
+        }
+        let probe = Probe::at(ws_line, at);
+        match hit(ws_line, at, &probe) {
+            Some((mask, len)) => {
+                copy(out, mask.placeholder());
+                at += len;
+            }
+            None => {
+                out.push(ws_line[at]);
+                at += 1;
+            }
         }
     }
 }
 
-fn hit(line: &[u8], at: usize) -> Option<(Mask, usize)> {
-    MASK_LIST
-        .iter()
-        .find_map(|mask| mask.at(line, at).map(|len| (*mask, len)))
+fn copy(out: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() > 8 {
+        out.extend_from_slice(bytes);
+        return;
+    }
+    for &byte in bytes {
+        out.push(byte);
+    }
+}
+
+fn hit(line: &[u8], at: usize, probe: &Probe) -> Option<(Mask, usize)> {
+    let lower = |skip: usize| line.get(at + skip).is_some_and(u8::is_ascii_lowercase);
+    if probe.digit == 4
+        && line.get(at + 4) == Some(&b'-')
+        && let Some(len) = iso_at(line, at)
+    {
+        return Some((Mask::Ts, len));
+    }
+    if line[at].is_ascii_uppercase()
+        && lower(1)
+        && lower(2)
+        && let Some(len) = syslog_at(line, at)
+    {
+        return Some((Mask::Ts, len));
+    }
+    let ip_shape = match probe.digit {
+        0 => probe.hex <= 4 && line.get(at + probe.hex) == Some(&b':'),
+        1..=4 => true,
+        _ => false,
+    };
+    if ip_shape && let Some(len) = ip_at(line, at, probe) {
+        return Some((Mask::Ip, len));
+    }
+    if probe.hex == 8
+        && let Some(len) = uuid_at(line, at)
+    {
+        return Some((Mask::Uuid, len));
+    }
+    if probe.hex >= HEX_MIN_RUN {
+        return Some((Mask::Hex, probe.hex));
+    }
+    if probe.digit > 0
+        && matches!(
+            line.get(at + probe.digit),
+            Some(b'.' | b'n' | b'u' | b'm' | b's' | b'h')
+        )
+        && let Some(len) = dur_at(line, at, probe)
+    {
+        return Some((Mask::Dur, len));
+    }
+    if probe.digit > 0 {
+        return num_at(line, at, probe).map(|len| (Mask::Num, len));
+    }
+    None
 }
 
 fn escape_unit(line: &[u8], at: usize) -> Option<usize> {
@@ -125,28 +223,14 @@ fn group(line: &[u8], at: usize, len: usize, sep: Option<u8>) -> Option<usize> {
     }
 }
 
-fn ts_at(line: &[u8], at: usize) -> Option<usize> {
-    let iso = iso_at(line, at);
-    let syslog = syslog_at(line, at);
-    match (iso, syslog) {
-        (Some(iso), Some(syslog)) => Some(iso.max(syslog)),
-        (iso, syslog) => iso.or(syslog),
-    }
-}
-
 fn iso_at(line: &[u8], at: usize) -> Option<usize> {
-    let date = date_at(line, at)?;
+    let month = group(line, at + 5, 2, Some(b'-'))?;
+    let day = group(line, at + 5 + month, 2, None)?;
+    let date = 5 + month + day;
     match time_at(line, at + date) {
         Some(time) => Some(date + time),
         None => Some(date),
     }
-}
-
-fn date_at(line: &[u8], at: usize) -> Option<usize> {
-    let year = group(line, at, 4, Some(b'-'))?;
-    let month = group(line, at + year, 2, Some(b'-'))?;
-    let day = group(line, at + year + month, 2, None)?;
-    Some(year + month + day)
 }
 
 fn time_at(line: &[u8], at: usize) -> Option<usize> {
@@ -209,14 +293,14 @@ fn syslog_at(line: &[u8], at: usize) -> Option<usize> {
     Some(at + hour + minute + second - start)
 }
 
-fn ip_at(line: &[u8], at: usize) -> Option<usize> {
-    ipv4_at(line, at).or_else(|| ipv6_at(line, at))
+fn ip_at(line: &[u8], at: usize, probe: &Probe) -> Option<usize> {
+    ipv4_at(line, at, probe.digit).or_else(|| ipv6_at(line, at, probe))
 }
 
-fn ipv4_at(line: &[u8], start: usize) -> Option<usize> {
+fn ipv4_at(line: &[u8], start: usize, first: usize) -> Option<usize> {
     let mut at = start;
+    let mut run = first;
     for octet in 0..4 {
-        let run = digits(line, at);
         if run == 0 || run > 3 {
             return None;
         }
@@ -232,27 +316,36 @@ fn ipv4_at(line: &[u8], start: usize) -> Option<usize> {
         if octet < 3 {
             take(line, at, b'.')?;
             at += 1;
+            run = digits(line, at);
         }
     }
     Some(at - start)
 }
 
-fn ipv6_at(line: &[u8], start: usize) -> Option<usize> {
+fn ipv6_at(line: &[u8], start: usize, probe: &Probe) -> Option<usize> {
     let mut at = start;
     let mut groups = 0usize;
     let mut singles = 0usize;
     let mut compressed = false;
+    let mut run = 0usize;
+    let mut shared = false;
     if line.get(at) == Some(&b':') {
         if line.get(at + 1) != Some(&b':') {
             return None;
         }
         at += 2;
         compressed = true;
+    } else {
+        run = probe.hex;
+        shared = true;
     }
     while at < line.len() {
-        let run = hex_run(line, at);
+        if !shared {
+            run = hex_run(line, at);
+        }
+        shared = false;
         if run == 0 || run > 4 || line.get(at + run) == Some(&b'.') {
-            let len = ipv4_at(line, at)?;
+            let len = ipv4_at(line, at, digits(line, at))?;
             at += len;
             groups += 2;
             break;
@@ -290,31 +383,24 @@ fn ipv6_at(line: &[u8], start: usize) -> Option<usize> {
 }
 
 fn uuid_at(line: &[u8], start: usize) -> Option<usize> {
-    let mut at = start;
-    for (index, len) in [8usize, 4, 4, 4, 12].into_iter().enumerate() {
-        if hex_run(line, at) != len {
+    take(line, start + 8, b'-')?;
+    let mut at = start + 9;
+    for _ in 0..3 {
+        if hex_run(line, at) != 4 {
             return None;
         }
-        at += len;
-        if index < 4 {
-            take(line, at, b'-')?;
-            at += 1;
-        }
+        at += 4;
+        take(line, at, b'-')?;
+        at += 1;
     }
-    Some(at - start)
-}
-
-fn hex_at(line: &[u8], at: usize) -> Option<usize> {
-    let run = hex_run(line, at);
-    (run >= HEX_MIN_RUN).then_some(run)
-}
-
-fn dur_at(line: &[u8], at: usize) -> Option<usize> {
-    let int = digits(line, at);
-    if int == 0 {
+    if hex_run(line, at) != 12 {
         return None;
     }
-    let mut end = at + int;
+    Some(at + 12 - start)
+}
+
+fn dur_at(line: &[u8], at: usize, probe: &Probe) -> Option<usize> {
+    let mut end = at + probe.digit;
     if line.get(end) == Some(&b'.') {
         let frac = digits(line, end + 1);
         if frac > 0 {
@@ -339,12 +425,8 @@ fn dur_unit(line: &[u8], at: usize) -> Option<usize> {
     }
 }
 
-fn num_at(line: &[u8], at: usize) -> Option<usize> {
-    let int = digits(line, at);
-    if int == 0 {
-        return None;
-    }
-    let mut end = at + int;
+fn num_at(line: &[u8], at: usize, probe: &Probe) -> Option<usize> {
+    let mut end = at + probe.digit;
     if line.get(end) == Some(&b'.') {
         let frac = digits(line, end + 1);
         if frac > 0 {

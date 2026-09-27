@@ -105,6 +105,22 @@ const NUM: [(&[u8], &[u8]); 7] = [
     ),
 ];
 
+const MIXED: [(&[u8], &[u8]); 8] = [
+    (b"1a2ms", b"<num>a<dur>"),
+    (b"12a3ms", b"<num>a<dur>"),
+    (b"12a3", b"<num>a<num>"),
+    (b"abc1", b"abc<num>"),
+    (b"1a2.3", b"<num>a<num>"),
+    (b"v1a2", b"v<num>a<num>"),
+    (b"a1b2", b"a<num>b<num>"),
+    (b"A550e8400-e29b-41d4-a716-446655440000", b"A<uuid>"),
+];
+
+const MIXED_HEX: [(&[u8], &[u8]); 2] = [
+    (b"1a2b3c4d5e6f7a8b", b"<hex>"),
+    (b"0x1a2b3c4d5e6f7a8b9", b"<num>x<hex>"),
+];
+
 const ESCAPES: [(&[u8], &[u8]); 6] = [
     (br"a\tb 42", br"a\tb <num>"),
     (br"\u0031", br"\u0031"),
@@ -114,7 +130,9 @@ const ESCAPES: [(&[u8], &[u8]); 6] = [
     (br"10.0.0.1 \u0031 42", br"<ip> \u0031 <num>"),
 ];
 
-const ALL: &[&[(&[u8], &[u8])]] = &[&PRIORITY, &TS, &IP, &UUID, &HEX, &DUR, &NUM, &ESCAPES];
+const ALL: &[&[(&[u8], &[u8])]] = &[
+    &PRIORITY, &TS, &IP, &UUID, &HEX, &DUR, &NUM, &MIXED, &MIXED_HEX, &ESCAPES,
+];
 
 fn assert_goldens(goldens: &[(&[u8], &[u8])]) {
     for (input, expect) in goldens {

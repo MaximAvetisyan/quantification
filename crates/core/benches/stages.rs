@@ -4,14 +4,17 @@ use std::time::Duration;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use quantification_core::config::{MarkerStyle, RawOptions, ResolvedOptions, ScopePolicy, resolve};
 use quantification_core::detect::{blocks, exact, templ, templ_blocks, wsruns};
+use quantification_core::fingerprint::fingerprint;
 use quantification_core::ledger::{Commit, Ledger};
 use quantification_core::locator::{Span, locate_into};
+use quantification_core::mask::mask_into;
 use quantification_core::perf_payload::{TARGET_BYTES, log_heavy_chat};
 use quantification_core::pipeline::Compressor;
 use quantification_core::sniff::{Schema, sniff};
 use quantification_core::splice::splice_into;
 use quantification_core::stage1::Unit;
 use quantification_core::stage1::split_span_counted;
+use quantification_core::wsnorm::normalize_into;
 
 const MIN_GROUP_SIZE: u32 = 3;
 const MIN_BLOCK_LINES: u32 = 2;
@@ -234,6 +237,62 @@ fn bench_end_to_end(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_micro(c: &mut Criterion) {
+    let f = fixture();
+    let style = MarkerStyle::Unicode;
+    let span = &f.span;
+    let units = units_of(span, style);
+    let mut group = c.benchmark_group("micro");
+    group.bench_function("normalize_all_units", |b| {
+        b.iter(|| {
+            let mut out = Vec::with_capacity(4096);
+            for unit in &units {
+                normalize_into(&span[unit.range.clone()], &mut out);
+                black_box(out.len());
+            }
+        })
+    });
+    group.bench_function("fingerprint_all_units", |b| {
+        b.iter(|| {
+            for unit in &units {
+                black_box(fingerprint(&span[unit.range.clone()]));
+            }
+        })
+    });
+    group.bench_function("mask_all_units_raw", |b| {
+        b.iter(|| {
+            let mut out = Vec::with_capacity(4096);
+            for unit in &units {
+                mask_into(&span[unit.range.clone()], &mut out);
+                black_box(out.len());
+            }
+        })
+    });
+    group.bench_function("normalize_and_mask_all_units", |b| {
+        b.iter(|| {
+            let mut ws = Vec::with_capacity(4096);
+            let mut out = Vec::with_capacity(4096);
+            for unit in &units {
+                normalize_into(&span[unit.range.clone()], &mut ws);
+                mask_into(&ws, &mut out);
+                black_box(out.len());
+            }
+        })
+    });
+    group.bench_function("forms_build_all_units", |b| {
+        b.iter(|| {
+            let mut scratch = templ::Scratch::with_capacity(4096, 4096);
+            black_box(templ::Forms::build(black_box(span), &units, &mut scratch))
+        })
+    });
+    group.bench_function("table_for_keys", |b| {
+        b.iter(|| {
+            black_box(quantification_core::fingerprint::FingerprintTable::for_keys(span.len()))
+        })
+    });
+    group.finish();
+}
+
 fn configured() -> Criterion {
     Criterion::default()
         .sample_size(20)
@@ -265,4 +324,10 @@ criterion_group! {
     targets = bench_end_to_end
 }
 
-criterion_main!(locate, compact, splice, end_to_end);
+criterion_group! {
+    name = micro;
+    config = configured();
+    targets = bench_micro
+}
+
+criterion_main!(locate, compact, splice, end_to_end, micro);

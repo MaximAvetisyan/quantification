@@ -13,12 +13,14 @@ pub struct Work {
     pub scanned: u64,
 }
 
+pub const NONE: u32 = u32::MAX;
+
 pub struct Scratch {
     arena: Vec<u8>,
     line: Vec<u8>,
     norm: Vec<Option<Range<usize>>>,
-    ids: Vec<Option<usize>>,
-    coarse: Vec<Option<usize>>,
+    ids: Vec<u32>,
+    coarse: Vec<u32>,
     work: Work,
     degraded: bool,
 }
@@ -128,11 +130,11 @@ fn load(span: &[u8], forms: Option<&Forms>, ledger: &Ledger<'_>, scratch: &mut S
             }
         };
         scratch.norm[index] = Some(range);
-        scratch.ids[index] = Some(rep);
-        scratch.coarse[index] = Some(match forms {
-            Some(forms) => forms.id(index).0 as usize,
-            None => rep,
-        });
+        scratch.ids[index] = rep as u32;
+        scratch.coarse[index] = match forms {
+            Some(forms) => forms.id(index).0 as u32,
+            None => rep as u32,
+        };
     }
     true
 }
@@ -142,7 +144,7 @@ fn reset(scratch: &mut Scratch, units: usize) {
     scratch.norm.resize(units, None);
     for column in [&mut scratch.ids, &mut scratch.coarse] {
         column.clear();
-        column.resize(units, None);
+        column.resize(units, NONE);
     }
 }
 
@@ -162,10 +164,10 @@ fn block<'a>(
 }
 
 pub(crate) struct Domain<'a, S, W, C> {
-    pub ids: &'a [Option<usize>],
+    pub ids: &'a [u32],
     pub same_bytes: S,
     pub left_wall: W,
-    pub coarse_ids: &'a [Option<usize>],
+    pub coarse_ids: &'a [u32],
     pub coarse_same: C,
 }
 
@@ -185,27 +187,38 @@ pub(crate) fn windowed_blocks<
     let min = min_block_lines.max(1);
     let max = max_block_lines.max(1);
     let mut stats = StageStats::default();
+    let mut compares = work.compares;
     let mut at = 0;
     let mut run = 0;
     while at < ids.len() {
         run = run.max(at);
-        while run < ids.len() && !ledger.is_committed(run) && ids[run].is_some() {
+        while run < ids.len() && !ledger.is_committed(run) && ids[run] != NONE {
             work.scanned += 1;
             run += 1;
         }
         let room = run - at;
         let mut next = at + 1;
         let mut length = max.min(room / 2);
+        let head = ids[at];
         while length >= min {
-            if equal(ids, at, at + length, length, work) {
+            compares += 1;
+            if head == ids[at + length] && equal_tail(ids, at, at + length, length, &mut compares) {
                 work.verifications += 1;
                 if (domain.same_bytes)(at, at + length, length)
-                    && anchor_is_match_free(domain, at, length, work)
+                    && anchor_is_match_free(domain, at, length, &mut compares, work)
                 {
                     if wall_blocks(ledger, domain, at) {
                         break;
                     }
-                    let copies = copies(ids, at, length, room, &mut domain.same_bytes, work);
+                    let copies = copies(
+                        ids,
+                        at,
+                        length,
+                        room,
+                        &mut domain.same_bytes,
+                        &mut compares,
+                        work,
+                    );
                     let group = at..at + copies * length;
                     if let CommitOutcome::Committed(commit) =
                         ledger.try_commit(Proposal::repeat(group.clone(), length, kind))
@@ -220,6 +233,7 @@ pub(crate) fn windowed_blocks<
         }
         at = next;
     }
+    work.compares = compares;
     stats
 }
 
@@ -231,7 +245,7 @@ where
 {
     at > 0
         && !ledger.is_committed(at - 1)
-        && domain.ids[at - 1].is_some()
+        && domain.ids[at - 1] != NONE
         && (domain.left_wall)(at - 1, at)
 }
 
@@ -239,6 +253,7 @@ fn anchor_is_match_free<S, W, C>(
     domain: &mut Domain<'_, S, W, C>,
     at: usize,
     length: usize,
+    compares: &mut u64,
     work: &mut Work,
 ) -> bool
 where
@@ -252,7 +267,9 @@ where
     while period > 0 {
         let mut start = at;
         while start + 2 * period <= end {
-            if equal(ids, start, start + period, period, work)
+            *compares += 1;
+            if ids[start] == ids[start + period]
+                && equal_tail(ids, start, start + period, period, compares)
                 && (domain.coarse_same)(start, start + period)
             {
                 work.verifications += 1;
@@ -265,9 +282,9 @@ where
     true
 }
 
-fn equal(ids: &[Option<usize>], first: usize, second: usize, len: usize, work: &mut Work) -> bool {
-    for at in 0..len {
-        work.compares += 1;
+fn equal_tail(ids: &[u32], first: usize, second: usize, len: usize, compares: &mut u64) -> bool {
+    for at in 1..len {
+        *compares += 1;
         if ids[first + at] != ids[second + at] {
             return false;
         }
@@ -276,18 +293,20 @@ fn equal(ids: &[Option<usize>], first: usize, second: usize, len: usize, work: &
 }
 
 fn copies(
-    ids: &[Option<usize>],
+    ids: &[u32],
     at: usize,
     length: usize,
     room: usize,
     same_bytes: &mut impl FnMut(usize, usize, usize) -> bool,
+    compares: &mut u64,
     work: &mut Work,
 ) -> usize {
     let mut copies = 2;
     while (copies + 1) * length <= room {
         let first = at + (copies - 1) * length;
         let second = first + length;
-        if !equal(ids, first, second, length, work) {
+        *compares += 1;
+        if ids[first] != ids[second] || !equal_tail(ids, first, second, length, compares) {
             break;
         }
         work.verifications += 1;

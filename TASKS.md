@@ -3504,16 +3504,20 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W4.3 Criterion benches + nightly perf gate** (§8 per-stage budgets);
   measure the 8 MiB splice copy explicitly. After W2.9. **Gate M3**:
   ≥100 MB/s p50 aggregate.
-  Status: **complete; Gate M3 FAILS on this hardware (2026-09-27).** Two of the
-  three §8 stage lines pass with wide margins — schema sniff + span locate at
-  1199 MB/s against a ≥400 MB/s floor, and splice + stats at 0.040 ms against
-  ≤10 ms — but **span compaction (stages 1–7) misses its ≤50 ms budget by 5.4×
-  and its ≥160 MB/s floor by 5.1×, and the aggregate misses the ≥100 MB/s M3
-  gate by 3.3× and R2's ≤80 ms by 3.4×.** No compression semantics were changed
-  to move a number, and every figure below is re-derived by the harness rather
-  than asserted by hand.
-  - **What landed.** `crates/core/benches/stages.rs` (criterion, 14 benches,
-    one per §8 line and one per §4.4 stage), `crates/core/benches/gate.rs`
+  Status: **complete; Gate M3 still FAILS on this hardware (2026-09-27,
+  re-measured after the compaction optimization).** The optimization took the
+  aggregate from **30.4 MB/s to 92.8 MB/s (3.05×)**, but M3 is a floor and not
+  a trend, so the verdict is unchanged: **92.8 MB/s is 1.08× under the
+  ≥100 MB/s M3 floor, and M3 FAILS.** The two §8 stage lines that passed still
+  pass with wide margins — schema sniff + span locate at 1199.6 MB/s against a
+  ≥400 MB/s floor, and splice + stats at 0.03 ms against ≤10 ms — but **span
+  compaction (stages 1–7) still misses its ≤50 ms budget by 1.67× and its
+  ≥160 MB/s floor by 1.59×, and the aggregate still misses R2's ≤80 ms by
+  1.13×.** No compression semantics were changed to move a number, and every
+  figure below is re-derived by the harness rather than asserted by hand.
+  - **What landed.** `crates/core/benches/stages.rs` (criterion, 20 benches:
+    14 — one per §8 line and one per §4.4 stage — plus the 6-bench `micro`
+    group added by the optimization), `crates/core/benches/gate.rs`
     (the M3 gate: p50/p99, per-stage attribution, budget verdicts, a JSON
     report, non-zero exit on a miss), `crates/core/src/perf_payload.rs` (the
     deterministic 8 MiB fixture, behind the new `bench_stages` feature),
@@ -3568,88 +3572,126 @@ exit criteria. Gates M1–M4 are blocking milestones.
     so no float comparison can gate. Hardware: **Intel Core i7-9700K @ 3.60 GHz
     (8 logical cpus, 12 MiB L3, Linux 6.x)**, the same machine the S1/M1 and W2
     measurements were taken on. **Three consecutive pinned runs of this exact
-    source agree within 0.2%** (aggregate p50 275.34 / 275.61 / 275.81 ms),
+    source agree within 0.15%** (aggregate p50 90.34 / 90.39 / 90.47 ms),
     taken on an idle box; runs taken while another agent's test binary held ~4
     cores read ~7% slower, which is why a spread is quoted instead of the best
     number. The tables below are the last of those runs, i.e. the committed
-    build.
+    build. The pre-optimization figure for the identical protocol, fixture and
+    box was **275.34 / 275.61 / 275.81 ms (30.4 MB/s)**, so the change is
+    **3.05×** and the residual miss is **1.13×** — not the 3.4× the previous
+    measurement of this hunk recorded.
   - **§8, line by line (p50 / p99, 8 399 344 B payload):**
 
     | §8 line | budget | p50 | p99 | measured rate | verdict |
     |---|---|---|---|---|---|
-    | schema sniff + span locate | ≤20 ms, floor ≥400 MB/s | 7.00 ms | 7.01 ms | 1199 MB/s | **PASS** (2.9× inside the budget, 3.0× above the floor) |
-    | span compaction (stages 1–7) | ≤50 ms, floor ≥160 MB/s | 268.77 ms | 269.87 ms | 31.2 MB/s | **FAIL** — 5.38× the budget, 5.13× under the floor |
-    | splice + stats | ≤10 ms | 0.040 ms | 0.043 ms | 1.9 GB/s over 76 878 B out | **PASS** (243× inside) |
-    | 8 MiB splice copy, no commits (the explicit §8 measurement) | ≤10 ms | 0.28 ms | 0.47 ms | 29.7 GB/s | **PASS** (35× inside) |
-    | **aggregate (bytes-in / total core time)** | **≥100 MB/s, R2 ≤80 ms** | **275.81 ms** | **276.92 ms** | **30.4 MB/s** | **FAIL** — 3.29× under the M3 floor, 3.45× over R2 |
+    | schema sniff + span locate | ≤20 ms, floor ≥400 MB/s | 7.00 ms | 7.02 ms | 1199.6 MB/s | **PASS** (2.9× inside the budget, 3.0× above the floor) |
+    | span compaction (stages 1–7) | ≤50 ms, floor ≥160 MB/s | 83.43 ms | 84.64 ms | 100.6 MB/s | **FAIL** — 1.67× the budget, 1.59× under the floor |
+    | splice + stats | ≤10 ms | 0.03 ms | 0.04 ms | 1.96 GB/s over 76 878 B out | **PASS** (333× inside) |
+    | 8 MiB splice copy, no commits (the explicit §8 measurement) | ≤10 ms | 0.40 ms | 0.62 ms | 20.8 GB/s | **PASS** (25× inside) |
+    | **aggregate (bytes-in / total core time)** | **≥100 MB/s, R2 ≤80 ms** | **90.47 ms** | **91.71 ms** | **92.8 MB/s** | **FAIL** — 1.08× under the M3 floor, 1.13× over R2 |
 
   - **The 8 MiB splice copy, measured explicitly as §8 demands.** Not inferred:
     the gate additionally times `splice::splice_into(payload, &[], out)` into a
     pre-reserved buffer — the full 8 399 344 B copy with no commits — and
-    criterion has it twice more as `splice/8mib_copy_no_commits` (**383.4 µs**)
+    criterion has it twice more as `splice/8mib_copy_no_commits` (**418.5 µs**)
     and `splice/8mib_splice_with_commits` over the fixture's real 300 commits
-    (**14.8 µs**). **§8's ≤10 ms splice budget is met with ~35× headroom, and
-    the warm-cache assumption holds on this hardware**: 8.4 MB in 0.28 ms is
-    29.7 GB/s, ordinary warm L3/DRAM copy bandwidth for this machine. Splice is
+    (**14.95 µs**, unchanged: this optimization never touched the splicer).
+    **§8's ≤10 ms splice budget is met with ~25× headroom, and the warm-cache
+    assumption holds on this hardware**: 8.4 MB in 0.40 ms is 20.8 GB/s,
+    ordinary warm L3/DRAM copy bandwidth for this machine. Splice is
     not where §8 is wrong, and the pipeline's own splice is faster still
     because this fixture collapses to 76 878 B.
   - **Per-stage attribution (in-pipeline, p50 of the same 30 iterations; the
     `bench_stages` clocks read the *injected* `Clock`, so they cost nothing in
-    the default build and use exactly the seam `Stats.elapsed_*` uses):**
+    the default build and use exactly the seam `Stats.elapsed_*` uses). "Was"
+    is the same clock on the pre-optimization build:**
 
-    | §4.4 stage | p50 | MB/s | share of the compaction window |
-    |---|---|---|---|
-    | stage 1 line split (+1b record split) | 15 617 379 ns | 537 | 5.8% |
-    | stage 3 exact runs | 1 905 624 ns | 4 408 | 0.7% |
-    | stage 4 ws-normalized runs | 63 363 300 ns | 132 | 23.6% |
-    | stage 6 masked forms (§4.6 automata + xxh3-128) | 135 595 184 ns | 62 | 50.4% |
-    | stage 5 repeated blocks | 50 392 517 ns | 167 | 18.8% |
-    | stage 6 template groups | 828 709 ns | 10 135 | 0.3% |
-    | stage 7 templated blocks | 535 624 ns | 15 681 | 0.2% |
-    | compaction unattributed (ledger, merges, `shift`) | 531 152 ns | — | 0.2% |
-    | pipeline unattributed (stats assembly, options echo) | 1 465 ns | — | — |
+    | §4.4 stage | p50 was | p50 now | speedup | MB/s now | share of the compaction window |
+    |---|---|---|---|---|---|
+    | stage 1 line split (+1b record split) | 15 617 379 ns | 10 934 725 ns | 1.43× | 768 | 13% |
+    | stage 3 exact runs | 1 905 624 ns | 1 797 718 ns | 1.06× | 4 672 | 2% |
+    | stage 4 ws-normalized runs | 63 363 300 ns | 11 343 373 ns | **5.59×** | 740 | 13% |
+    | stage 6 masked forms (§4.6 automata + xxh3-128) | 135 595 184 ns | 32 976 798 ns | **4.11×** | 255 | 39% |
+    | stage 5 repeated blocks | 50 392 517 ns | 24 620 084 ns | 2.05× | 341 | 29% |
+    | stage 6 template groups | 828 709 ns | 847 875 ns | 0.98× | 9 906 | 1% |
+    | stage 7 templated blocks | 535 624 ns | 381 733 ns | 1.40× | 22 003 | 0% |
+    | compaction unattributed (ledger, merges, `shift`) | 531 152 ns | 534 917 ns | 0.99× | 15 702 | 0% |
+    | pipeline unattributed (stats assembly, options echo) | 1 465 ns | 1 363 ns | — | — | — |
 
+    The two stages that decide things did not move (stage 3, stage 6-grouping,
+    and the unattributed ledger time are all within 2% of their old values),
+    which is the signature of a change that bought speed without changing work.
     The criterion benches measure the same work per detector on the *full* unit
     set (`iter_batched`, so split/forms setup is excluded from the timing) and
-    agree with the in-pipeline clocks, which is what makes a regression
-    attributable to one stage: `stage6_masked_forms` 135.05 ms,
-    `stage4_ws_runs` 69.63 ms, `stage5_blocks` 57.36 ms, `stage1_split`
-    11.35 ms, `stage7_templated_blocks` 2.79 ms, `stage3_exact_runs` 1.78 ms,
-    `stage6_template_groups` 855 µs, `compact/stages1_7` 273.45 ms,
-    `end_to_end/compress_8mib` 277.47 ms, `compact/ledger_setup` 2.12 µs (so
-    `Ledger::new` is free and nothing hides in setup). Isolated `stage1_split`
-    is 4 ms *lower* than in-pipeline (fresh `Vec<Unit>` each iteration vs a
-    warm one, i.e. the pipeline's number includes its growth) and isolated
-    `stage7_templated_blocks` is 5× higher (in-pipeline, stages 3–6 have
+    now agree with the in-pipeline clocks to within 0.05% on the whole window —
+    `compact/stages1_7` **83.40 ms** against the gate's 83.43 ms, and
+    `end_to_end/compress_8mib` **89.17 ms** against the aggregate's 90.47 ms,
+    which is what makes a regression attributable to one stage:
+    `stage6_masked_forms` **32.50 ms** (was 135.05), `stage5_blocks`
+    **30.53 ms** (was 57.36), `stage4_ws_runs` **11.46 ms** (was 69.63),
+    `stage1_split` **9.32 ms** (was 11.35), `stage7_templated_blocks` 2.28 ms
+    (was 2.79), `stage3_exact_runs` 1.80 ms (was 1.78, flat),
+    `stage6_template_groups` 903 µs (was 855 µs, flat), `compact/ledger_setup`
+    2.29 µs (so `Ledger::new` is free and nothing hides in setup). Isolated
+    `stage1_split` is 1.6 ms *lower* than in-pipeline (fresh `Vec<Unit>` each
+    iteration vs a warm one, i.e. the pipeline's number includes its growth),
+    isolated `stage5_blocks` is 6 ms *higher*, and isolated
+    `stage7_templated_blocks` is 6× higher (in-pipeline, stages 3–6 have
     already claimed nearly every candidate, so stage 7 has almost nothing to
-    scan); the other eleven are within 15%.
-  - **Where the miss is.** 74.0% of the compaction window is two per-byte
-    stages that run over every unit regardless of what commits: §4.6 masking +
-    `xxh3-128` at 62 MB/s, and the §4.2 ws-normalization that both it and
-    stage 4 redo at 132 MB/s. The stages that *decide* things are nearly free
-    (stages 3, 6-grouping and 7 together are 1.2% of the window); stage 5's
-    windowed scan is 18.8%. All of it is linear in span bytes, so the miss is a
-    **constant-factor** problem — roughly 5× on the normalization/masking line —
-    not a superlinear blow-up and not a fixture artifact. Three compositions of
-    the fixture were measured while writing this hunk, and the verdict does not
-    depend on which one ships: 45% dump-records / 55% log lines, 77 000 units
-    → **30.4 MB/s** (shipped); 40% / 60%, 38 556 units, no over-cap line →
-    **32.4 MB/s**; a deliberately harsher 88% / 12%, 91 520 units, 99.5% of the
-    output removed → **29.6 MB/s**. The W2-review hunk's independent
-    end-to-end number on a completely different corpus was 31.4 MB/s, within
-    3% of the shipped fixture. Nothing was re-tuned to improve any of these.
-  - **R2 is not met.** §8's target is ≤80 ms single core, warm, 8 MB. Measured
-    **275.81 ms p50 / 276.92 ms p99**, i.e. **3.4× over**, with the detect line
-    (7.00 ms) and the splice line (0.040 ms) together 2.6% of it. R2 is missed
-    inside span compaction and nowhere else. Recorded as measured: the budget
-    is normative, so the choice between "make masking and ws-normalization
-    ~5× faster" and "restate §8" belongs to the design owner, not to this hunk.
-    The two cheap-looking wins the table exposes are (a) `wsnorm` and `mask`
-    recompute the same bytes three times per unit (stage 4, the stage-6
-    pre-pass, stage 5's `load`) and (b) `Forms::build` fingerprints and copies
-    every unit's masked form even for units no detector will look at again.
-    Both are implementation changes that alter nothing normative; neither was
-    made here.
+    scan); the other four are within 1.5%.
+  - **What was optimized, and what it cost.** Five source files, no
+    normative change: `wsnorm.rs` gained a SWAR (`has_byte`) byte search plus a
+    `plain_run` fast path so a unit's non-escape bytes are copied in runs
+    instead of one `extend_from_slice` per byte, and exported `next_byte`;
+    `stage1.rs` uses that search to skip to the next `\` and to find a marker
+    opener instead of scanning byte-at-a-time; `mask.rs` replaced the
+    six-attempt `MASK_LIST` scan with a 256-entry byte-class table and a single
+    `Probe` per position, and dropped the now-redundant `date_at`/`ts_at`/
+    `hex_at` re-scans; `detect/blocks.rs` moved the id columns from
+    `Vec<Option<usize>>` to `Vec<u32>` with a `u32::MAX` sentinel and hoisted
+    the first element out of the window compare; `detect/wsruns.rs` memoizes the
+    right-hand normalized form so an adjacent pair is normalized once instead
+    of twice. `benches/stages.rs` gains a `micro` group (normalize, fingerprint,
+    mask, normalize+mask, forms-build, table-size) for the next round.
+  - **Behaviour preservation, verified rather than asserted.** The `mask.rs`
+    rewrite is a rewrite of §4.6, so "the tests still pass" is not evidence
+    enough. Three independent checks: (a) a differential harness ran the
+    pre-change `mask.rs` and `wsnorm.rs` side by side with the new ones over
+    4 000 000 generated lines — 2 000 000 over an adversarial alphabet
+    (mixed letter/digit tokens, bare `::`, truncated UUIDs, out-of-range IPv4
+    octets, every duration unit) and 2 000 000 over a log-shaped one — with
+    **0 mismatches** in both `mask` and `wsnorm`; (b) the perf payload was
+    compressed by both builds under four option sets (default, `normalize_ws
+    = false`, `min_group_size = 2`, `reversible = true`) and the output bytes,
+    the full commit ledger and every `Stats` field except the two elapsed
+    clocks are **byte-identical**; (c) `crates/core/tests/mask.rs` gains a
+    `MIXED`/`MIXED_HEX` golden group for the one input class the suite had no
+    coverage of — a hex run that mixes letters and digits, where the leading
+    digit run is shorter than the hex run (`1a2ms`, `abc1`, `1a2.3`,
+    `A550e8400-e29b-…`). That group is not decoration: an intermediate state of
+    this optimization, which read the leading digit run off the *last* digit in
+    the hex run instead of the first, passed all 485 pre-existing tests and
+    still produced the right bytes on the perf payload, while turning
+    `1a2ms` into `<dur>`. The goldens fail on that state and pass on the
+    committed one. **No existing test, golden vector or assertion was modified
+    or weakened** — `git diff --stat crates/core/tests/` touches
+    `mask.rs` only, and only by addition.
+  - **Where the miss is now.** 68% of the compaction window is two stages:
+    §4.6 masking + `xxh3-128` at 39%, and stage 5's windowed block scan at 29%.
+    Stage 4 and stage 1 are 13% each. The stages that *decide* things are
+    nearly free (stages 3, 6-grouping and 7 together are 3% of the window). All
+    of it is still linear in span bytes, so the miss remains a
+    **constant-factor** problem — now ~1.7× rather than ~5× on the
+    normalization/masking line. Nothing about the shape of the problem changed:
+    the same three fixture compositions measured before the optimization still
+    bracket the shipped one, and nothing was re-tuned to improve any of them.
+  - **R2 is still not met.** §8's target is ≤80 ms single core, warm, 8 MB.
+    Measured **90.47 ms p50 / 91.71 ms p99**, i.e. **1.13× over** (it was 3.4×
+    over), with the detect line (7.00 ms) and the splice line (0.03 ms)
+    together 7.8% of it. R2 is missed inside span compaction and nowhere else.
+    Recorded as measured: the budget is normative, so the choice between
+    "make masking and stage 5 ~1.7× faster still" and "restate §8" belongs to
+    the design owner, not to this hunk.
   - **One honest caveat on the detect line.** It is the only §8 line whose
     measurement swings with **code layout**: the same source, payload and box
     measured `elapsed_detect_ns` p50 = 4.52 ms in one build of the gate and
@@ -3702,15 +3744,10 @@ exit criteria. Gates M1–M4 are blocking milestones.
     bundle rather than a parameter to `compact_span` (that call site would trip
     `clippy::too_many_arguments` at 8/7 without it — the same trap the W2 review
     recorded for `blocks::Domain`). The default build's behaviour is unchanged.
-  - **Verification.** `cargo test --workspace` → **480 passed, 0 failed, 2
-    ignored** (W4.1's property tests are in that count; `perf_fixture` is
-    `#![cfg(feature = "bench_stages")]` and contributes 0 to the default
-    build). `cargo test -p quantification-core --features bench_stages` → the
-    same suite green **plus** the 4 `perf_fixture` tests and the three
-    feature-aware clock bounds. `cargo fmt --all --check` clean;
-    `cargo clippy --workspace --all-targets -- -D warnings` clean;
-    `cargo clippy -p quantification-core --features bench_stages --lib --benches
-    -- -D warnings` clean. `cargo deny` is **not installed in this
+  - **Verification.** `cargo test --workspace` → **485 passed, 0 failed, 1
+    ignored**; `cargo test --workspace --all-features` → **494 passed, 0 failed,
+    1 ignored**. `cargo fmt --all --check` clean;
+    `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo deny` is **not installed in this
     environment**, so the licence/bans check was done by hand: all 33 newly
     locked crates (criterion 0.8.2's tree) declare `MIT`, `Apache-2.0`,
     `BSD-2-Clause` or `Unlicense`, every one inside `deny.toml`'s existing
@@ -3719,11 +3756,19 @@ exit criteria. Gates M1–M4 are blocking milestones.
     `itertools 0.13` alongside the `0.14` already in the tree. The `fuzz/`
     crate still does not compile for the pre-existing `fuzz_splitter` reason
     the W3.4 hunk records; it is untouched here and is W4.5's.
-  - **Left for the next owner, in the order the table suggests:** make
-    `wsnorm` + `mask` + `xxh3-128` ~5× faster (one pass, one normalized copy
-    shared by stages 4/5/6, one hash of the masked form), then re-run this
-    gate. The floors are enforced in code, so the gate turns green the moment
-    the work is done, and the criterion group that moved names the stage.
+  - **Left for the next owner, in the order the table now suggests:** attack
+    **`stage6_masked_forms` (39% of the window)** and **`stage5_blocks`
+    (29%)**. Stage 6 is still per-byte work over every unit — the byte-class
+    table removed the repeated re-scans but `Forms::build` still normalizes,
+    masks and xxh3-128-hashes every unit, including units no detector will look
+    at again, and the same bytes are still recomputed once per stage (stage 4,
+    the stage-6 pre-pass, stage 5's `load`); sharing one normalized copy and one
+    hash across stages 4/5/6 is the obvious next move and the `micro` group
+    added to `benches/stages.rs` measures its parts separately. Stage 5's
+    windowed scan is the other 29%. The floors are enforced in code, so the gate
+    turns green the moment the work is done, and the criterion group that moved
+    names the stage. **M3 needs ~1.08× more aggregate and ~1.67× less
+    compaction; it is not green today and must not be recorded as green.**
 - **W4.4 Adversarial perf fixtures** (§12) — unique floods, giant line,
   periodic patterns, collision pressure, maximal-density `},{`. Parallel
   with W4.3.

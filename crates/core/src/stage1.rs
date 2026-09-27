@@ -3,6 +3,7 @@ use std::ops::Range;
 use crate::config::{MAX_LINE_BYTES, MarkerStyle};
 use crate::ledger::{CommitKind, framing};
 use crate::stage1b::segment_line;
+use crate::wsnorm::next_byte;
 
 const KINDS: [CommitKind; 5] = [
     CommitKind::ExactRun,
@@ -59,7 +60,7 @@ pub fn split_span_counted(span: &[u8], style: MarkerStyle) -> Split {
                 }
                 at += len;
             }
-            None => at += 1,
+            None => at = next_byte(span, at + 1, b'\\'),
         }
     }
     if start < span.len() {
@@ -97,9 +98,8 @@ fn scans(unit: &[u8], style: MarkerStyle) -> bool {
 
 fn find(unit: &[u8], needle: &[u8], at: usize) -> Option<usize> {
     let first = *needle.first()?;
-    let found = unit.get(at..)?.iter().position(|byte| *byte == first)?;
-    let start = at + found;
-    unit[start..].starts_with(needle).then_some(start)
+    let start = next_byte(unit, at, first);
+    unit.get(start..)?.starts_with(needle).then_some(start)
 }
 
 fn shape(unit: &[u8], at: usize, kind: CommitKind, style: MarkerStyle) -> bool {
