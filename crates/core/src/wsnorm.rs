@@ -1,3 +1,68 @@
+use std::ops::Range;
+
+use crate::fingerprint::fingerprint;
+use crate::stage1::Unit;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Column {
+    pub bytes: Vec<u8>,
+    pub start: Vec<usize>,
+    pub len: Vec<usize>,
+    pub hash: Vec<u128>,
+    pub span_bytes: usize,
+}
+
+impl Column {
+    pub fn with_capacity(span_bytes: usize, unit_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(span_bytes),
+            start: Vec::with_capacity(unit_bytes),
+            len: Vec::with_capacity(unit_bytes),
+            hash: Vec::with_capacity(unit_bytes),
+            span_bytes: 0,
+        }
+    }
+
+    pub fn reserved(&self) -> (usize, usize) {
+        (self.bytes.capacity(), self.start.capacity())
+    }
+
+    pub fn build(&mut self, span: &[u8], units: &[Unit], line: &mut Vec<u8>) {
+        self.bytes.clear();
+        self.start.clear();
+        self.len.clear();
+        self.hash.clear();
+        self.span_bytes = span.len();
+        for unit in units {
+            normalize_into(&span[unit.range.clone()], line);
+            self.start.push(self.bytes.len());
+            self.len.push(line.len());
+            self.hash.push(fingerprint(line));
+            self.bytes.extend_from_slice(line);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.start.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start.is_empty()
+    }
+
+    pub fn range(&self, unit: usize) -> Range<usize> {
+        self.start[unit]..self.start[unit] + self.len[unit]
+    }
+
+    pub fn get(&self, unit: usize) -> &[u8] {
+        &self.bytes[self.range(unit)]
+    }
+
+    pub fn block(&self, start: usize, len: usize) -> &[u8] {
+        &self.bytes[self.start[start]..self.start[start + len - 1] + self.len[start + len - 1]]
+    }
+}
+
 pub fn normalize(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     normalize_into(raw, &mut out);

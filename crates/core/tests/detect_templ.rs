@@ -1,7 +1,7 @@
 use quantification_core::config::{MAX_LINE_BYTES, MAX_RECORD_BYTES, MarkerStyle};
 use quantification_core::detect::exact::exact_runs;
 use quantification_core::detect::templ::{Forms, Scratch, TemplateId, template_groups};
-use quantification_core::detect::wsruns::{Scratch as WsScratch, ws_runs};
+use quantification_core::detect::wsruns::ws_runs;
 use quantification_core::fingerprint::{MAX_SLOTS, fingerprint};
 use quantification_core::ledger::{
     Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, marker_len, profitable,
@@ -9,7 +9,7 @@ use quantification_core::ledger::{
 use quantification_core::mask::mask;
 use quantification_core::render::render;
 use quantification_core::stage1::{Unit, split_span};
-use quantification_core::wsnorm::normalize;
+use quantification_core::wsnorm::{Column, normalize};
 
 const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 const TEMPLATE_MARKER: &[u8] = "\u{27ea}\u{d7}2 rows, template \u{b7}7837\u{27eb}".as_bytes();
@@ -45,8 +45,16 @@ struct Six {
     degraded: bool,
 }
 
+fn column_of(span: &[u8], ledger: &Ledger<'_>) -> Column {
+    let mut column = Column::default();
+    let mut line = Vec::new();
+    column.build(span, ledger.units(), &mut line);
+    column
+}
+
 fn six(span: &[u8], ledger: &mut Ledger<'_>, min_group_size: u32, scratch: &mut Scratch) -> Six {
-    let Some(forms) = Forms::build(span, ledger.units(), scratch) else {
+    let column = column_of(span, ledger);
+    let Some(forms) = Forms::build(&column, ledger.units(), scratch) else {
         return Six {
             stats: StageStats::default(),
             forms: Forms::default(),
@@ -186,10 +194,9 @@ fn a_log_burst_collapses_to_one_representative_and_a_marker() {
     assert_eq!(units.len(), 3);
     let mut exact = new_ledger(&units);
     let mut ws = new_ledger(&units);
-    let mut ws_scratch = WsScratch::default();
     assert_eq!(exact_runs(&span, &mut exact, 3), StageStats::default());
     assert_eq!(
-        ws_runs(&span, &mut ws, 3, &mut ws_scratch),
+        ws_runs(&column_of(&span, &ws), &mut ws, 3),
         StageStats::default()
     );
     assert_eq!(exact.commits().len(), 0);
@@ -540,7 +547,7 @@ fn template_ids_are_content_derived_and_deterministic() {
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let mut other = Scratch::with_capacity(0, 0);
+    let mut other = Scratch::with_capacity(0);
     let left = six(&span, &mut first, 3, &mut scratch);
     let right = six(&span, &mut second, 3, &mut other);
     assert_eq!(left.forms, right.forms);
@@ -685,14 +692,14 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
     let span = span_with(br"\n", &borrowed);
     let units = split_span(&span, UNICODE);
     let widest = units.iter().map(|unit| unit.range.len()).max().unwrap();
-    let mut scratch = Scratch::with_capacity(widest, widest);
+    let mut scratch = Scratch::with_capacity(widest);
     let mut ledger = new_ledger(&units);
     let out = six(&span, &mut ledger, 3, &mut scratch);
     assert!(
         out.stats.template_groups > 3,
         "the generator produced no groups"
     );
-    assert_eq!(scratch.reserved(), (widest, widest));
+    assert_eq!(scratch.reserved(), widest);
     let few = span_with(
         br"\n",
         &[many[0].as_bytes(), many[1].as_bytes(), many[2].as_bytes()],
@@ -703,7 +710,7 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
         six(&few, &mut small, 3, &mut scratch).stats.template_groups,
         1
     );
-    assert_eq!(scratch.reserved(), (widest, widest));
+    assert_eq!(scratch.reserved(), widest);
     let mut grown = Scratch::default();
     let mut other = new_ledger(&units);
     let other_out = six(&span, &mut other, 3, &mut grown);
@@ -711,8 +718,7 @@ fn the_scratch_is_reused_and_never_grows_with_the_line_count() {
     let reference_out = six(&span, &mut reference, 3, &mut scratch);
     assert_eq!(other_out, reference_out);
     assert_eq!(other.commits(), ledger.commits());
-    assert!(grown.reserved().0 <= 2 * widest);
-    assert!(grown.reserved().1 <= 2 * widest);
+    assert!(grown.reserved() <= 2 * widest);
 }
 
 #[test]
@@ -721,16 +727,15 @@ fn template_groups_are_deterministic_over_a_generated_span() {
     let units = split_span(&span, UNICODE);
     let mut exact = new_ledger(&units);
     let mut ws = new_ledger(&units);
-    let mut ws_scratch = WsScratch::default();
     assert_eq!(exact_runs(&span, &mut exact, 3), StageStats::default());
     assert_eq!(
-        ws_runs(&span, &mut ws, 3, &mut ws_scratch),
+        ws_runs(&column_of(&span, &ws), &mut ws, 3),
         StageStats::default()
     );
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let mut other = Scratch::with_capacity(0, 0);
+    let mut other = Scratch::with_capacity(0);
     let left = six(&span, &mut first, 3, &mut scratch);
     let right = six(&span, &mut second, 3, &mut other);
     assert_eq!(left.forms, right.forms);
@@ -816,7 +821,8 @@ fn the_templ_module_has_no_forbidden_determinism_inputs() {
         assert!(!uses(banned), "template groups must not use {banned}");
     }
     assert!(source.contains("mask_into"));
-    assert!(source.contains("normalize_into"));
+    assert!(source.contains("column.get(index)"));
+    assert!(!source.contains("normalize_into"));
     assert!(source.contains("FingerprintTable::for_keys"));
     assert!(source.contains("insert_hashed"));
     assert!(source.contains("Proposal::run(at..end, CommitKind::TemplateGroup)"));

@@ -11,13 +11,14 @@ use crate::render::{self, resolve_style};
 use crate::sniff::{self, Schema};
 use crate::splice::splice_into;
 use crate::stage1;
+use crate::wsnorm;
 
 pub const ALGO_VERSION: &str = "0.1.0";
 
 #[cfg(feature = "bench_stages")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StageTimes {
-    ns: [u64; 7],
+    ns: [u64; 8],
 }
 
 #[cfg(feature = "bench_stages")]
@@ -25,18 +26,20 @@ pub struct StageTimes {
 #[repr(usize)]
 pub enum Stage {
     Split = 0,
-    ExactRuns = 1,
-    WsRuns = 2,
-    MaskedForms = 3,
-    Blocks = 4,
-    TemplateGroups = 5,
-    TemplatedBlocks = 6,
+    WsColumn = 1,
+    ExactRuns = 2,
+    WsRuns = 3,
+    MaskedForms = 4,
+    Blocks = 5,
+    TemplateGroups = 6,
+    TemplatedBlocks = 7,
 }
 
 #[cfg(feature = "bench_stages")]
 impl Stage {
-    pub const ALL: [Stage; 7] = [
+    pub const ALL: [Stage; 8] = [
         Self::Split,
+        Self::WsColumn,
         Self::ExactRuns,
         Self::WsRuns,
         Self::MaskedForms,
@@ -48,6 +51,7 @@ impl Stage {
     pub fn name(self) -> &'static str {
         match self {
             Self::Split => "stage1_split",
+            Self::WsColumn => "prepass_ws_column",
             Self::ExactRuns => "stage3_exact_runs",
             Self::WsRuns => "stage4_ws_runs",
             Self::MaskedForms => "stage6_masked_forms",
@@ -145,7 +149,8 @@ impl Clock for MonotonicClock {
 }
 
 struct Stages {
-    ws: wsruns::Scratch,
+    ws: wsnorm::Column,
+    line: Vec<u8>,
     templ: templ::Scratch,
     blocks: blocks::Scratch,
     templ_blocks: templ_blocks::Scratch,
@@ -156,7 +161,8 @@ struct Stages {
 impl Stages {
     fn new() -> Self {
         Self {
-            ws: wsruns::Scratch::default(),
+            ws: wsnorm::Column::default(),
+            line: Vec::new(),
             templ: templ::Scratch::default(),
             blocks: blocks::Scratch::new(),
             templ_blocks: templ_blocks::Scratch::new(),
@@ -166,14 +172,17 @@ impl Stages {
     }
 
     fn reserve(&mut self, span_bytes: usize, units: usize, unit_bytes: usize) {
-        if self.blocks.reserved().0 < span_bytes || self.blocks.reserved().1 < unit_bytes {
-            self.blocks = blocks::Scratch::with_capacity(span_bytes, unit_bytes);
+        if self.ws.reserved().0 < span_bytes || self.ws.reserved().1 < units {
+            self.ws = wsnorm::Column::with_capacity(span_bytes, units);
         }
-        if self.ws.reserved().0 < unit_bytes {
-            self.ws = wsruns::Scratch::with_capacity(unit_bytes, unit_bytes);
+        if self.line.capacity() < unit_bytes {
+            self.line = Vec::with_capacity(unit_bytes);
         }
-        if self.templ.reserved().0 < unit_bytes {
-            self.templ = templ::Scratch::with_capacity(unit_bytes, unit_bytes);
+        if self.blocks.reserved() < units {
+            self.blocks = blocks::Scratch::with_capacity(units);
+        }
+        if self.templ.reserved() < unit_bytes {
+            self.templ = templ::Scratch::with_capacity(unit_bytes);
         }
         if self.templ_blocks.reserved() < units {
             self.templ_blocks = templ_blocks::Scratch::with_capacity(units);
@@ -397,6 +406,11 @@ fn compact_span(
     };
     #[cfg(feature = "bench_stages")]
     let mark = clock.now_ns();
+    stages.ws.build(bytes, &units, &mut stages.line);
+    #[cfg(feature = "bench_stages")]
+    record(stages, clock, Stage::WsColumn, mark);
+    #[cfg(feature = "bench_stages")]
+    let mark = clock.now_ns();
     stats.merge(&exact::exact_runs(
         bytes,
         &mut ledger,
@@ -408,23 +422,22 @@ fn compact_span(
         #[cfg(feature = "bench_stages")]
         let mark = clock.now_ns();
         stats.merge(&wsruns::ws_runs(
-            bytes,
+            &stages.ws,
             &mut ledger,
             options.min_group_size,
-            &mut stages.ws,
         ));
         #[cfg(feature = "bench_stages")]
         record(stages, clock, Stage::WsRuns, mark);
     }
     #[cfg(feature = "bench_stages")]
     let mark = clock.now_ns();
-    let forms = templ::Forms::build(bytes, &units, &mut stages.templ);
+    let forms = templ::Forms::build(&stages.ws, &units, &mut stages.templ);
     #[cfg(feature = "bench_stages")]
     record(stages, clock, Stage::MaskedForms, mark);
     #[cfg(feature = "bench_stages")]
     let mark = clock.now_ns();
     stats.merge(&blocks::repeated_blocks(
-        bytes,
+        &stages.ws,
         forms.as_ref(),
         &mut ledger,
         MIN_BLOCK_LINES,

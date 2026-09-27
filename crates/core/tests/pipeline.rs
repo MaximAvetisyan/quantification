@@ -1440,6 +1440,11 @@ fn the_pipeline_module_has_no_forbidden_determinism_inputs() {
         order.windows(2).all(|pair| pair[0] < pair[1]),
         "stages 1/1b, 3, 4, the masked pre-pass, 5, 6 and 7 run in normative order"
     );
+    assert_eq!(
+        source.matches("stages.ws.build(").count(),
+        1,
+        "the ws-normalized column is built once per span and shared by stages 4, 5 and 6"
+    );
     let at = |site: &str| source.find(site).unwrap_or_else(|| panic!("{site}"));
     assert!(
         at("let result = compact_span(") < at("splice_into(payload"),

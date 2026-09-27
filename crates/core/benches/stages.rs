@@ -14,7 +14,7 @@ use quantification_core::sniff::{Schema, sniff};
 use quantification_core::splice::splice_into;
 use quantification_core::stage1::Unit;
 use quantification_core::stage1::split_span_counted;
-use quantification_core::wsnorm::normalize_into;
+use quantification_core::wsnorm::{Column, normalize_into};
 
 const MIN_GROUP_SIZE: u32 = 3;
 const MIN_BLOCK_LINES: u32 = 2;
@@ -55,9 +55,17 @@ fn units_of(span: &[u8], style: MarkerStyle) -> Vec<Unit> {
     split_span_counted(span, style).units
 }
 
+fn column_of(span: &[u8], units: &[Unit]) -> Column {
+    let mut column = Column::default();
+    let mut line = Vec::new();
+    column.build(span, units, &mut line);
+    column
+}
+
 fn forms_of(span: &[u8], units: &[Unit]) -> templ::Forms {
+    let column = column_of(span, units);
     let mut scratch = templ::Scratch::default();
-    templ::Forms::build(span, units, &mut scratch).expect("the fixture table never fills")
+    templ::Forms::build(&column, units, &mut scratch).expect("the fixture table never fills")
 }
 
 fn bench_locate(c: &mut Criterion) {
@@ -111,18 +119,26 @@ fn bench_compact(c: &mut Criterion) {
             BatchSize::LargeInput,
         )
     });
-    group.bench_function("stage4_ws_runs", |b| {
+    group.bench_function("prepass_ws_column", |b| {
         b.iter_batched(
             || units_of(span, style),
             |units| {
+                let column = column_of(span, &units);
+                black_box(column.bytes.len())
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("stage4_ws_runs", |b| {
+        b.iter_batched(
+            || {
+                let units = units_of(span, style);
+                let column = column_of(span, &units);
+                (units, column)
+            },
+            |(units, column)| {
                 let mut ledger = Ledger::new(&units, style);
-                let mut scratch = wsruns::Scratch::default();
-                black_box(wsruns::ws_runs(
-                    span,
-                    &mut ledger,
-                    MIN_GROUP_SIZE,
-                    &mut scratch,
-                ))
+                black_box(wsruns::ws_runs(&column, &mut ledger, MIN_GROUP_SIZE))
             },
             BatchSize::LargeInput,
         )
@@ -131,14 +147,15 @@ fn bench_compact(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let units = units_of(span, style);
+                let column = column_of(span, &units);
                 let forms = forms_of(span, &units);
-                (units, forms)
+                (units, column, forms)
             },
-            |(units, forms)| {
+            |(units, column, forms)| {
                 let mut ledger = Ledger::new(&units, style);
                 let mut scratch = blocks::Scratch::new();
                 black_box(blocks::repeated_blocks(
-                    span,
+                    &column,
                     Some(&forms),
                     &mut ledger,
                     MIN_BLOCK_LINES,
@@ -151,10 +168,18 @@ fn bench_compact(c: &mut Criterion) {
     });
     group.bench_function("stage6_masked_forms", |b| {
         b.iter_batched(
-            || units_of(span, style),
-            |units| {
+            || {
+                let units = units_of(span, style);
+                let column = column_of(span, &units);
+                (units, column)
+            },
+            |(units, column)| {
                 let mut scratch = templ::Scratch::default();
-                black_box(templ::Forms::build(black_box(span), &units, &mut scratch))
+                black_box(templ::Forms::build(
+                    black_box(&column),
+                    &units,
+                    &mut scratch,
+                ))
             },
             BatchSize::LargeInput,
         )
@@ -280,9 +305,22 @@ fn bench_micro(c: &mut Criterion) {
         })
     });
     group.bench_function("forms_build_all_units", |b| {
+        let column = column_of(span, &units);
         b.iter(|| {
-            let mut scratch = templ::Scratch::with_capacity(4096, 4096);
-            black_box(templ::Forms::build(black_box(span), &units, &mut scratch))
+            let mut scratch = templ::Scratch::with_capacity(4096);
+            black_box(templ::Forms::build(
+                black_box(&column),
+                &units,
+                &mut scratch,
+            ))
+        })
+    });
+    group.bench_function("build_column_all_units", |b| {
+        b.iter(|| {
+            let mut column = Column::with_capacity(span.len(), units.len());
+            let mut line = Vec::with_capacity(4096);
+            column.build(black_box(span), &units, &mut line);
+            black_box(column.bytes.len())
         })
     });
     group.bench_function("table_for_keys", |b| {

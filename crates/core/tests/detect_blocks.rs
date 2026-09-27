@@ -4,14 +4,14 @@ use quantification_core::config::{
 use quantification_core::detect::blocks::{Scratch, repeated_blocks};
 use quantification_core::detect::exact::exact_runs;
 use quantification_core::detect::templ::{Forms, Scratch as TemplScratch};
-use quantification_core::detect::wsruns::{Scratch as WsScratch, ws_runs};
+use quantification_core::detect::wsruns::ws_runs;
 use quantification_core::ledger::{
     Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, marker_len, profitable,
 };
 use quantification_core::mask::mask;
 use quantification_core::render::render;
 use quantification_core::stage1::{Unit, split_span};
-use quantification_core::wsnorm::normalize;
+use quantification_core::wsnorm::{Column, normalize};
 
 const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 const H0: &[u8] = br"INFO run start trace 1 payload";
@@ -45,6 +45,13 @@ fn lines_span(lines: &[&[u8]]) -> Vec<u8> {
     span_with(br"\n", lines)
 }
 
+fn column_of(span: &[u8], ledger: &Ledger<'_>) -> Column {
+    let mut column = Column::default();
+    let mut line = Vec::new();
+    column.build(span, ledger.units(), &mut line);
+    column
+}
+
 fn stage_as(
     span: &[u8],
     ledger: &mut Ledger<'_>,
@@ -52,8 +59,9 @@ fn stage_as(
     max: u32,
     scratch: &mut Scratch,
 ) -> StageStats {
-    let forms = Forms::build(span, ledger.units(), &mut TemplScratch::default());
-    repeated_blocks(span, forms.as_ref(), ledger, min, max, scratch)
+    let column = column_of(span, ledger);
+    let forms = Forms::build(&column, ledger.units(), &mut TemplScratch::default());
+    repeated_blocks(&column, forms.as_ref(), ledger, min, max, scratch)
 }
 
 fn stage(span: &[u8], ledger: &mut Ledger<'_>, scratch: &mut Scratch) -> StageStats {
@@ -265,7 +273,7 @@ fn a_block_behind_header_lines_commits() {
     assert_eq!(exact_runs(&span, &mut exact, 3), StageStats::default());
     let mut ws = new_ledger(&units);
     assert_eq!(
-        ws_runs(&span, &mut ws, 3, &mut WsScratch::default()),
+        ws_runs(&column_of(&span, &ws), &mut ws, 3),
         StageStats::default()
     );
     let mut ledger = new_ledger(&units);
@@ -756,7 +764,7 @@ fn stage_five_commits_only_what_stages_three_and_four_left() {
     let mut scratch = Scratch::default();
     let first = exact_runs(&span, &mut ledger, 3);
     assert_eq!(first.exact_runs, 1);
-    let second = ws_runs(&span, &mut ledger, 3, &mut WsScratch::default());
+    let second = ws_runs(&column_of(&span, &ledger), &mut ledger, 3);
     assert_eq!(second.ws_runs, 0);
     let third = stage(&span, &mut ledger, &mut scratch);
     assert_eq!(third.block_repeats, 1);
@@ -959,7 +967,7 @@ fn repeated_blocks_is_deterministic() {
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
     let mut scratch = Scratch::default();
-    let mut other = Scratch::with_capacity(span.len(), 64);
+    let mut other = Scratch::with_capacity(64);
     let stats = stage(&span, &mut first, &mut scratch);
     assert_eq!(stage(&span, &mut second, &mut other), stats);
     assert!(
@@ -988,22 +996,14 @@ fn repeated_blocks_is_deterministic() {
 }
 
 #[test]
-fn the_scratch_holds_each_residual_unit_once() {
+fn the_id_columns_hold_each_unit_once() {
     let span = generated_span(50, 0x1234_5678_9abc_def0);
     let units = split_span(&span, UNICODE);
-    let widest = units.iter().map(|unit| unit.range.len()).max().unwrap();
-    let normalized: usize = units
-        .iter()
-        .map(|unit| normalize(&span[unit.range.clone()]).len())
-        .sum();
-    let mut scratch = Scratch::with_capacity(span.len(), widest);
+    let mut scratch = Scratch::with_capacity(units.len());
     let mut ledger = new_ledger(&units);
     let stats = stage(&span, &mut ledger, &mut scratch);
     assert!(stats.block_repeats > 5);
-    let (arena, line) = scratch.reserved();
-    assert!(arena >= normalized);
-    assert_eq!(line, widest);
-    assert!(arena <= 2 * span.len());
+    assert_eq!(scratch.reserved(), units.len());
     let small: [&[u8]; 4] = [L0, L1, L0, L1];
     let small_span = lines_span(&small);
     let small_units = split_span(&small_span, UNICODE);
@@ -1012,12 +1012,12 @@ fn the_scratch_holds_each_residual_unit_once() {
         stage(&small_span, &mut small_ledger, &mut scratch).block_repeats,
         1
     );
-    assert_eq!(scratch.reserved(), (arena, line));
+    assert_eq!(scratch.reserved(), units.len());
     let mut grown = Scratch::default();
     let mut grown_ledger = new_ledger(&units);
     assert_eq!(stage(&span, &mut grown_ledger, &mut grown), stats);
-    assert!(grown.reserved().1 <= 2 * widest);
-    assert!(grown.reserved().0 <= 2 * span.len());
+    assert!(grown.reserved() <= 2 * units.len());
+    assert!(scratch.reserved() < span.len());
 }
 
 #[test]
@@ -1080,7 +1080,9 @@ fn the_blocks_module_has_no_forbidden_determinism_inputs() {
             "blocks must not use {banned}"
         );
     }
-    assert!(source.contains("normalize_into"));
+    assert!(source.contains("column.get(") || source.contains("column.block("));
+    assert!(!source.contains("normalize_into"));
+    assert!(!source.contains("mask_into"));
     assert!(source.contains("FingerprintTable"));
     assert!(source.contains("Proposal::repeat"));
     assert!(source.contains("CommitKind::Block"));

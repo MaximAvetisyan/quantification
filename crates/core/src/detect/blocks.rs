@@ -1,8 +1,6 @@
-use std::ops::Range;
-
-use crate::fingerprint::{FingerprintTable, Insert, fingerprint};
+use crate::fingerprint::{FingerprintTable, Insert};
 use crate::ledger::{CommitKind, CommitOutcome, Ledger, Proposal, StageStats};
-use crate::wsnorm::normalize_into;
+use crate::wsnorm::Column;
 
 use super::templ::Forms;
 
@@ -16,9 +14,6 @@ pub struct Work {
 pub const NONE: u32 = u32::MAX;
 
 pub struct Scratch {
-    arena: Vec<u8>,
-    line: Vec<u8>,
-    norm: Vec<Option<Range<usize>>>,
     ids: Vec<u32>,
     coarse: Vec<u32>,
     work: Work,
@@ -34,9 +29,6 @@ impl Default for Scratch {
 impl Scratch {
     pub fn new() -> Self {
         Self {
-            arena: Vec::new(),
-            line: Vec::new(),
-            norm: Vec::new(),
             ids: Vec::new(),
             coarse: Vec::new(),
             work: Work::default(),
@@ -44,16 +36,16 @@ impl Scratch {
         }
     }
 
-    pub fn with_capacity(span_bytes: usize, unit_bytes: usize) -> Self {
+    pub fn with_capacity(units: usize) -> Self {
         Self {
-            arena: Vec::with_capacity(span_bytes),
-            line: Vec::with_capacity(unit_bytes),
+            ids: Vec::with_capacity(units),
+            coarse: Vec::with_capacity(units),
             ..Self::new()
         }
     }
 
-    pub fn reserved(&self) -> (usize, usize) {
-        (self.arena.capacity(), self.line.capacity())
+    pub fn reserved(&self) -> usize {
+        self.ids.capacity()
     }
 
     pub fn work(&self) -> Work {
@@ -66,22 +58,21 @@ impl Scratch {
 }
 
 pub fn repeated_blocks(
-    span: &[u8],
+    column: &Column,
     forms: Option<&Forms>,
     ledger: &mut Ledger<'_>,
     min_block_lines: u32,
     max_block_lines: u32,
     scratch: &mut Scratch,
 ) -> StageStats {
-    if !load(span, forms, ledger, scratch) {
+    if !load(column, forms, ledger, scratch) {
         scratch.degraded = true;
         return StageStats::default();
     }
     let min = min_block_lines.max(1) as usize;
     let max = max_block_lines.max(1) as usize;
     let mut same_bytes = |first: usize, second: usize, len: usize| {
-        block(&scratch.norm, &scratch.arena, first, len)
-            == block(&scratch.norm, &scratch.arena, second, len)
+        column.block(first, len) == column.block(second, len)
     };
     let mut left_wall =
         |before: usize, first: usize| forms.is_some_and(|forms| forms.same(before, first));
@@ -104,24 +95,27 @@ pub fn repeated_blocks(
     )
 }
 
-fn load(span: &[u8], forms: Option<&Forms>, ledger: &Ledger<'_>, scratch: &mut Scratch) -> bool {
+fn load(
+    column: &Column,
+    forms: Option<&Forms>,
+    ledger: &Ledger<'_>,
+    scratch: &mut Scratch,
+) -> bool {
     let units = ledger.units();
-    scratch.arena.clear();
-    scratch.line.clear();
     reset(scratch, units.len());
     scratch.work = Work::default();
     scratch.degraded = false;
-    let mut table = FingerprintTable::for_keys(span.len());
-    for (index, unit) in units.iter().enumerate() {
-        if !unit.eligible || ledger.is_committed(index) {
+    let mut table = FingerprintTable::for_keys(column.span_bytes);
+    for index in 0..units.len() {
+        if !units[index].eligible || ledger.is_committed(index) {
             continue;
         }
-        normalize_into(&span[unit.range.clone()], &mut scratch.line);
-        let start = scratch.arena.len();
-        let hash = fingerprint(&scratch.line);
-        scratch.arena.extend_from_slice(&scratch.line);
-        let range = start..scratch.arena.len();
-        let rep = match table.insert_hashed(&scratch.arena, range.clone(), index, hash) {
+        let rep = match table.insert_hashed(
+            &column.bytes,
+            column.range(index),
+            index,
+            column.hash[index],
+        ) {
             Insert::New => index,
             Insert::Duplicate(rep) => rep,
             Insert::Full => {
@@ -129,7 +123,6 @@ fn load(span: &[u8], forms: Option<&Forms>, ledger: &Ledger<'_>, scratch: &mut S
                 return false;
             }
         };
-        scratch.norm[index] = Some(range);
         scratch.ids[index] = rep as u32;
         scratch.coarse[index] = match forms {
             Some(forms) => forms.id(index).0 as u32,
@@ -140,27 +133,10 @@ fn load(span: &[u8], forms: Option<&Forms>, ledger: &Ledger<'_>, scratch: &mut S
 }
 
 fn reset(scratch: &mut Scratch, units: usize) {
-    scratch.norm.clear();
-    scratch.norm.resize(units, None);
     for column in [&mut scratch.ids, &mut scratch.coarse] {
         column.clear();
         column.resize(units, NONE);
     }
-}
-
-fn block<'a>(
-    norm: &'a [Option<Range<usize>>],
-    arena: &'a [u8],
-    start: usize,
-    len: usize,
-) -> &'a [u8] {
-    let first = norm[start]
-        .as_ref()
-        .expect("candidate members are residual");
-    let last = norm[start + len - 1]
-        .as_ref()
-        .expect("candidate members are residual");
-    &arena[first.start..last.end]
 }
 
 pub(crate) struct Domain<'a, S, W, C> {

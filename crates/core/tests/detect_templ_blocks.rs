@@ -10,7 +10,7 @@ use quantification_core::detect::templ::{
 use quantification_core::detect::templ_blocks::{
     Scratch as Stage7Scratch, templated_blocks as stage7,
 };
-use quantification_core::detect::wsruns::{Scratch as WsScratch, ws_runs};
+use quantification_core::detect::wsruns::ws_runs;
 use quantification_core::fingerprint::fingerprint;
 use quantification_core::ledger::{
     Commit, CommitKind, CommitOutcome, Ledger, Proposal, StageStats, marker_len, profitable,
@@ -18,7 +18,7 @@ use quantification_core::ledger::{
 use quantification_core::mask::mask;
 use quantification_core::render::render;
 use quantification_core::stage1::{Unit, split_span};
-use quantification_core::wsnorm::normalize;
+use quantification_core::wsnorm::{Column, normalize};
 
 const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 
@@ -121,8 +121,16 @@ fn six(span: &[u8], ledger: &mut Ledger<'_>) -> Handoff {
     six_with(span, ledger, &mut TemplScratch::default())
 }
 
+fn column_of(span: &[u8], ledger: &Ledger<'_>) -> Column {
+    let mut column = Column::default();
+    let mut line = Vec::new();
+    column.build(span, ledger.units(), &mut line);
+    column
+}
+
 fn six_with(span: &[u8], ledger: &mut Ledger<'_>, scratch: &mut TemplScratch) -> Handoff {
-    let Some(forms) = Forms::build(span, ledger.units(), scratch) else {
+    let column = column_of(span, ledger);
+    let Some(forms) = Forms::build(&column, ledger.units(), scratch) else {
         return Handoff {
             stats: StageStats::default(),
             forms: Forms::default(),
@@ -160,18 +168,14 @@ fn earlier_stages_refuse(span: &[u8], units: &[Unit]) {
         StageStats::default()
     );
     assert_eq!(
-        ws_runs(
-            span,
-            &mut ws,
-            MIN_GROUP_SIZE_DEFAULT,
-            &mut WsScratch::default()
-        ),
+        ws_runs(&column_of(span, &ws), &mut ws, MIN_GROUP_SIZE_DEFAULT),
         StageStats::default()
     );
-    let forms = Forms::build(span, units, &mut TemplScratch::default());
+    let column = column_of(span, &blocks);
+    let forms = Forms::build(&column, units, &mut TemplScratch::default());
     assert_eq!(
         repeated_blocks(
-            span,
+            &column,
             forms.as_ref(),
             &mut blocks,
             MIN_BLOCK_LINES,
@@ -1002,7 +1006,7 @@ fn templated_blocks_are_deterministic_over_a_generated_span() {
     assert_eq!(units.len(), 280);
     let mut first = new_ledger(&units);
     let mut second = new_ledger(&units);
-    let mut other = TemplScratch::with_capacity(0, 0);
+    let mut other = TemplScratch::with_capacity(0);
     let left = six(&span, &mut first);
     let right = six_with(&span, &mut second, &mut other);
     assert_eq!(left.forms, right.forms);

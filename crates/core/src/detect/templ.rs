@@ -4,27 +4,25 @@ use crate::fingerprint::{FingerprintTable, Insert, fingerprint};
 use crate::ledger::{CommitKind, CommitOutcome, Ledger, Proposal, StageStats};
 use crate::mask::mask_into;
 use crate::stage1::Unit;
-use crate::wsnorm::normalize_into;
+use crate::wsnorm::Column;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TemplateId(pub u64);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scratch {
-    ws: Vec<u8>,
     form: Vec<u8>,
 }
 
 impl Scratch {
-    pub fn with_capacity(ws: usize, form: usize) -> Self {
+    pub fn with_capacity(form: usize) -> Self {
         Self {
-            ws: Vec::with_capacity(ws),
             form: Vec::with_capacity(form),
         }
     }
 
-    pub fn reserved(&self) -> (usize, usize) {
-        (self.ws.capacity(), self.form.capacity())
+    pub fn reserved(&self) -> usize {
+        self.form.capacity()
     }
 }
 
@@ -42,15 +40,14 @@ pub struct Forms {
 }
 
 impl Forms {
-    pub fn build(span: &[u8], units: &[Unit], scratch: &mut Scratch) -> Option<Self> {
-        let mut table = FingerprintTable::for_keys(span.len());
+    pub fn build(column: &Column, units: &[Unit], scratch: &mut Scratch) -> Option<Self> {
+        let mut table = FingerprintTable::for_keys(column.span_bytes);
         let mut forms = Self {
-            bytes: Vec::with_capacity(span.len()),
+            bytes: Vec::with_capacity(column.bytes.len()),
             units: Vec::with_capacity(units.len()),
         };
-        for (index, unit) in units.iter().enumerate() {
-            normalize_into(&span[unit.range.clone()], &mut scratch.ws);
-            mask_into(&scratch.ws, &mut scratch.form);
+        for index in 0..units.len() {
+            mask_into(column.get(index), &mut scratch.form);
             let masked = forms.bytes.len()..forms.bytes.len() + scratch.form.len();
             forms.bytes.extend_from_slice(&scratch.form);
             let hash = fingerprint(&scratch.form);
