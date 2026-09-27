@@ -773,14 +773,15 @@ fn the_command_transport_pipes_the_prompt_and_reports_a_missing_program() {
     assert_eq!(providers[1].spec().id, "anthropic");
 }
 
+fn sh(script: &str) -> tasks::Injected {
+    tasks::Injected::command(
+        PROVIDERS[0],
+        vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
+    )
+}
+
 #[test]
 fn a_child_that_closes_stdin_early_is_reported_by_its_exit_status() {
-    let sh = |script: &str| {
-        tasks::Injected::command(
-            PROVIDERS[0],
-            vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
-        )
-    };
     let unread = "x".repeat(8 << 20);
     let error = sh("exec 0<&-; exit 37")
         .complete(&unread)
@@ -807,6 +808,53 @@ fn a_child_that_closes_stdin_early_is_reported_by_its_exit_status() {
             "run {at}: the write/exit race changed the report: {}",
             error.reason
         );
+    }
+}
+
+#[test]
+fn a_child_that_answers_nothing_is_a_transport_failure() {
+    let unread = "x".repeat(8 << 20);
+    for script in ["exec 0<&-; exit 0", "true", "cat >/dev/null; exit 0"] {
+        for prompt in [&unread, "x"] {
+            let error = sh(script)
+                .complete(prompt)
+                .expect_err("a child that prints nothing must not be a scored answer");
+            assert_eq!(error.provider, "openai");
+            assert!(
+                error.reason.contains("answered with no output"),
+                "{script}: {}",
+                error.reason
+            );
+        }
+    }
+    assert_eq!(
+        sh("printf answer")
+            .complete("prompt body")
+            .expect("a child that answers still answers"),
+        "answer",
+        "the guard is for a dead transport, not for short answers"
+    );
+}
+
+#[test]
+fn the_exit_status_outranks_an_empty_answer() {
+    let unread = "x".repeat(8 << 20);
+    for script in ["exec 0<&-; exit 37", "exit 37"] {
+        for prompt in [&unread, "x"] {
+            let error = sh(script)
+                .complete(prompt)
+                .expect_err("a non-zero exit must fail");
+            assert!(
+                error.reason.contains("exited with") && error.reason.contains("37"),
+                "{script}: the exit status is checked first: {}",
+                error.reason
+            );
+            assert!(
+                !error.reason.contains("no output"),
+                "{script}: a child that exits non-zero is reported by its status: {}",
+                error.reason
+            );
+        }
     }
 }
 

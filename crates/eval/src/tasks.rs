@@ -206,6 +206,12 @@ fn run_command(spec: &ProviderSpec, argv: &[String], prompt: &str) -> Result<Str
             format!("cannot write the prompt to {program}: {e}"),
         ));
     }
+    if answer.iter().all(u8::is_ascii_whitespace) {
+        return Err(ModelError::new(
+            spec.id,
+            format!("{program} answered with no output"),
+        ));
+    }
     String::from_utf8(answer).map_err(|e| ModelError::new(spec.id, e.to_string()))
 }
 
