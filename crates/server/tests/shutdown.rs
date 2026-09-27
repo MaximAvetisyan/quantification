@@ -1,3 +1,4 @@
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tonic::transport::server::TcpIncoming;
 use tower::ServiceExt;
 
 const PAYLOAD: &[u8] =
@@ -29,14 +31,14 @@ struct Running {
 
 impl Running {
     fn start(grace: Duration) -> Self {
-        let (http, grpc_address, listener) = listeners();
+        let (http, _, listener, grpc) = listeners();
         let state = State::new();
         let (trigger, wait) = oneshot::channel();
         let done = tokio::spawn(serve(
             listener,
             state.clone(),
             grpc::Service::new(),
-            grpc_address,
+            grpc,
             async {
                 let _ = wait.await;
             },
@@ -60,12 +62,13 @@ impl Running {
     }
 }
 
-fn listeners() -> (SocketAddr, SocketAddr, TcpListener) {
+fn listeners() -> (SocketAddr, SocketAddr, TcpListener, TcpIncoming) {
     let (http, grpc_address) = (port(), port());
     let bound = std::net::TcpListener::bind(http).expect("bind http");
     bound.set_nonblocking(true).expect("nonblocking");
     let listener = TcpListener::from_std(bound).expect("tokio listener");
-    (http, grpc_address, listener)
+    let grpc = TcpIncoming::bind(grpc_address).expect("bind grpc");
+    (http, grpc_address, listener, grpc)
 }
 
 fn port() -> SocketAddr {
@@ -181,20 +184,21 @@ async fn answers(address: SocketAddr) -> bool {
     raw.starts_with(b"HTTP/1.1")
 }
 
-struct Server(Child);
+struct Server(Child, std::process::ChildStderr);
 
 impl Server {
     fn spawn(http: SocketAddr, grpc_address: SocketAddr, grace: &str) -> Self {
-        let server = Command::new(env!("CARGO_BIN_EXE_quantification-server"))
+        let mut server = Command::new(env!("CARGO_BIN_EXE_quantification-server"))
             .env("QUANT_HTTP_ADDR", http.to_string())
             .env("QUANT_GRPC_ADDR", grpc_address.to_string())
             .env(SHUTDOWN_GRACE_MS, grace)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("the server binary starts");
-        Self(server)
+        let log = server.stderr.take().expect("a piped stderr");
+        Self(server, log)
     }
 
     fn terminate(&self) {
@@ -207,6 +211,12 @@ impl Server {
 
     fn exit(&mut self) -> ExitStatus {
         self.0.wait().expect("the server exits")
+    }
+
+    fn log(&mut self) -> String {
+        let mut out = Vec::new();
+        let _ = self.1.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
     }
 }
 
@@ -325,14 +335,14 @@ async fn a_latched_shutdown_stops_accepting_and_exits_clean() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_in_flight_finishes_during_the_drain() {
-    let (http, grpc_address, listener) = listeners();
+    let (http, _, listener, grpc) = listeners();
     let state = State::new();
     let (trigger, wait) = oneshot::channel();
     let done = tokio::spawn(serve(
         listener,
         state.clone(),
         grpc::Service::new(),
-        grpc_address,
+        grpc,
         async {
             let _ = wait.await;
         },
@@ -371,13 +381,13 @@ async fn a_request_in_flight_finishes_during_the_drain() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_grace_period_bounds_the_drain() {
-    let (http, grpc_address, listener) = listeners();
+    let (http, _, listener, grpc) = listeners();
     let (trigger, wait) = oneshot::channel();
     let done = tokio::spawn(serve(
         listener,
         State::new(),
         grpc::Service::new(),
-        grpc_address,
+        grpc,
         async {
             let _ = wait.await;
         },
@@ -407,38 +417,44 @@ async fn the_grace_period_bounds_the_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_transport_tears_down_the_other_and_exits_non_zero() {
-    let grpc_address = port();
+async fn a_taken_grpc_port_fails_startup_without_announcing_a_listener() {
+    let (http, grpc_address) = (port(), port());
     let _squatter = std::net::TcpListener::bind(grpc_address).expect("bind");
-    let (http, _, listener) = listeners();
-    let state = State::new();
+    let mut server = Server::spawn(http, grpc_address, "5000");
 
-    let served = tokio::time::timeout(
-        Duration::from_secs(5),
-        serve(
-            listener,
-            state.clone(),
-            grpc::Service::new(),
-            grpc_address,
-            std::future::pending(),
-            Duration::from_millis(5_000),
-        ),
-    )
-    .await
-    .expect("the failure is reported, not a hang");
+    let status = server.exit();
 
-    let Err(error) = served else {
-        panic!("a grpc port already in use is a failure: {served:?}");
-    };
-    assert!(
-        matches!(error, ServeError::Grpc(_)),
-        "the taken grpc port is the failure: {error}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a dead transport is a startup failure, so the pod is replaced whole: {status}"
     );
-    assert_eq!(error.exit_code(), 1);
-    assert!(state.draining());
+    let log = server.log();
+    assert!(
+        !log.contains("listening"),
+        "the listening line is only true once both listeners exist: {log}"
+    );
+    assert!(
+        log.contains("cannot bind grpc"),
+        "and the port clash is named: {log}"
+    );
     assert!(
         !answers(http).await,
-        "one dead transport takes the other down with it, so the pod is replaced whole"
+        "and the http listener never served anything"
+    );
+}
+
+#[test]
+fn a_transport_failure_is_a_non_zero_exit() {
+    let http = ServeError::Http(std::io::Error::other("the listener died"));
+    assert_eq!(http.exit_code(), 1);
+    assert!(http.to_string().contains("the http server failed"));
+    assert_eq!(ServeError::GraceExpired(Duration::ZERO).exit_code(), 2);
+    assert!(
+        ServeError::GraceExpired(Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS))
+            .to_string()
+            .contains(&format!("{}ms", DEFAULT_SHUTDOWN_GRACE_MS)),
+        "an expired grace names the budget it blew"
     );
 }
 

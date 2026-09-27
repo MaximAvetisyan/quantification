@@ -4,7 +4,6 @@ mod options;
 
 use std::collections::BTreeMap;
 use std::future::{Future, IntoFuture};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -237,7 +236,7 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     state: State,
     service: grpc::Service,
-    grpc_address: SocketAddr,
+    grpc: tonic::transport::server::TcpIncoming,
     shutdown: impl Future<Output = ()>,
     grace: Duration,
 ) -> Result<(), ServeError> {
@@ -251,7 +250,7 @@ pub async fn serve(
     let mut grpc = Box::pin(
         tonic::transport::Server::builder()
             .add_service(grpc::server(service))
-            .serve_with_shutdown(grpc_address, released(drained)),
+            .serve_with_incoming_shutdown(grpc, released(drained)),
     );
     let mut shutdown = Box::pin(shutdown);
     let first = tokio::select! {
