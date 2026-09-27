@@ -521,28 +521,45 @@ async fn the_default_options_echo_is_the_section_seven_default() {
 }
 
 #[tokio::test]
-async fn reversible_is_accepted_and_reserved() {
-    let answer = compress(&router(), "/v1/compress?reversible=true", EXACT_RUN).await;
-    assert_eq!(answer.status, StatusCode::OK);
-    assert_eq!(
-        answer.body,
-        compress(&router(), "/v1/compress", EXACT_RUN).await.body
+async fn reversible_true_is_refused_and_reversible_false_resolves() {
+    let envelope = |reversible: bool| {
+        serde_json::to_vec(&serde_json::json!({
+            "payload": String::from_utf8(EXACT_RUN.to_vec()).expect("utf8"),
+            "options": {"reversible": reversible},
+        }))
+        .expect("json")
+    };
+    let target = "/v1/compress?reversible=true";
+    let answer = compress(&router(), target, EXACT_RUN).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{target}");
+    assert_eq!(answer.error_code(), "invalid_options", "{target}");
+    assert!(
+        answer.json["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("reversible=true is not accepted"),
+        "{target}"
     );
-    let envelope = serde_json::json!({
-        "payload": String::from_utf8(EXACT_RUN.to_vec()).expect("utf8"),
-        "options": {"reversible": true},
-    });
-    let answer = compress(
-        &router(),
-        "/v1/compress?envelope=json",
-        &serde_json::to_vec(&envelope).expect("json"),
-    )
-    .await;
+    let answer = compress(&router(), "/v1/compress?envelope=json", &envelope(true)).await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer.error_code(), "invalid_options");
+    assert_eq!(
+        answer.json.get("stats"),
+        None,
+        "a refused option answers no stats and no ids"
+    );
+
+    let plain = compress(&router(), "/v1/compress", EXACT_RUN).await;
+    let off = compress(&router(), "/v1/compress?reversible=false", EXACT_RUN).await;
+    assert_eq!(off.status, StatusCode::OK);
+    assert_eq!(off.body, plain.body, "false changes no output byte");
+    let answer = compress(&router(), "/v1/compress?envelope=json", &envelope(false)).await;
+    assert_eq!(answer.status, StatusCode::OK);
     assert!(
         answer.json["stats"]["options_echo"]
             .as_str()
             .expect("echo")
-            .ends_with("\"reversible\":true}")
+            .ends_with("\"reversible\":false}")
     );
     assert_eq!(
         answer.json["stats"].get("restore_ids"),

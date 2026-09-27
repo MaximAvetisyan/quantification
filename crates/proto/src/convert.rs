@@ -96,20 +96,50 @@ mod tests {
     }
 
     #[test]
-    fn explicit_false_survives_wire_and_resolves_false() {
-        let options = roundtrip(Options {
+    fn explicit_false_presence_survives_the_wire_and_resolves_false() {
+        let explicit = Options {
             normalize_ws: Some(false),
             template_dedup: Some(false),
-            reversible: Some(true),
             ..Options::default()
-        });
+        };
+        assert_ne!(
+            explicit.encode_to_vec(),
+            Options::default().encode_to_vec(),
+            "an explicit false must occupy the wire, so absent is not explicit false"
+        );
+        let options = roundtrip(explicit);
         assert_eq!(options.normalize_ws, Some(false));
         assert_eq!(options.template_dedup, Some(false));
-        assert_eq!(options.reversible, Some(true));
+        assert_eq!(options.reversible, None);
         let resolved = resolve(&request(options)).unwrap();
         assert!(!resolved.normalize_ws);
         assert!(!resolved.template_dedup);
-        assert!(resolved.reversible);
+        assert!(!resolved.reversible);
+    }
+
+    #[test]
+    fn reversible_true_is_refused_and_absent_or_false_resolves() {
+        for wire in [None, Some(false)] {
+            let options = roundtrip(Options {
+                reversible: wire,
+                ..Options::default()
+            });
+            assert_eq!(options.reversible, wire);
+            assert!(!resolve(&request(options)).unwrap().reversible);
+        }
+        let options = roundtrip(Options {
+            reversible: Some(true),
+            ..Options::default()
+        });
+        assert_eq!(
+            options.reversible,
+            Some(true),
+            "the refused value still occupies the wire"
+        );
+        assert_eq!(
+            resolve(&request(options)),
+            Err(ResolveError::UnsupportedReversible)
+        );
     }
 
     #[test]

@@ -2430,9 +2430,11 @@ exit criteria. Gates M1–M4 are blocking milestones.
   off by default and `CCR_ENABLED` is `cfg!(feature = "ccr")`; both feature
   states answer 501 `not_implemented` (the message says "disabled" vs "not
   implemented yet"), because §9's store is W3.4's and this wave invents none. The
-  same holds for `reversible=true`: it is parsed, resolved and echoed, changes
-  no output byte, and returns no `restore_ids`
-  (`reversible_is_accepted_and_reserved`).
+  same store's absence is what makes `reversible=true` a 400
+  `invalid_options` rather than a silent no-op: the option is parsed and then
+  refused by the core, so it changes no output byte, is never echoed as `true`,
+  and there is no `restore_ids` to return
+  (`reversible_true_is_refused_and_reversible_false_resolves`).
   **`/v1/detect`** is the §6.1 debugging aid: `locator::locate` with the
   `scope_policy` option (`scope_policy` is its only accepted query key; a
   reserved policy is a 400), reporting the sniffed schema, the degradation and
@@ -2622,9 +2624,10 @@ exit criteria. Gates M1–M4 are blocking milestones.
   plus `options_echo` are equal to the envelope's.
   `every_case_answers_the_core_bytes_and_a_full_stats_message` then asserts the
   full message field by field against the core's `Stats`, and
-  `the_reversible_option_is_decided_the_same_way_by_both_transports` asserts
-  parity of *outcome* for `reversible=true` (whatever the core decides, both
-  transports decide it identically) because that option's fate belongs to W3.4.
+  `reversible_true_is_refused_by_both_transports_and_false_resolves` asserts
+  that `reversible=true` is `InvalidArgument` on gRPC and 400 `invalid_options`
+  on HTTP (both naming the option) while `reversible=false` resolves, echoes
+  `false` and returns no `restore_ids`.
   Also asserted: every option's effect on the output, the wire round trip of
   `optional bool`, the pinned-contradiction vs matching-pin split, the
   unknown-enum and reserved-option `InvalidArgument`s, `Unimplemented` `Restore`
@@ -2660,15 +2663,60 @@ exit criteria. Gates M1–M4 are blocking milestones.
   `resolve_message` non-exhaustive and left **the whole crate uncompilable**, so
   this wave added the missing arm ("reversible=true is not accepted; the
   reversible store (DESIGN section 9) is not implemented yet") and both
-  transports report it identically. Two pre-existing tests now fail because of
-  that core change rather than of this wave, and both are in files this wave
-  does not own: `crates/proto`'s
-  `convert::tests::explicit_false_survives_wire_and_resolves_false` (it asserts
-  `reversible=true` resolves) and W3.2's
-  `reversible_is_accepted_and_reserved`. §3's degradation policy, §4.5's
+  transports report it identically. Two pre-existing tests encoded the old
+  contract and were left failing by that core change; both are re-pointed at the
+  new one by the W3 fix wave recorded below. §3's degradation policy, §4.5's
   marker/Stats set, §5's determinism, §6.1's option semantics, §6.2's service
   shape, §6.2's `Stats` message and §7's `request_body_limit` are implemented
   as written.
+
+- **W3 fix wave — the two tests that encoded the pre-`UnsupportedReversible`
+  contract** (2026-09-27). No behaviour changed: the core still refuses
+  `reversible=true` with `ResolveError::UnsupportedReversible` (400
+  `invalid_options` on HTTP, `InvalidArgument` on gRPC), and `reversible=false`
+  or absent still resolves to the §7 default.
+  - `crates/proto`: `convert::tests::explicit_false_survives_wire_and_resolves_false`
+    asserted, as a side effect of its fixture, that `reversible: Some(true)`
+    resolves. Its subject is proto3 `optional bool` **presence** for the
+    default-true options, so the fixture now sets `reversible` absent and keeps
+    the presence assertions (`normalize_ws`/`template_dedup` are `Some(false)`
+    after the wire round trip and resolve `false`; the encoded bytes differ from
+    `Options::default()`, which is what makes absent ≠ explicit false), and the
+    test is renamed
+    `explicit_false_presence_survives_the_wire_and_resolves_false`. A separate
+    `reversible_true_is_refused_and_absent_or_false_resolves` pins the new
+    contract: `Some(true)` survives the wire and then resolves to
+    `Err(UnsupportedReversible)`, while absent and `Some(false)` resolve `false`.
+  - `crates/server/tests/http.rs`: `reversible_is_accepted_and_reserved`
+    (renamed `reversible_true_is_refused_and_reversible_false_resolves`) now
+    asserts the query and envelope paths both answer 400 `invalid_options` with
+    a message naming the option and no `stats` at all, that `reversible=false`
+    is byte-identical to the default answer, and that its `options_echo` ends
+    `"reversible":false}` with no `restore_ids`.
+  - `crates/server/tests/grpc.rs`:
+    `the_reversible_option_is_decided_the_same_way_by_both_transports` accepted
+    either outcome ("that option's fate belongs to W3.4"), so its accepting
+    branch had become dead code. Renamed
+    `reversible_true_is_refused_by_both_transports_and_false_resolves`, it now
+    pins the refusal on both transports and the `false` round trip. The
+    rationale for refusing rather than echoing: §6.2 field 19 promises
+    `restore_ids` iff `reversible=true` and §9's store does not exist, so
+    echoing `true` beside an empty list is an affirmative false promise to a
+    machine client.
+  - `crates/server/src/lib.rs`: the two `/v1/restore` 501 messages said
+    "reversible=true is resolved and echoed but stores nothing", which the core
+    change made false; they now say the option is refused, so no span has a
+    `restore_id`. Message text only — no status, code or gate changed.
+  - Verification: `cargo test --workspace` **441 green** (442 collected, the
+    one `#[ignore]`d golden generator), **443** with
+    `--features quantification-core/strict_validate`, 60 green with
+    `-p quantification-server --features ccr`; `cargo fmt --all --check` clean
+    and `cargo clippy --workspace --all-targets -- -D warnings` clean in the
+    default, `all-features` and `strict_validate` states. W3.3's reported
+    `too_many_arguments` in `crates/core/src/detect/blocks.rs` no longer
+    reproduces: `windowed_blocks` takes six parameters because 99fc0f7 already
+    grouped the closure/domain arguments into `Domain`, so no `#[allow]` was
+    needed.
 
 ## Wave 4 — verification & perf (overlaps Waves 2–3 where noted)
 

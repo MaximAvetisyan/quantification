@@ -945,9 +945,9 @@ async fn repeated_identical_requests_answer_byte_identically() {
 }
 
 #[tokio::test]
-async fn the_reversible_option_is_decided_the_same_way_by_both_transports() {
-    let case = case(
-        "reversible",
+async fn reversible_true_is_refused_by_both_transports_and_false_resolves() {
+    let refused = case(
+        "reversible_true",
         EXACT_RUN,
         "?reversible=true",
         ContentType::Auto,
@@ -957,34 +957,45 @@ async fn the_reversible_option_is_decided_the_same_way_by_both_transports() {
             ..Options::default()
         },
     );
-    let served = http_status_and_bytes("/v1/compress?reversible=true", EXACT_RUN).await;
-    match compress(request(&case)).await {
-        Ok(answer) => {
-            assert_eq!(served.0, 200, "grpc accepted, so http must too");
-            assert_eq!(served.1.as_ref(), answer.payload.as_slice());
-            assert!(
-                answer
-                    .stats
-                    .expect("stats")
-                    .options_echo
-                    .ends_with("\"reversible\":true}"),
-                "the option is echoed either way"
-            );
-        }
-        Err(status) => {
-            assert_eq!(
-                status.code(),
-                Code::InvalidArgument,
-                "a refused option is the http 400 analogue"
-            );
-            assert!(
-                status.message().contains("reversible"),
-                "{} must name the option",
-                status.message()
-            );
-            assert_eq!(served.0, 400, "the transports must agree");
-        }
-    }
+    let status = compress(request(&refused)).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("reversible"),
+        "{} must name the option",
+        status.message()
+    );
+    let (http_status, body) =
+        http_status_and_bytes("/v1/compress?reversible=true", EXACT_RUN).await;
+    assert_eq!(http_status, 400, "the transports must agree");
+    let http: Value = serde_json::from_slice(&body).expect("error json");
+    assert_eq!(http["error"]["code"], "invalid_options");
+
+    let off = case(
+        "reversible_false",
+        EXACT_RUN,
+        "?reversible=false",
+        ContentType::Auto,
+        WireScopePolicy::UserContent,
+        Options {
+            reversible: Some(false),
+            ..Options::default()
+        },
+    );
+    let answer = compress(request(&off)).await.expect("false resolves");
+    assert_eq!(
+        answer.payload,
+        http_bytes("/v1/compress?reversible=false", EXACT_RUN).await
+    );
+    let stats = answer.stats.expect("stats");
+    assert!(
+        stats.options_echo.ends_with("\"reversible\":false}"),
+        "{}",
+        stats.options_echo
+    );
+    assert!(
+        stats.restore_ids.is_empty(),
+        "no store, so no ids next to the echoed false"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

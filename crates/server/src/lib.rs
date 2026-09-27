@@ -28,8 +28,8 @@ const COMPRESS: u8 = 0;
 const DETECT: u8 = 1;
 const RESTORE: u8 = 2;
 
-const CCR_MISSING: &str = "the reversible store (DESIGN section 9) is not implemented yet; reversible=true is resolved and echoed but stores nothing";
-const CCR_DISABLED: &str = "the reversible store (DESIGN section 9) is disabled in this build; reversible=true is resolved and echoed but stores nothing";
+const CCR_MISSING: &str = "the reversible store (DESIGN section 9) is not implemented yet; reversible=true is refused, so no span has a restore_id";
+const CCR_DISABLED: &str = "the reversible store (DESIGN section 9) is disabled in this build; reversible=true is refused, so no span has a restore_id";
 
 #[derive(Clone)]
 pub struct State {
