@@ -222,21 +222,44 @@ fn auto_is_refused_by_the_renderer() {
     let _ = render(MarkerStyle::Auto, CommitKind::ExactRun, 1, ANCHOR);
 }
 
+fn uses_token(source: &str, banned: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == banned)
+}
+
 #[test]
 fn render_path_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/render.rs");
+    let uses = |banned: &str| uses_token(source, banned);
+    assert!(
+        uses_token("fn f() { rand(); }", "rand"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("fn f() { std::env::var(\"X\"); }", "env"),
+        "a real use is seen"
+    );
+    assert!(
+        !uses_token("let brand = 1;", "rand"),
+        "the scan is not a substring match"
+    );
+    assert!(
+        !uses_token("fn f() { let brand = 1; }", "rand"),
+        "the scan is not a substring match"
+    );
     for banned in [
         "HashMap",
         "RandomState",
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "random",
         "f32",
         "f64",
-        "format!",
+        "format",
     ] {
-        assert!(!source.contains(banned), "{banned} in the renderer");
+        assert!(!uses(banned), "{banned} in the renderer");
     }
 }

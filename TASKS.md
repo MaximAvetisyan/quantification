@@ -3501,6 +3501,146 @@ exit criteria. Gates M1–M4 are blocking milestones.
 
 - **W4.2 Determinism CI gate** (§5) — 1000× PR / 200k nightly soak / fuzz
   double-run / CPU-feature matrix (baseline vs AVX2 vs NEON). After W2.9.
+  Status: **complete; every §5.8/§5.9 leg is wired and every one of them was
+  run here, with the numbers below measured rather than asserted (2026-09-27).**
+  Two files new (`crates/core/tests/determinism_harness.rs`,
+  `crates/core/tests/determinism_gate.rs`), one workflow new
+  (`.github/workflows/determinism.yml`), and **the last three substring
+  determinism source-scans are gone**; no production file, no dependency, no
+  `Cargo.lock`/`deny.toml` change, no golden touched.
+  - **The review of the in-flight hunk, and what it cost.** The two modified
+    files (`tests/detect_exact.rs`, `tests/detect_wsruns.rs`) had their loose
+    substring scans converted to whole-token matching, which is the right
+    conversion: `"std::env"` (a two-token path) became the token `"env"`, and
+    the split keeps `_`, so `HashMap`/`RandomState`/`sort_by` are still seen.
+    But the negative self-check the hunk added was **vacuous**:
+    `let uses = |banned| uses_token(source, banned)` closes over the *real*
+    module source, so `assert!(!uses("let brand = 1;"))` asks whether
+    `exact.rs` contains a token literally named `let brand = 1;` — always
+    false, so it passed for the wrong reason and would have kept passing
+    through any regression of the scan. Both files now take the sample string
+    as the argument, exactly as `tests/pipeline.rs` already did, and each
+    carries **four** self-checks: a real `rand()` call, a real
+    `std::collections::HashMap` import, a real `RandomState::new()`, a real
+    `std::env::var` path, and two negatives (`brand` must not read as `rand`).
+    **The identical vacuous negative was found in `tests/detect_templ.rs` and
+    `tests/detect_templ_blocks.rs`** (the W4.1 files that introduced the
+    pattern) and is fixed the same way. The last remaining substring scan in
+    the tree was in **`tests/render.rs`, not `tests/splice.rs`** — the W4.1
+    record names `splice.rs`, which has no source scan at all; `render.rs`
+    had one, with the same vacuous two-token `"std::env"` entry and `"format!"`
+    as a banned token, and it is now token-matched too (with `"format"`, so
+    the token is the one that can appear). Teeth were demonstrated, not
+    assumed: appending one line that uses `std::collections::HashMap` and
+    `std::env::var` to `src/detect/exact.rs` fails
+    `the_exact_module_has_no_forbidden_determinism_inputs` with
+    `exact runs must not use HashMap`, and the probe is reverted.
+  - **The M2 machinery is reused, not duplicated.** `tests/pipeline.rs`'s
+    gate-M2 harness and the new gate had converged on the same ~90 lines
+    (fixture loading, `compress_all`, the `RandomState` seed fingerprint, the
+    child report format and its parser, the fresh-process runner, the profile
+    table). All of it now lives in `tests/determinism_harness.rs`, included by
+    `#[path]` from both files (so it also compiles as its own 0-test target,
+    the price already paid for `tests/adversarial_fixtures.rs`). M2's own
+    `gate_m2_outputs_are_identical_across_processes_and_environments` is now
+    one call into the shared `assert_fresh_processes_agree`, and it runs on
+    **three** environment profiles instead of two. Net: `pipeline.rs` −173
+    lines, and one implementation of the cross-process check.
+  - **The PR quick gate** (`quick-gate`, blocking, every push and PR). Three
+    steps: the corpus is proved non-vacuous; the whole corpus is byte-equal in
+    **three fresh processes** under differing `RandomState` seeds,
+    `RAYON_NUM_THREADS` 1/8/3, `RUST_TEST_THREADS` 1/4/2, `LC_ALL`/`LANG`
+    `C`/`C.UTF-8`/`tr_TR.UTF-8` and `TZ` `UTC`/`Pacific-Auckland`/`Asia/Kolkata`;
+    then **1000 runs** over the corpus, byte-equal. **Measured here: 36 corpus
+    entries (847 098 B) — 18 golden and 3 of the 10 W4.4 adversarial cases
+    actually change bytes, so 21 of 36 entries are compression-sensitive and
+    the byte-comparisons are not over pass-through — 1000 runs in 8.91 s in
+    release, so the whole gate is ~10 s of compute.** The corpus is the 26
+    golden fixtures **plus** `fixtures::gate_suite()`, so the W4.4 adversarial
+    cases are in the gate by construction; W4.4's "not done" note about
+    writing a *file-level* corpus entry per case is still open and is still
+    what `gate_suite()` substitutes for.
+    **Honest limit on "varying thread counts":** the pipeline is
+    single-threaded (§5.5 — there is no `rayon` or `std::thread` in
+    `crates/core/src`), so today that variation is env-level plus the test
+    harness's own parallelism. The profiles are the hook; when parallelism
+    lands, the same three profiles become a real thread-count check with no
+    change to the gate.
+  - **The nightly soak: 200 000 runs, honestly chunked.** 1000 runs cost
+    8.91 s, so 200 000 runs is **≈29 core-minutes on the reference box** —
+    too long for one 30-min job once the build is counted, and it would
+    serialise the nightly behind a single core. It is therefore **8 parallel
+    legs of 25 000 runs each (≈3.7 min per leg, measured from the 8.6 ms per
+    run the chunk leg reports)**, and `the_soak_chunks_add_up_to_the_whole_run_count`
+    is the aggregate that makes the chunking honest: it requires every chunk's
+    report to exist, sums the run counts to **exactly** `QUANT_SOAK_TOTAL`
+    (200 000), sums the mismatches to 0, and requires every chunk to agree on
+    the corpus size, on the reference fold and on the observed fold. Verified
+    here end to end with `QUANT_SOAK_TOTAL=64 QUANT_SOAK_CHUNKS=4`: 4×16 runs,
+    `64 runs over 4 chunks, 36 entries`, and the aggregate **fails** when a
+    report is corrupted — both on `mismatches 1` and on a disagreeing
+    `observed` fold.
+  - **Fuzz determinism** (nightly). The checkout ships no retained corpus, so
+    the leg grows one first (2000 runs per target on real nightly) and then
+    compresses **every retained input in two fresh processes**, byte-equal,
+    with the parent recompressing every input a third time as a cross-check.
+    Verified here against a synthetic three-input corpus:
+    `3 retained fuzz inputs, 0 of which compress, byte-equal in two fresh
+    processes`. **Zero compressing is not a weakness here** — §12 says fuzz
+    inputs that merely fail to compress must pass through, so the property
+    under test is the byte-equality, not the ratio. This leg could not be run
+    end to end in this session because `fuzz/fuzz_targets/fuzz_splitter.rs`
+    did not compile (W2.6 changed `stage1::split_span`'s signature and the
+    target still called the two-argument form); that is W4.5's build break,
+    fixed in the same session, and the leg is wired so it runs as soon as the
+    fuzz crate builds.
+  - **The CPU-feature matrix, with the unavailable leg reported rather than
+    skipped.** `isa-leg` builds the gate corpus **twice, for real**: leg
+    `baseline` with `RUSTFLAGS=-C target-cpu=x86-64` and leg `avx2` with
+    `-C target-cpu=x86-64-v3` (AVX2 + FMA + BMI), each in its own fresh CI
+    target dir, each writing a per-entry digest plus a `.build` provenance
+    file. **Verified here that the two legs really are different binaries**
+    (distinct `-C metadata` hashes, 1 320 888 B vs 1 318 688 B, 52 vs 309
+    VEX-encoded vector instructions) **and that they produce the identical
+    digest** `b3550dd54fd6bb04a7308ee5b031cfeb` over all 36 entries — the
+    §5.9 ISA-independence claim, checked rather than assumed. `isa-matrix`
+    then downloads both legs and runs
+    `the_available_isa_legs_agree_byte_for_byte`, which **fails if a leg
+    neither reported a digest nor a reason** (a silent skip is a failure, not
+    a pass), requires every digest to cover all 36 corpus entries by name, and
+    prints the whole table. **The NEON leg is reported UNAVAILABLE on an x86_64
+    runner, with the reason written into the artifact and a `::warning::`
+    annotation on the run** — this session's measured output is
+    `leg neon: UNAVAILABLE: runner x86_64 cannot run NEON: DESIGN.md 5.9's NEON
+    leg needs an aarch64 runner (GitHub-hosted: ubuntu-24.04-arm)` and
+    `isa matrix: 2 of 3 legs ran and agree, 1 reported unavailable`. It is
+    **not** running today and this record does not claim otherwise; wiring it
+    is one `runs-on` change once an aarch64 runner is available. The
+    aggregate's teeth were demonstrated: deleting the reason file turns the
+    leg into a silent skip and the test FAILS, and perturbing one line of one
+    leg's digest FAILS with `the avx2 build diverges from the baseline build`.
+  - **Gates.** `cargo test --workspace` **505 green, 0 failed, 1 `#[ignore]`d**
+    (unchanged: the new harness target collects 0 tests, and the gate's own
+    5 ignored tests are CI-driven), **517** with `--all-features`, **434** for
+    `-p quantification-core --features bench_stages`, **429** with
+    `strict_validate`, **70** for `-p quantification-server --features ccr`.
+    `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets
+    -D warnings` clean in the default and `--all-features` states. Every
+    command the new workflow claims to run was executed here, and each of its
+    eight test filters was checked to resolve to exactly one test in the
+    binary.
+  - **Not done / still open.** The NEON leg is reported unavailable rather than
+    run (§ above). W4.4's file-level corpus entry per adversarial case is
+    still missing, so the soak and fuzz legs address those payloads by
+    in-process `gate_suite()` only. The `perf.yml` gate still runs on
+    `pull_request` with `continue-on-error`, and this workflow's quick gate is
+    blocking; the two are not unified. The in-process 1000× leg cannot vary
+    threads inside one process (§ above). And the fuzz-determinism leg's
+    corpus is grown in the same job that consumes it, so a libFuzzer run that
+    retains nothing would make the leg fail on its own
+    non-vacuity assertion rather than report an empty corpus — deliberate, but
+    it means a libFuzzer change that stops retaining inputs shows up as a
+    determinism failure.
 - **W4.3 Criterion benches + nightly perf gate** (§8 per-stage budgets);
   measure the 8 MiB splice copy explicitly. After W2.9. **Gate M3**:
   ≥100 MB/s p50 aggregate.

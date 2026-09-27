@@ -1,0 +1,173 @@
+name: determinism
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  quick-gate:
+    name: quick gate, 1000 runs, blocking
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: the corpus is the 26 golden fixtures plus the ten W4.4 adversarial cases
+        run: >
+          cargo test -p quantification-core --test determinism_gate
+          the_gate_corpus_covers_every_schema_and_is_not_vacuous -- --nocapture
+      - name: three fresh processes, differing RandomState seeds, thread counts, locales and TZ
+        run: >
+          cargo test -p quantification-core --test determinism_gate
+          gate_outputs_are_identical_in_fresh_processes_under_varied_threads_and_locales
+          -- --nocapture
+      - name: 1000 runs over the whole corpus, byte-equal (DESIGN.md 5.8)
+        run: >
+          cargo test --release -p quantification-core --test determinism_gate
+          gate_outputs_are_byte_stable_over_1000_runs -- --ignored --nocapture
+
+  isa-leg:
+    name: cpu-feature matrix, ${{ matrix.leg }} build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: baseline
+            rustflags: -C target-cpu=x86-64
+          - leg: avx2
+            rustflags: -C target-cpu=x86-64-v3
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      QUANT_ISA_DIGEST: ${{ github.workspace }}/target/isa-legs/${{ matrix.leg }}.txt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: the build this leg is, written next to its digest as provenance
+        run: |
+          mkdir -p "${{ github.workspace }}/target/isa-legs"
+          {
+            rustc --version --verbose
+            echo "RUSTFLAGS=$RUSTFLAGS"
+            echo "runner=$(uname -m)"
+          } > "${{ github.workspace }}/target/isa-legs/${{ matrix.leg }}.build"
+      - name: digest the gate corpus under this leg's target features
+        run: >
+          cargo test --release -p quantification-core --test determinism_gate
+          -- --exact --nocapture isa_child_writes_the_corpus_digest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: isa-leg-${{ matrix.leg }}
+          path: target/isa-legs
+
+  isa-matrix:
+    name: cpu-feature matrix, every leg accounted for
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: isa-leg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/isa-legs
+          merge-multiple: true
+      - name: declare the legs this runner cannot execute instead of skipping them
+        run: |
+          if [ "$(uname -m)" != "aarch64" ] && [ ! -f target/isa-legs/neon.txt ]; then
+            echo "runner $(uname -m) cannot run NEON: DESIGN.md 5.9's NEON leg needs an aarch64 runner (GitHub-hosted: ubuntu-24.04-arm)" > target/isa-legs/neon.unavailable
+            echo "::warning::the DESIGN.md 5.9 NEON leg was NOT run on this runner; it is reported unavailable, not skipped"
+          fi
+          ls -l target/isa-legs
+      - name: every leg that ran agrees byte for byte, every leg that did not says why
+        run: >
+          cargo test --release -p quantification-core --test determinism_gate
+          the_available_isa_legs_agree_byte_for_byte -- --ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: isa-matrix
+          path: target/isa-legs
+
+  soak:
+    name: nightly soak, chunk ${{ matrix.chunk }} of 8
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      QUANT_SOAK_DIR: ${{ github.workspace }}/target/soak
+      QUANT_SOAK_TOTAL: "200000"
+      QUANT_SOAK_CHUNKS: "8"
+      QUANT_SOAK_CHUNK: ${{ matrix.chunk }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 25000 of the 200000 nightly runs (DESIGN.md 5.8)
+        run: |
+          mkdir -p "$QUANT_SOAK_DIR"
+          cargo test --release -p quantification-core --test determinism_gate
+          nightly_soak_chunk_is_byte_stable -- --ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-chunk-${{ matrix.chunk }}
+          path: target/soak
+
+  soak-aggregate:
+    name: the 200000 runs add up
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: soak
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/soak
+          merge-multiple: true
+      - name: every chunk reported, and they add up to 200000 runs over one corpus
+        run: >
+          cargo test --release -p quantification-core --test determinism_gate
+          the_soak_chunks_add_up_to_the_whole_run_count -- --ignored --nocapture
+      - name: the per-chunk reports
+        if: always()
+        run: cat target/soak/soak-*.report
+
+  fuzz-determinism:
+    name: the retained fuzz corpus in two fresh processes
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: a fresh checkout ships no retained corpus, so grow one first
+        working-directory: fuzz
+        run: |
+          cargo fuzz run fuzz_sniff    -- -runs=2000
+          cargo fuzz run fuzz_locator  -- -runs=2000
+          cargo fuzz run fuzz_splitter -- -runs=2000
+          cargo fuzz run fuzz_pipeline -- -runs=2000
+      - name: how many inputs the corpus retained
+        run: find fuzz/corpus -type f | wc -l
+      - name: every retained input compressed in two fresh processes, byte-equal
+        env:
+          QUANT_FUZZ_CORPUS: ${{ github.workspace }}/fuzz/corpus
+        run: >
+          cargo test --release -p quantification-core --test determinism_gate
+          every_retained_fuzz_input_is_byte_equal_in_two_fresh_processes
+          -- --ignored --nocapture

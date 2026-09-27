@@ -511,22 +511,53 @@ fn exact_runs_is_deterministic() {
     assert_eq!(apply(&wide, &first), apply(&wide, &second));
 }
 
+fn uses_token(source: &str, banned: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == banned)
+}
+
 #[test]
 fn the_exact_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/detect/exact.rs");
+    let uses = |banned: &str| uses_token(source, banned);
+    assert!(
+        uses_token("fn f() { rand(); }", "rand"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("use std::collections::HashMap as Map;", "HashMap"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("let state = RandomState::new();", "RandomState"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("fn f() { std::env::var(\"X\"); }", "env"),
+        "a real use is seen"
+    );
+    assert!(
+        !uses_token("let brand = 1;", "rand"),
+        "the scan is not a substring match"
+    );
+    assert!(
+        !uses_token("fn f() { let brand = 1; }", "rand"),
+        "the scan is not a substring match"
+    );
     for banned in [
         "HashMap",
         "RandomState",
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(!source.contains(banned), "exact runs must not use {banned}");
+        assert!(!uses(banned), "exact runs must not use {banned}");
     }
 }

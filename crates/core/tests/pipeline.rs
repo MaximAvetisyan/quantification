@@ -1,7 +1,7 @@
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+#[path = "determinism_harness.rs"]
+mod harness;
+
+use harness::{Case, defaults, fixture, root};
 
 use quantification_core::config::{
     MarkerStyle, RawOptions, ResolveError, ResolvedOptions, ScopePolicy, resolve,
@@ -58,17 +58,6 @@ const CORPUS: &[&str] = &[
 const CHILD_BYTES_ENV: &str = "QUANT_M2_CHILD_BYTES";
 const CHILD_TEST: &str = "m2_child_writes_the_corpus_outputs";
 
-fn root(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(rel)
-}
-
-fn fixture(rel: &str) -> Vec<u8> {
-    let path = root(rel);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
 fn golden_rel(name: &str) -> String {
     let base = name.rsplit('/').next().expect("fixture name");
     format!("golden/{}", base)
@@ -81,10 +70,6 @@ fn golden(name: &str) -> Vec<u8> {
 
 fn options(raw: &RawOptions) -> ResolvedOptions {
     resolve(raw).expect("options resolve")
-}
-
-fn defaults() -> ResolvedOptions {
-    options(&RawOptions::default())
 }
 
 struct Run {
@@ -107,10 +92,14 @@ fn compress(payload: &[u8], opts: &ResolvedOptions) -> Run {
     compress_with(&mut Compressor::new(), payload, opts)
 }
 
+fn chat_cases() -> Vec<Case> {
+    harness::cases(CHAT_CORPUS)
+}
+
 fn chat_corpus() -> Vec<(String, Vec<u8>)> {
-    CHAT_CORPUS
-        .iter()
-        .map(|name| (name.to_string(), fixture(name)))
+    chat_cases()
+        .into_iter()
+        .map(|case| (case.name, case.payload))
         .collect()
 }
 
@@ -1515,57 +1504,9 @@ fn m2_child_writes_the_corpus_outputs() {
     let Ok(path) = std::env::var(CHILD_BYTES_ENV) else {
         return;
     };
-    let mut report = format!("seed {}\n", seed_fingerprint()).into_bytes();
-    let opts = defaults();
-    let mut compressor = Compressor::new();
-    let mut out = Vec::new();
-    for (name, payload) in chat_corpus() {
-        compressor.compress(&payload, &opts, &mut out);
-        report.extend_from_slice(name.as_bytes());
-        report.push(b'\n');
-        report.extend_from_slice(out.len().to_string().as_bytes());
-        report.push(b'\n');
-        report.extend_from_slice(&out);
-        report.push(b'\n');
-    }
+    let corpus = chat_cases();
+    let report = harness::report_bytes(&corpus, &harness::compress_all(&corpus));
     std::fs::write(path, report).expect("child writes its report");
-}
-
-struct Report {
-    seed: String,
-    entries: Vec<(String, Vec<u8>)>,
-}
-
-fn parse_report(bytes: &[u8]) -> Report {
-    let line = |from: &mut usize| -> String {
-        let rest = &bytes[*from..];
-        let end = rest.iter().position(|b| *b == b'\n').expect("line end");
-        let text = String::from_utf8(rest[..end].to_vec()).expect("utf-8 line");
-        *from += end + 1;
-        text
-    };
-    let mut at = 0;
-    let seed = line(&mut at)
-        .strip_prefix("seed ")
-        .expect("seed")
-        .to_string();
-    let mut entries = Vec::new();
-    while at < bytes.len() {
-        let name = line(&mut at);
-        let len: usize = line(&mut at).parse().expect("length");
-        let payload = bytes[at..at + len].to_vec();
-        at += len;
-        assert_eq!(bytes[at], b'\n', "entry terminator");
-        at += 1;
-        entries.push((name, payload));
-    }
-    Report { seed, entries }
-}
-
-fn seed_fingerprint() -> String {
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u8(0);
-    format!("{:016x}", hasher.finish())
 }
 
 #[test]
@@ -1573,93 +1514,7 @@ fn gate_m2_outputs_are_identical_across_processes_and_environments() {
     if std::env::var(CHILD_BYTES_ENV).is_ok() {
         return;
     }
-    let exe = std::env::current_exe().expect("test binary path");
-    let dir = std::env::temp_dir().join("quantification-gate-m2");
-    std::fs::create_dir_all(&dir).expect("report dir");
-    let profiles: [(&str, &[(&str, &str)]); 2] = [
-        (
-            "profile-a",
-            &[
-                ("RUST_BACKTRACE", "0"),
-                ("RAYON_NUM_THREADS", "1"),
-                ("RUST_TEST_THREADS", "1"),
-                ("LC_ALL", "C"),
-                ("TZ", "UTC"),
-            ],
-        ),
-        (
-            "profile-b",
-            &[
-                ("RUST_BACKTRACE", "full"),
-                ("RAYON_NUM_THREADS", "8"),
-                ("RUST_TEST_THREADS", "4"),
-                ("LC_ALL", "C.UTF-8"),
-                ("TZ", "Pacific/Auckland"),
-            ],
-        ),
-    ];
-
-    let corpus = chat_corpus();
-    let mut reports = Vec::new();
-    for (name, env) in profiles {
-        let report_path = dir.join(format!("{name}-{}.report", std::process::id()));
-        let _ = std::fs::remove_file(&report_path);
-        let status = Command::new(&exe)
-            .arg("--exact")
-            .arg(CHILD_TEST)
-            .arg("--nocapture")
-            .envs(env.iter().copied())
-            .env(CHILD_BYTES_ENV, &report_path)
-            .output()
-            .expect("child runs");
-        assert!(
-            status.status.success(),
-            "child {name} failed: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-        reports.push((
-            name,
-            parse_report(&std::fs::read(&report_path).expect("report")),
-        ));
-    }
-
-    let seeds: Vec<&str> = reports
-        .iter()
-        .map(|(_, report)| report.seed.as_str())
-        .collect();
-    assert_ne!(
-        seeds[0], seeds[1],
-        "the two processes must carry different RandomState seeds ({seeds:?})"
-    );
-
-    for (name, report) in &reports {
-        assert_eq!(report.entries.len(), corpus.len(), "{name}");
-        for (at, (entry_name, entry_bytes)) in report.entries.iter().enumerate() {
-            let (fixture_name, _) = &corpus[at];
-            assert_eq!(entry_name, fixture_name, "{name} entry {at}");
-            let local = compress(&corpus[at].1, &defaults());
-            assert_eq!(
-                &local.payload, entry_bytes,
-                "{name} differs from the in-process run on {fixture_name}"
-            );
-        }
-    }
-    let mut compressed = 0;
-    for (at, entry) in reports[0].1.entries.iter().enumerate() {
-        assert_eq!(
-            entry.1, reports[1].1.entries[at].1,
-            "the two processes differ on {}",
-            corpus[at].0
-        );
-        if entry.1 != corpus[at].1 {
-            compressed += 1;
-        }
-    }
-    assert!(
-        compressed >= 4,
-        "only {compressed} of {} chat fixtures changed: the gate is vacuous",
-        corpus.len()
-    );
+    harness::assert_fresh_processes_agree(CHILD_TEST, CHILD_BYTES_ENV, &chat_cases(), 4);
 }
 
 #[test]

@@ -1074,15 +1074,32 @@ fn empty_single_unit_and_over_cap_spans_commit_nothing() {
     );
 }
 
+fn uses_token(source: &str, banned: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == banned)
+}
+
 #[test]
 fn the_templ_blocks_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/detect/templ_blocks.rs");
-    let uses = |banned: &str| {
-        source
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|word| word == banned)
-    };
-    assert!(!uses("let brand = 1;"), "the scan is not a substring match");
+    let uses = |banned: &str| uses_token(source, banned);
+    assert!(
+        uses_token("fn f() { rand(); }", "rand"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("fn f() { std::env::var(\"X\"); }", "env"),
+        "a real use is seen"
+    );
+    assert!(
+        !uses_token("let brand = 1;", "rand"),
+        "the scan is not a substring match"
+    );
+    assert!(
+        !uses_token("fn f() { let brand = 1; }", "rand"),
+        "the scan is not a substring match"
+    );
     for banned in [
         "HashMap",
         "RandomState",

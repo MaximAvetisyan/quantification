@@ -531,26 +531,57 @@ fn empty_ineligible_and_single_unit_spans_commit_nothing() {
     assert!(ledger.is_free(0..1));
 }
 
+fn uses_token(source: &str, banned: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == banned)
+}
+
 #[test]
 fn the_wsruns_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/detect/wsruns.rs");
+    let uses = |banned: &str| uses_token(source, banned);
+    assert!(
+        uses_token("fn f() { rand(); }", "rand"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("use std::collections::HashMap as Map;", "HashMap"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("let state = RandomState::new();", "RandomState"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("fn f() { std::env::var(\"X\"); }", "env"),
+        "a real use is seen"
+    );
+    assert!(
+        !uses_token("let brand = 1;", "rand"),
+        "the scan is not a substring match"
+    );
+    assert!(
+        !uses_token("fn f() { let brand = 1; }", "rand"),
+        "the scan is not a substring match"
+    );
     for banned in [
         "HashMap",
         "RandomState",
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(!source.contains(banned), "ws runs must not use {banned}");
+        assert!(!uses(banned), "ws runs must not use {banned}");
     }
     assert!(source.contains("column.get(left) == column.get(right)"));
     assert!(source.contains("column.hash[left] == column.hash[right]"));
-    assert!(!source.contains("normalize_into"));
-    assert!(!source.contains("fingerprint"));
+    assert!(!uses("normalize_into"));
+    assert!(!uses("fingerprint"));
 }

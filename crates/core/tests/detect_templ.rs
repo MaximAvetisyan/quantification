@@ -796,15 +796,32 @@ fn a_template_group_is_committed_through_the_ledger_gate() {
     assert_eq!(out.forms.id(0), out.forms.id(2));
 }
 
+fn uses_token(source: &str, banned: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == banned)
+}
+
 #[test]
 fn the_templ_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/detect/templ.rs");
-    let uses = |banned: &str| {
-        source
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|word| word == banned)
-    };
-    assert!(!uses("let brand = 1;"), "the scan is not a substring match");
+    let uses = |banned: &str| uses_token(source, banned);
+    assert!(
+        uses_token("fn f() { rand(); }", "rand"),
+        "a real use is seen"
+    );
+    assert!(
+        uses_token("fn f() { std::env::var(\"X\"); }", "env"),
+        "a real use is seen"
+    );
+    assert!(
+        !uses_token("let brand = 1;", "rand"),
+        "the scan is not a substring match"
+    );
+    assert!(
+        !uses_token("fn f() { let brand = 1; }", "rand"),
+        "the scan is not a substring match"
+    );
     for banned in [
         "HashMap",
         "RandomState",
