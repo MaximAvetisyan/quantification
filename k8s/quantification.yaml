@@ -5,7 +5,7 @@ metadata:
   labels:
     app: quantification
 spec:
-  replicas: 2
+  replicas: 1
   revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
@@ -44,6 +44,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: QUANT_GRPC_ADDR
               value: "0.0.0.0:50051"
+            - name: QUANT_SHUTDOWN_GRACE_MS
+              value: "25000"
           startupProbe:
             httpGet:
               path: /healthz
@@ -55,10 +57,10 @@ spec:
             httpGet:
               path: /readyz
               port: http
-            periodSeconds: 5
+            periodSeconds: 1
             timeoutSeconds: 2
             successThreshold: 1
-            failureThreshold: 3
+            failureThreshold: 1
           livenessProbe:
             httpGet:
               path: /healthz
