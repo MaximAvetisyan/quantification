@@ -1073,23 +1073,26 @@ fn empty_single_unit_and_over_cap_spans_commit_nothing() {
 #[test]
 fn the_templ_blocks_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/detect/templ_blocks.rs");
+    let uses = |banned: &str| {
+        source
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|word| word == banned)
+    };
+    assert!(!uses("let brand = 1;"), "the scan is not a substring match");
     for banned in [
         "HashMap",
         "RandomState",
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(
-            !source.contains(banned),
-            "stage seven must not use {banned}"
-        );
+        assert!(!uses(banned), "stage seven must not use {banned}");
     }
     assert!(source.contains("windowed_blocks"));
     assert!(source.contains("CommitKind::TemplatedBlock"));

@@ -9,6 +9,7 @@ use quantification_core::config::{
 use quantification_core::fingerprint::marker_checksum;
 use quantification_core::ledger::{Commit, CommitKind, marker_len, profitable, removal_range};
 use quantification_core::locator;
+use quantification_core::mask;
 use quantification_core::pipeline::{Clock, Compressor, Stats};
 use quantification_core::render;
 use quantification_core::sniff::{self, Schema};
@@ -1280,14 +1281,14 @@ fn every_generated_divergence_is_a_block_anchor_hiding_a_period_one_repetition()
     assert_eq!(
         diverged, DIVERGENT_PAYLOADS,
         "the measured divergence count moved: every one of them must be a block anchor hiding a \
-         period-one repetition, and the pin below names the mechanism"
+         period-one repetition, and the pins below name the mechanism"
     );
 }
 
-const DIVERGENT_PAYLOADS: usize = 160;
+const DIVERGENT_PAYLOADS: usize = 0;
 
 #[test]
-fn a_block_anchor_that_hides_a_period_one_repetition_is_not_a_fixed_point() {
+fn a_block_anchor_that_hides_a_period_one_repetition_is_refused() {
     let body = "2026-08-25T10:00:01Z INFO hc 10.0.0.1 took 5ms ok padding";
     let other = "2026-08-25T10:00:01Z ERROR a completely different line of its own";
     let lines = [
@@ -1304,41 +1305,92 @@ fn a_block_anchor_that_hides_a_period_one_repetition_is_not_a_fixed_point() {
         payload,
         options: resolve(&RawOptions::default()).expect("resolve"),
     };
-    let once = compress(&case);
-    assert_eq!(once.commits.len(), 1, "{}", show(&case.payload));
-    let first = &once.commits[0];
-    assert_eq!(first.kind, CommitKind::Block, "{}", show(&case.payload));
-    assert_eq!((first.first, first.last, first.count), (0, 5, 1));
-    assert_eq!(first.removed, 0..case.payload.len());
-    assert_eq!(first.anchor.start, 0);
     assert_eq!(
-        first.anchor.len(),
-        lines[0].len() + 2 + lines[1].len() + 2 + lines[2].len()
+        wsnorm::normalize(&case.payload[lines[0].len() + 2..][..lines[0].len()]),
+        wsnorm::normalize(&case.payload[..lines[0].len()]),
+        "the two padded lines are ws-equal but raw-different"
+    );
+    let once = compress(&case);
+    assert!(
+        !once
+            .commits
+            .iter()
+            .any(|commit| commit.kind == CommitKind::Block),
+        "stage five must refuse a block whose anchor hides a period-one repetition: {:?}",
+        once.commits
+            .iter()
+            .map(|commit| (commit.kind, commit.first, commit.last, commit.count))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        once.commits
+            .iter()
+            .map(|commit| (commit.kind, commit.first, commit.last, commit.count))
+            .collect::<Vec<_>>(),
+        [
+            (CommitKind::TemplatedBlock, 0, 1, 1),
+            (CommitKind::TemplatedBlock, 3, 4, 1)
+        ],
+        "stage seven folds the two ws-equal lines the anchor would have hidden"
     );
     let second = compress(&again(&case, once.payload.clone(), 2));
-    assert_eq!(second.commits.len(), 1, "{}", show(&once.payload));
-    let second_commit = &second.commits[0];
-    assert_eq!(second_commit.kind, CommitKind::TemplatedBlock);
     assert_eq!(
-        (second_commit.first, second_commit.last, second_commit.count),
-        (0, 1, 1),
-        "the second pass collapses the two ws-equal lines the anchor kept"
-    );
-    assert!(
-        first.anchor.start <= second_commit.removed.start
-            && second_commit.removed.end <= first.anchor.end,
-        "the second pass ran inside the first pass's anchor"
-    );
-    assert_ne!(
         second.payload, once.payload,
-        "this is the documented divergence: DESIGN 4.4's idempotence claim does not hold"
+        "the first pass is a fixed point, which is what DESIGN 4.4 claims"
     );
+    assert_eq!(second.commits.len(), 0);
     let third = compress(&again(&case, second.payload.clone(), 3));
-    assert_eq!(
-        third.payload, second.payload,
-        "and the third pass is stable"
-    );
+    assert_eq!(third.payload, once.payload);
     assert_eq!(third.commits.len(), 0);
+}
+
+#[test]
+fn a_block_anchor_that_hides_a_mask_equal_but_ws_distinct_pair_is_refused() {
+    let first = "2026-08-25T10:00:01Z INFO hc 10.0.0.1 took 5ms a long padding tail here";
+    let second = "2026-08-25T10:00:01Z INFO hc 10.0.0.2 took 6ms a long padding tail here";
+    let other = "2026-08-25T10:00:01Z ERROR a completely different line of its own length";
+    let lines: Vec<String> = [first, second, other, first, second, other]
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    let payload = lines.join(r"\n").into_bytes();
+    let case = Case {
+        name: String::from("a mask-equal pair that stage five alone cannot see"),
+        payload,
+        options: resolve(&RawOptions::default()).expect("resolve"),
+    };
+    let span = &case.payload[first.len() + 2..2 * first.len() + 2];
+    assert_ne!(span, &case.payload[..first.len()]);
+    assert_eq!(
+        mask::mask(&wsnorm::normalize(span)),
+        mask::mask(&wsnorm::normalize(&case.payload[..first.len()])),
+        "the two lines mask equal, so stage seven would fold them on the next pass"
+    );
+    let once = compress(&case);
+    assert!(
+        !once
+            .commits
+            .iter()
+            .any(|commit| commit.kind == CommitKind::Block),
+        "the primitivity check must read the coarsest domain, not stage five's own: {:?}",
+        once.commits
+            .iter()
+            .map(|commit| (commit.kind, commit.first, commit.last, commit.count))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        once.commits
+            .iter()
+            .map(|commit| (commit.kind, commit.first, commit.last, commit.count))
+            .collect::<Vec<_>>(),
+        [
+            (CommitKind::TemplatedBlock, 0, 1, 1),
+            (CommitKind::TemplatedBlock, 3, 4, 1)
+        ]
+    );
+    let second = compress(&again(&case, once.payload.clone(), 2));
+    assert_eq!(second.payload, once.payload);
+    assert_eq!(second.commits.len(), 0);
 }
 
 fn kind_name(kind: CommitKind) -> &'static str {
@@ -1354,7 +1406,6 @@ fn kind_name(kind: CommitKind) -> &'static str {
 // ---------------------------------------------------------------- idempotence
 
 #[test]
-#[ignore = "DESIGN 4.4's idempotence claim is false: a stage-5 block anchor can hide a period-one repetition, which stage 7 then collapses on the second pass. See the two tests below and TASKS.md W4.1."]
 fn every_generated_payload_reaches_a_fixed_point() {
     let cases = corpus(2048, SEED ^ 0x33);
     let (mut compressed, mut markers) = (0usize, 0usize);

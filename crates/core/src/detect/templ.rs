@@ -86,6 +86,10 @@ impl Forms {
             && self.units[left].hash == self.units[right].hash
             && first == second
     }
+
+    pub fn block(&self, start: usize, len: usize) -> &[u8] {
+        &self.bytes[self.units[start].masked.start..self.units[start + len - 1].masked.end]
+    }
 }
 
 pub fn template_groups(forms: &Forms, ledger: &mut Ledger<'_>, min_group_size: u32) -> StageStats {

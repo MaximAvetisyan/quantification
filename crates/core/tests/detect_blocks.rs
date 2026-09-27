@@ -17,11 +17,11 @@ const UNICODE: MarkerStyle = MarkerStyle::Unicode;
 const H0: &[u8] = br"INFO run start trace 1 payload";
 const H1: &[u8] = br"INFO phase one begin payload";
 const L0: &[u8] = br"INFO hc 10.0.0.1 ok 0123456789";
-const L1: &[u8] = br"INFO hc 10.0.0.2 ok 9876543210";
+const L1: &[u8] = br"INFO hc 10.0.0.2 ok abcdefghij";
 const L0P: &[u8] = br"INFO hc\t10.0.0.1 ok 0123456789";
-const L1P: &[u8] = br"INFO hc \t 10.0.0.2 ok 9876543210";
+const L1P: &[u8] = br"INFO hc \t 10.0.0.2 ok abcdefghij";
 const L0Q: &[u8] = br"INFO hc\t\t10.0.0.1 ok 0123456789";
-const L1Q: &[u8] = br"INFO hc\t 10.0.0.2 ok 9876543210";
+const L1Q: &[u8] = br"INFO hc\t 10.0.0.2 ok abcdefghij";
 const C0: &[u8] = br"INFO hc 10.0.0.3 ok aaaabbbbcc";
 const LZ: &[u8] = br"INFO hc 10.0.0.9 ok divergent!!";
 const E0: &[u8] = br"INFO hc 10.0.0.7 ok 40-byte-exact-line!!";
@@ -86,7 +86,7 @@ fn record_a(index: usize) -> Vec<u8> {
 
 fn record_b(index: usize) -> Vec<u8> {
     filled_record(
-        b'b',
+        b'y',
         200,
         if index.is_multiple_of(2) {
             b"  "
@@ -97,7 +97,7 @@ fn record_b(index: usize) -> Vec<u8> {
 }
 
 fn unique_record(index: usize) -> Vec<u8> {
-    filled_record(b'c', 200, format!("{index:06}").as_bytes())
+    filled_record(b'z', 200, format!("{index:06}").as_bytes())
 }
 
 fn filler(count: usize, start: usize) -> Vec<Vec<u8>> {
@@ -182,9 +182,22 @@ fn assert_removal_invariant(units: &[Unit], commit: &Commit) {
     ));
 }
 
+fn tag(mut index: usize) -> String {
+    let mut out = Vec::new();
+    loop {
+        out.push(b'a' + (index % 26) as u8);
+        index /= 26;
+        if index == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).expect("an ascii tag")
+}
+
 fn periodic_span(period: usize, lines: usize) -> Vec<u8> {
     let distinct: Vec<String> = (0..period)
-        .map(|index| format!("trace line {index:04} payload padding 0123456789"))
+        .map(|index| format!("trace line {index:04} {} payload", tag(index)))
         .collect();
     let mut span = Vec::new();
     for index in 0..lines {
@@ -209,6 +222,12 @@ impl Rng {
 }
 
 const PADS: [&str; 4] = ["\\t", "  ", " \\t ", "\\r\\t"];
+const BODIES: [&[u8]; 4] = [
+    br" 10.0.0.1 ok 0123456789 payload",
+    br" 10.0.0.2 no 9876543210 payload",
+    br" 10.0.0.3 ok aaaabbbbcc payload",
+    br" 10.0.0.4 no zzzzzzzzzz payload",
+];
 
 fn generated_span(groups: usize, seed: u64) -> Vec<u8> {
     let mut rng = Rng(seed);
@@ -224,15 +243,13 @@ fn generated_span(groups: usize, seed: u64) -> Vec<u8> {
             &mut span,
             format!("INFO run {group:04} unique {}", rng.next()).as_bytes(),
         );
-        for pad in ["\\t", "  ", " \\t ", "\\t\\t"] {
-            let mut first = b"INFO hc".to_vec();
-            first.extend_from_slice(pad.as_bytes());
-            first.extend_from_slice(br" 10.0.0.1 ok 0123456789 payload");
-            push(&mut span, &first);
-            let mut second = b"INFO hc".to_vec();
-            second.extend_from_slice(PADS[(group + pad.len()) % PADS.len()].as_bytes());
-            second.extend_from_slice(br" 10.0.0.2 ok 9876543210 payload");
-            push(&mut span, &second);
+        for round in 0..4 {
+            for (index, body) in BODIES.iter().enumerate() {
+                let mut line = b"INFO hc".to_vec();
+                line.extend_from_slice(PADS[(group + round + index) % PADS.len()].as_bytes());
+                line.extend_from_slice(body);
+                push(&mut span, &line);
+            }
         }
     }
     span
@@ -371,7 +388,11 @@ fn a_two_copy_block_costs_exactly_one_verification_memcmp() {
     let commit = &ledger.commits()[0];
     assert_eq!((commit.first, commit.last, commit.count), (0, 3, 1));
     assert_eq!(scratch.work().verifications, 1);
-    assert_eq!(scratch.work().compares, 2);
+    assert_eq!(
+        scratch.work().compares,
+        3,
+        "two window compares plus the anchor's masked primitivity compare"
+    );
     assert_eq!(&span[commit.anchor.clone()], lines_span(&[L0, L1]));
     assert_eq!(commit.removed.len(), 4 * 30 + 3 * 2);
     assert_removal_invariant(&units, commit);
@@ -485,8 +506,7 @@ fn min_and_max_block_lines_bound_the_candidate_lengths() {
     );
     let long: Vec<Vec<u8>> = (0..3)
         .flat_map(|_| {
-            (0..70)
-                .map(|line| format!("INFO hc step {line:02} payload 0123456789abcdef").into_bytes())
+            (0..70).map(|line| format!("INFO hc step {line:02} {} payload", tag(line)).into_bytes())
         })
         .collect();
     let borrowed: Vec<&[u8]> = long.iter().map(|line| line.as_slice()).collect();
@@ -577,7 +597,11 @@ fn a_record_anchor_head_that_would_glue_to_a_mask_equal_record_is_refused() {
     let records = record_a(0);
     let masked = mask(&normalize(&records));
     assert_eq!(masked, mask(&normalize(&record_a(1))));
-    assert_eq!(masked, mask(&normalize(&record_b(1))));
+    assert_ne!(
+        masked,
+        mask(&normalize(&record_b(1))),
+        "an anchor may not hold two mask-equal records: stage seven would fold them on the next pass"
+    );
     let tail: Vec<Vec<u8>> = vec![
         records.clone(),
         record_a(1),
@@ -790,30 +814,47 @@ fn a_block_whose_anchor_itself_repeats_is_never_committed() {
 
 #[test]
 fn a_block_whose_anchor_head_would_glue_to_a_mask_equal_neighbour_is_refused() {
-    let lines: [&[u8]; 10] = [L0, L1, C0, L1, C0, L0, L1, C0, L1, C0];
+    const TWIN: &[u8] = br"INFO hc 10.0.0.9 ok 0123456789";
+    let lines: [&[u8]; 7] = [TWIN, L0, L1, C0, L0, L1, C0];
     let span = lines_span(&lines);
     let units = split_span(&span, UNICODE);
-    assert_eq!(units.len(), 10);
+    assert_eq!(units.len(), 7);
     assert_eq!(
+        mask(&normalize(TWIN)),
         mask(&normalize(L0)),
-        mask(&normalize(L1)),
-        "the head of a two-line anchor masks equal to the line before it"
+        "the head of a three-line anchor masks equal to the line before it"
     );
+    assert_ne!(mask(&normalize(L0)), mask(&normalize(L1)));
+    assert_ne!(mask(&normalize(L1)), mask(&normalize(C0)));
     assert_eq!(
-        norm_block(&span, &units, 0, 5),
-        norm_block(&span, &units, 5, 5),
-        "the five-line candidate is a real repeat"
+        norm_block(&span, &units, 1, 3),
+        norm_block(&span, &units, 4, 3),
+        "the three-line candidate is a real repeat"
     );
     let mut ledger = new_ledger(&units);
     let mut scratch = Scratch::default();
     assert_eq!(
         stage(&span, &mut ledger, &mut scratch),
         StageStats::default(),
-        "every candidate head is walled off, so nothing commits"
+        "the only candidate head is walled off, so nothing commits"
     );
     assert_eq!(ledger.commits().len(), 0);
     assert_eq!(ledger.residual().count(), units.len());
     assert_eq!(apply(&span, &ledger), span);
+
+    let free: [&[u8]; 6] = [L0, L1, C0, L0, L1, C0];
+    let span = lines_span(&free);
+    let units = split_span(&span, UNICODE);
+    let mut ledger = new_ledger(&units);
+    assert_eq!(
+        stage(&span, &mut ledger, &mut scratch).block_repeats,
+        1,
+        "the same candidate commits once the line before it masks differently"
+    );
+    let commit = &ledger.commits()[0];
+    assert_eq!((commit.first, commit.last, commit.count), (0, 5, 1));
+    assert_eq!(commit.anchor, units[0].range.start..units[2].range.end);
+    assert_removal_invariant(&units, commit);
 }
 
 #[test]

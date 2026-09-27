@@ -51,13 +51,16 @@ pub fn templated_blocks(
     };
     load(ledger, forms, scratch);
     let mut same = |first: usize, second: usize, length: usize| {
-        masked(forms, first, length) == masked(forms, second, length)
+        forms.block(first, length) == forms.block(second, length)
     };
+    let mut coarse = |first: usize, second: usize| forms.same(first, second);
     let mut left_wall = |before: usize, first: usize| forms.same(before, first);
     let mut domain = Domain {
         ids: &scratch.ids,
         same_bytes: &mut same,
         left_wall: &mut left_wall,
+        coarse_ids: &scratch.ids,
+        coarse_same: &mut coarse,
     };
     windowed_blocks(
         ledger,
@@ -79,8 +82,4 @@ fn load(ledger: &Ledger<'_>, forms: &Forms, scratch: &mut Scratch) {
             scratch.ids[index] = Some(forms.id(index).0 as usize);
         }
     }
-}
-
-fn masked(forms: &Forms, start: usize, length: usize) -> &[u8] {
-    &forms.bytes[forms.units[start].masked.start..forms.units[start + length - 1].masked.end]
 }

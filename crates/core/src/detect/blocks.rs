@@ -18,6 +18,7 @@ pub struct Scratch {
     line: Vec<u8>,
     norm: Vec<Option<Range<usize>>>,
     ids: Vec<Option<usize>>,
+    coarse: Vec<Option<usize>>,
     work: Work,
     degraded: bool,
 }
@@ -35,6 +36,7 @@ impl Scratch {
             line: Vec::new(),
             norm: Vec::new(),
             ids: Vec::new(),
+            coarse: Vec::new(),
             work: Work::default(),
             degraded: false,
         }
@@ -69,7 +71,7 @@ pub fn repeated_blocks(
     max_block_lines: u32,
     scratch: &mut Scratch,
 ) -> StageStats {
-    if !load(span, ledger, scratch) {
+    if !load(span, forms, ledger, scratch) {
         scratch.degraded = true;
         return StageStats::default();
     }
@@ -81,10 +83,14 @@ pub fn repeated_blocks(
     };
     let mut left_wall =
         |before: usize, first: usize| forms.is_some_and(|forms| forms.same(before, first));
+    let mut coarse_same =
+        |first: usize, second: usize| forms.is_some_and(|forms| forms.same(first, second));
     let mut domain = Domain {
         ids: &scratch.ids,
         same_bytes: &mut same_bytes,
         left_wall: &mut left_wall,
+        coarse_ids: &scratch.coarse,
+        coarse_same: &mut coarse_same,
     };
     windowed_blocks(
         ledger,
@@ -96,16 +102,13 @@ pub fn repeated_blocks(
     )
 }
 
-fn load(span: &[u8], ledger: &Ledger<'_>, scratch: &mut Scratch) -> bool {
+fn load(span: &[u8], forms: Option<&Forms>, ledger: &Ledger<'_>, scratch: &mut Scratch) -> bool {
     let units = ledger.units();
     scratch.arena.clear();
     scratch.line.clear();
-    scratch.norm.clear();
-    scratch.ids.clear();
+    reset(scratch, units.len());
     scratch.work = Work::default();
     scratch.degraded = false;
-    scratch.norm.resize(units.len(), None);
-    scratch.ids.resize(units.len(), None);
     let mut table = FingerprintTable::for_keys(span.len());
     for (index, unit) in units.iter().enumerate() {
         if !unit.eligible || ledger.is_committed(index) {
@@ -120,17 +123,27 @@ fn load(span: &[u8], ledger: &Ledger<'_>, scratch: &mut Scratch) -> bool {
             Insert::New => index,
             Insert::Duplicate(rep) => rep,
             Insert::Full => {
-                scratch.norm.clear();
-                scratch.norm.resize(units.len(), None);
-                scratch.ids.clear();
-                scratch.ids.resize(units.len(), None);
+                reset(scratch, units.len());
                 return false;
             }
         };
         scratch.norm[index] = Some(range);
         scratch.ids[index] = Some(rep);
+        scratch.coarse[index] = Some(match forms {
+            Some(forms) => forms.id(index).0 as usize,
+            None => rep,
+        });
     }
     true
+}
+
+fn reset(scratch: &mut Scratch, units: usize) {
+    scratch.norm.clear();
+    scratch.norm.resize(units, None);
+    for column in [&mut scratch.ids, &mut scratch.coarse] {
+        column.clear();
+        column.resize(units, None);
+    }
 }
 
 fn block<'a>(
@@ -148,18 +161,21 @@ fn block<'a>(
     &arena[first.start..last.end]
 }
 
-pub(crate) struct Domain<'a, S, W> {
+pub(crate) struct Domain<'a, S, W, C> {
     pub ids: &'a [Option<usize>],
     pub same_bytes: S,
     pub left_wall: W,
+    pub coarse_ids: &'a [Option<usize>],
+    pub coarse_same: C,
 }
 
 pub(crate) fn windowed_blocks<
     S: FnMut(usize, usize, usize) -> bool,
     W: FnMut(usize, usize) -> bool,
+    C: FnMut(usize, usize) -> bool,
 >(
     ledger: &mut Ledger<'_>,
-    domain: &mut Domain<'_, S, W>,
+    domain: &mut Domain<'_, S, W, C>,
     min_block_lines: usize,
     max_block_lines: usize,
     kind: CommitKind,
@@ -184,7 +200,7 @@ pub(crate) fn windowed_blocks<
             if equal(ids, at, at + length, length, work) {
                 work.verifications += 1;
                 if (domain.same_bytes)(at, at + length, length)
-                    && anchor_is_match_free(ids, at, length, min, &mut domain.same_bytes, work)
+                    && anchor_is_match_free(domain, at, length, work)
                 {
                     if wall_blocks(ledger, domain, at) {
                         break;
@@ -207,10 +223,11 @@ pub(crate) fn windowed_blocks<
     stats
 }
 
-fn wall_blocks<S, W>(ledger: &Ledger<'_>, domain: &mut Domain<'_, S, W>, at: usize) -> bool
+fn wall_blocks<S, W, C>(ledger: &Ledger<'_>, domain: &mut Domain<'_, S, W, C>, at: usize) -> bool
 where
     S: FnMut(usize, usize, usize) -> bool,
     W: FnMut(usize, usize) -> bool,
+    C: FnMut(usize, usize) -> bool,
 {
     at > 0
         && !ledger.is_committed(at - 1)
@@ -218,28 +235,32 @@ where
         && (domain.left_wall)(at - 1, at)
 }
 
-fn anchor_is_match_free(
-    ids: &[Option<usize>],
+fn anchor_is_match_free<S, W, C>(
+    domain: &mut Domain<'_, S, W, C>,
     at: usize,
     length: usize,
-    min: usize,
-    same_bytes: &mut impl FnMut(usize, usize, usize) -> bool,
     work: &mut Work,
-) -> bool {
+) -> bool
+where
+    S: FnMut(usize, usize, usize) -> bool,
+    W: FnMut(usize, usize) -> bool,
+    C: FnMut(usize, usize) -> bool,
+{
+    let ids = domain.coarse_ids;
     let end = at + length;
-    let mut start = at;
-    while start < end {
-        let mut period = (end - start) / 2;
-        while period >= min {
-            if equal(ids, start, start + period, period, work) {
+    let mut period = (end - at) / 2;
+    while period > 0 {
+        let mut start = at;
+        while start + 2 * period <= end {
+            if equal(ids, start, start + period, period, work)
+                && (domain.coarse_same)(start, start + period)
+            {
                 work.verifications += 1;
-                if same_bytes(start, start + period, period) {
-                    return false;
-                }
+                return false;
             }
-            period -= 1;
+            start += 1;
         }
-        start += 1;
+        period -= 1;
     }
     true
 }

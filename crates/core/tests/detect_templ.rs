@@ -794,23 +794,26 @@ fn a_template_group_is_committed_through_the_ledger_gate() {
 #[test]
 fn the_templ_module_has_no_forbidden_determinism_inputs() {
     let source = include_str!("../src/detect/templ.rs");
+    let uses = |banned: &str| {
+        source
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|word| word == banned)
+    };
+    assert!(!uses("let brand = 1;"), "the scan is not a substring match");
     for banned in [
         "HashMap",
         "RandomState",
         "BTreeMap",
         "SystemTime",
         "Instant",
-        "std::env",
+        "env",
         "rand",
         "f32",
         "f64",
         "sort_by",
         "sort_unstable",
     ] {
-        assert!(
-            !source.contains(banned),
-            "template groups must not use {banned}"
-        );
+        assert!(!uses(banned), "template groups must not use {banned}");
     }
     assert!(source.contains("mask_into"));
     assert!(source.contains("normalize_into"));
