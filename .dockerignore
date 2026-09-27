@@ -1,5 +1,8 @@
 *
 !Cargo.toml
 !Cargo.lock
+!.cargo
+!.cargo/**
 !crates
 !crates/**
+crates/**/tests

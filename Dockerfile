@@ -28,7 +28,7 @@ RUN find crates -name '*.rs' -exec touch {} + \
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
 COPY --from=build /src/target/release/quantification-server /usr/local/bin/quantification-server
-USER nonroot:nonroot
+USER 65532:65532
 ENV QUANT_HTTP_ADDR=0.0.0.0:8080 \
     QUANT_GRPC_ADDR=0.0.0.0:50051
 EXPOSE 8080 50051

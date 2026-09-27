@@ -76,9 +76,21 @@ and is reporting only — it never gates acceptance (DESIGN.md §4.5).
 
 ## Docker
 
-There is a `Dockerfile` at the repo root, and a `.dockerignore` beside it that
-keeps the build context to `Cargo.toml`, `Cargo.lock` and `crates/`. It is a
-two-stage build:
+There is a `Dockerfile` at the repo root, and a `.dockerignore` beside it. It is
+an allowlist: everything is excluded, and only `Cargo.toml`, `Cargo.lock`,
+`.cargo`/`**` and `crates` are re-included, minus `crates/**/tests`. Measured
+by exporting the context (`FROM scratch` + `COPY . /ctx`, no registry needed)
+on this checkout, that takes it from **1,554,856 bytes in 122 files to 334,600
+bytes in 51** — the 71 excluded files are the `tests/` trees, 1,220,256 bytes
+of it, almost all the `crates/core/tests` fixture corpus, and a fixture edit
+would otherwise invalidate the `COPY . .` layer and force a full rebuild of
+every crate. `crates/**/benches` is deliberately **kept**:
+`crates/core/Cargo.toml` declares `[[bench]]` targets, and cargo hard-errors on
+a missing declared bench file (`can't find 'gate' bench at 'benches/gate.rs'`
+— reproduced). `.cargo` is re-included rather than dropped because a
+repo-level `.cargo/config.toml` is a common Rust setting and, under a bare `*`
+allowlist, it would vanish silently and change the build — also reproduced.
+It is a two-stage build:
 
 * **build** — `rust:1.98-bookworm`, with `protobuf-compiler` installed for
   `quantification-proto`'s `tonic-prost-build`, thin LTO and one codegen unit.
@@ -87,9 +99,17 @@ two-stage build:
   source mtimes, which would otherwise leave cargo believing the stubs are
   current), and builds `quantification-server` with `--locked --features ccr`.
 * **runtime** — `gcr.io/distroless/cc-debian12`: the release binary at
-  `/usr/local/bin/quantification-server`, `USER nonroot:nonroot` (UID/GID
-  65532), no shell and no package manager, `STOPSIGNAL SIGTERM`,
-  `EXPOSE 8080 50051`.
+  `/usr/local/bin/quantification-server`, `USER 65532:65532`, no shell and no
+  package manager, `STOPSIGNAL SIGTERM`, `EXPOSE 8080 50051`.
+
+  The `USER` line is **numeric on purpose**. A `USER nonroot:nonroot` resolves
+  against `/etc/passwd` in the image, and whether `gcr.io/distroless/cc-debian12`
+  carries a `nonroot` entry is not something this tree can verify. The failure
+  mode is lopsided: a pod would still start, because the manifest's
+  `runAsUser: 65532` overrides `USER` — but a plain `docker run`, which the
+  quickstart below tells people to use, would fail with "unable to find user".
+  `65532:65532` is unconditionally correct and is the same value
+  `k8s/quantification.yaml` sets.
 
 ```sh
 docker build -t quantification .
@@ -111,19 +131,17 @@ docker run --rm -p 8080:8080 -p 50051:50051 quantification
   and gRPC `Restore` returns `UNIMPLEMENTED` (the same constant, asserted in
   `crates/server/src/grpc.rs`); both statuses verified over HTTP.
 
-**The image was never built in the environment this was written in.** No
-container registry was reachable from that machine — every pull of
-`rust:1.98-bookworm` and `gcr.io/distroless/cc-debian12` failed with
-`net/http: TLS handshake timeout` — so neither base image could be fetched and
-no image was assembled. What was run natively is the content of every build
-step: the same `cargo build --release --locked -p quantification-server
---features ccr`, the release binary started and exercised over real sockets, and
-`ldd` on it, which needs only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` and
-`ld-linux-x86-64.so.2` — no `libssl`, no `libstdc++`, so the binary does fit
-`cc-debian12`. That is not the same thing as a built image, and it is not a
-claim that the runtime stage, the `nonroot` UID, the ports or the `ENTRYPOINT`
-have been observed working: the Dockerfile is reviewed-but-unbuilt until someone
-runs the `docker build` above with registry access.
+**The image has still never been built in the environment this was written
+in.** No container registry is reachable from this machine — a
+`docker pull rust:1.98-bookworm` fails right now with `net/http: TLS handshake
+timeout` — so neither base image can be fetched and no image is assembled here.
+What was run natively is the content of every build step: the same `cargo
+build --release --locked -p quantification-server --features ccr`, the release
+binary started and exercised over real sockets, and `ldd` on it, which needs
+only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` and `ld-linux-x86-64.so.2` — no
+`libssl`, no `libstdc++`, so the binary does fit `cc-debian12`. That is not the
+same thing as a built image, and it is not a claim that the runtime stage, the
+ports or the `ENTRYPOINT` have been observed working.
 
 ### Kubernetes
 
