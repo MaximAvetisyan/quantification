@@ -67,9 +67,13 @@ async fn http(app: &Router, target: &str, body: &[u8]) -> (StatusCode, Bytes) {
 }
 
 async fn http_compress(app: &Router) -> (Vec<u8>, Value) {
+    http_compress_with(app, "auto").await
+}
+
+async fn http_compress_with(app: &Router, marker_style: &str) -> (Vec<u8>, Value) {
     let envelope = serde_json::json!({
         "payload": String::from_utf8(payload()).expect("utf8"),
-        "options": {"reversible": true},
+        "options": {"reversible": true, "marker_style": marker_style},
     });
     let (status, body) = http(
         app,
@@ -241,6 +245,72 @@ async fn both_compress_shapes_store_the_same_originals() {
             "not_found"
         );
     }
+}
+
+#[tokio::test]
+async fn a_returned_id_restores_its_own_response_after_another_style_re_stored_it() {
+    if !CCR_ENABLED {
+        return;
+    }
+    let store: Arc<dyn RootStore> = Arc::new(ccr::Shared::default());
+    let (ascii, ascii_stats) = http_compress_with(&router(Some(store.clone())), "ascii").await;
+    let (unicode, unicode_stats) =
+        http_compress_with(&router(Some(store.clone())), "unicode").await;
+    assert_ne!(
+        ascii, unicode,
+        "the same removed range is marked twice, in two styles"
+    );
+    assert!(ascii.windows(4).any(|w| w == b"[..."), "the ascii markers");
+    assert!(String::from_utf8_lossy(&unicode).contains('\u{27ea}'));
+    let ascii_ids = ids(&ascii_stats);
+    let unicode_ids = ids(&unicode_stats);
+    assert_eq!(
+        ascii_ids, unicode_ids,
+        "one removed range, one content address"
+    );
+    assert_eq!(ascii_ids.len(), 2);
+    let mut client = client(service(Some(store.clone())));
+    for (body, reported, style) in [
+        (&ascii, &ascii_ids, "ascii"),
+        (&unicode, &unicode_ids, "unicode"),
+    ] {
+        for id in reported {
+            let (status, restored) = http(
+                &router(Some(store.clone())),
+                &format!("/v1/restore?restore_id={id}"),
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the {style} response must still restore {id}"
+            );
+            let over_grpc = client
+                .restore(RestoreRequest {
+                    payload: body.clone(),
+                    restore_id: id.clone(),
+                })
+                .await
+                .expect("a hit on the other transport too")
+                .into_inner()
+                .original;
+            assert_eq!(restored.as_ref(), over_grpc.as_slice(), "{id}");
+            assert!(
+                payload()
+                    .windows(restored.len())
+                    .any(|window| window == restored.as_ref()),
+                "{id} restored bytes that are not in the input"
+            );
+        }
+    }
+    let (status, _) = http(
+        &router(Some(store)),
+        "/v1/restore?restore_id=00000000000000000000000000000000:0",
+        &ascii,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an id no response returned");
 }
 
 #[tokio::test]

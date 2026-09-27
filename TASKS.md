@@ -2763,7 +2763,8 @@ exit criteria. Gates M1–M4 are blocking milestones.
           -> Option<RestoreId>;
   }
 
-  pub struct Store { /* clock, ttl_ns, max_bytes, bytes, entries */ }
+  pub struct Store { /* clock, ttl_ns, max_bytes, bytes, entries: Vec<Entry> */ }
+  struct Entry { id: RestoreId, original: Vec<u8>, cost: usize, stored_at_ns: u64 }
   impl Store {
       pub fn new(ttl_ns: u64, max_bytes: usize) -> Self;
       pub fn with_clock(clock: impl Clock + Send + Sync + 'static,
@@ -2793,21 +2794,15 @@ exit criteria. Gates M1–M4 are blocking milestones.
   that range's prefix, so the id's byte length is a length a caller can check
   against the marker it sees. `id = <hex>:<removed range length>`, never the
   anchor's.
-  **Nothing may return wrong bytes.** `restore` is a five-step ladder and any
+  **Nothing may return wrong bytes.** `restore` is a four-step ladder and any
   step that fails is a **miss** (`None` ⇒ HTTP 404 `not_found` / gRPC
   `NotFound`), never a guess:
   1. `RestoreId::parse` — a malformed id (wrong hex width, uppercase, a second
      colon, a non-canonical length, trailing bytes, garbage) is a miss;
   2. the entry must exist and must not be past its TTL;
-  3. **the cheap pre-check**, only when the caller supplied a compressed payload
-     and it is non-empty: the marker's 4-hex `CCCC` must occur in it, and the
-     exact marker bytes the core rendered for that group must occur in it. §9
-     and §4.5 are explicit that `CCCC` is "a cheap pre-check only — never the
-     storage key", and it is used only here: the key is always the 128-bit hash
-     plus the length;
-  4. **re-verification, §9's requirement**: `entry.original.len() == id.len`;
-  5. `fingerprint(&entry.original) == id.hash`.
-  The key and the bytes are stored in *separate* fields precisely so that step 5
+  3. **re-verification, §9's requirement**: `entry.original.len() == id.len`;
+  4. `fingerprint(&entry.original) == id.hash`.
+  The key and the bytes are stored in *separate* fields precisely so that step 4
   can catch an entry whose bytes no longer hash to their key
   (`a_mutated_entry_is_caught_by_re_verification` mutates the stored `Vec` in
   place), and so that an entry filed under a valid id with different bytes is a
@@ -2817,6 +2812,100 @@ exit criteria. Gates M1–M4 are blocking milestones.
   hypothetical xxh3-128 collision costs the second group its id instead of
   handing the first group's caller the wrong original
   (`a_collision_never_replaces_a_live_entry`).
+  **The id is the only admission criterion (W4.1's finding S, fixed 2026-09-27).**
+  The first version of this ladder had a fifth step *above* the re-verification:
+  when the caller supplied a compressed payload, the store required it to contain
+  the 4-hex `CCCC` **and** the exact marker bytes the core had rendered for
+  that group, and reported a miss otherwise. That made §9's promise — one
+  `restore_id` per committed group, so a caller can address `/v1/restore` /
+  gRPC `Restore` **without parsing markers** — false whenever one removed range
+  was marked twice: `insert` overwrote the entry's `marker`/`checksum` on the
+  second store, so the first response's id missed (W4.1's reproducer and
+  minimal case: one payload, one shared store, `reversible=true`, compressed
+  once per marker style — both responses report the same id
+  `bccde1936da3c9e2627e4635690aa9c2:157`, and `restore(ascii_response, id)` was
+  a miss while `restore(unicode_response, id)` returned the right 157 bytes).
+  Three fixes were weighed, and the design text decides between them:
+  * **(a) stop keeping per-response marker/checksum state; the id alone admits,
+    the payload is context.** Chosen.
+  * **(b) key the entry by `(id, marker)`** so both responses coexist. Rejected:
+    it makes the rendered marker part of the storage key, which is the thing
+    §9 and §4.5 forbid in the same sentence that introduces the checksum ("a
+    cheap pre-check only — **never the storage key**"), it duplicates the same
+    original once per marker spelling, and it is still not a fix — a third
+    response (a new option set, a different `min_group_size`, a re-compressed
+    document) re-stores the id under a marker no earlier response ever held and
+    the first two shadow *again*. Guaranteeing the §9 property needs the entry
+    to be addressable by the id alone.
+  * **(c) keep the pre-check but make it advisory** (matching marker ⇒ return,
+    different well-formed marker ⇒ return anyway, no recognizable marker ⇒ fall
+    back to the id). Rejected as strictly more machinery for the same behaviour:
+    all three of its branches return the entry, so it is (a) with a §4.5 marker
+    grammar parser bolted on, and the parser's answer cannot change any answer.
+  So the fifth step is gone: `restore` parses the id, requires a live entry, and
+  re-verifies length and hash, and the caller's payload is **not consulted at
+  all** (`_payload`). §9's "re-verifies length and hash before returning a
+  stored original and reports a miss on mismatch rather than risking wrong
+  restoration" is the whole contract, and the bytes it can return are always the
+  exact removal-rule range of the id's own content, whatever payload the caller
+  presents — a hit is never wrong bytes, and a miss is never a shadowed id.
+  The public signatures are unchanged (`Sink::store(original, marker, checksum)`,
+  `Store::insert(id, original, marker, checksum)`,
+  `restore(payload, id)`, `RestoreStore::store_committed` / `restore_verified`),
+  so `pipeline::reversals` and both transports are untouched; the store simply
+  records none of that per-response state. `marker` survives only as the
+  `Entry::cost` input, because the recorded byte bound counts
+  `original + marker` (reading (c) below) and the bound is unchanged;
+  `checksum` is accepted and not stored. The 4-hex `CCCC` is still rendered into
+  every marker (§4.5 unchanged, so a *caller* can pre-check its own payload
+  cheaply), it is simply not authority inside the store — which is exactly what
+  "a cheap pre-check only" buys. Tests:
+  `the_id_is_the_authority_and_the_payload_is_only_context`
+  (six payload shapes — absent, empty, its own response, the *other* style's
+  response, an unrelated document, a lookalike marker with a different checksum
+  — all restore, and three never-stored ids are still misses),
+  `one_original_stored_under_many_markers_restores_every_time` (three marker
+  spellings over one id, inserted forwards and backwards, every combination
+  restores, one entry, so a restore cannot depend on insertion order),
+  `a_returned_id_always_restores_its_own_response` (the 26-fixture corpus ×
+  {`user_content`, `user_and_tools`} × {`ascii`, `unicode`, `auto`} into **one**
+  shared store: all six responses of a payload are stored *before* any of them is
+  restored, so the shadowing shape is the one exercised, and every id restores
+  its own removal range and every response reconstructs the input),
+  `a_returned_id_restores_its_own_response_after_another_style_re_stored_it`
+  (the same over both transports), and W4.1's two re-pointed property tests
+  below. `a_tampered_id_is_a_miss_never_wrong_bytes` keeps its tampered-id cases
+  and now asserts the new reading: an id from another payload is a *different
+  id*, and either id still returns **its own** original under either payload.
+  The miss classes left are exactly the ones the store can still detect — an id
+  no response returned, a malformed id, an expired entry, an evicted entry, and
+  an entry whose bytes no longer hash to their key — and the bound/TTL test and
+  the "a store that never saw a compress" transport test still pin two of them.
+  **Non-vacuity, measured on scratch copies and reverted:** re-adding the
+  marker-membership step (the exact pre-fix behaviour) fails
+  `the_id_is_the_authority_and_the_payload_is_only_context`,
+  `one_original_stored_under_many_markers_restores_every_time`,
+  `a_returned_id_always_restores_its_own_response`,
+  `a_tampered_id_is_a_miss_never_wrong_bytes`,
+  `an_id_stored_under_two_marker_styles_restores_both_responses`,
+  `on_a_shared_store_every_returned_id_restores_and_no_miss_is_shadowing` and
+  `a_returned_id_restores_its_own_response_after_another_style_re_stored_it`;
+  deleting the length/hash re-verification fails
+  `a_mutated_entry_is_caught_by_re_verification` and
+  `an_entry_whose_bytes_disagree_with_its_key_is_a_miss`. (The re-pointed
+  W4.1 test was the interesting one: its first draft restored each response
+  *before* its sibling style re-stored the same originals, which never exercises
+  the bug — it passed against the pre-fix store until the two responses were
+  stored first, as the W4.1 original did.)
+  **Found while fixing S and deliberately NOT changed here:** `insert` drops the
+  replaced entry without subtracting its cost, so `Store::bytes()` over-reports
+  after a refresh (one entry of cost 68 reads 136 after the same original is
+  stored twice) and the eviction loop, which consults `self.bytes`, evicts one
+  entry earlier than `max_bytes` warrants. Real memory is unaffected (the
+  replaced `Vec` is freed) and nothing in the suite observes it, but it is a
+  counter that does not mean what reading (c) says it means; fixing it changes
+  the recorded eviction numbers, so it belongs to whoever next owns the
+  eviction policy, not to this fix.
   **The clock is a seam, never a sleep.** `Store`/`Shared` take
   `impl Clock + Send + Sync` (W2.9's `pipeline::Clock`, the same trait the
   elapsed stats read), defaulting to `MonotonicClock`; `Send + Sync` is what
@@ -2884,7 +2973,7 @@ exit criteria. Gates M1–M4 are blocking milestones.
 
   | Transport | Success | Failures |
   |---|---|---|
-  | `POST /v1/restore?restore_id=<id>` (raw compressed body) | 200, the original bytes, `Content-Type: application/octet-stream` | 400 `invalid_argument` (no `restore_id`, an unknown query key), 404 `not_found` (a miss: unknown, expired, evicted, malformed or mismatched id; a payload that is not the one the id came from), 413, 501 `not_implemented` (feature off, or no store wired) |
+  | `POST /v1/restore?restore_id=<id>` (raw compressed body) | 200, the original bytes, `Content-Type: application/octet-stream` | 400 `invalid_argument` (no `restore_id`, an unknown query key), 404 `not_found` (a miss: unknown, expired, evicted, malformed or mismatched id; an entry whose bytes no longer hash to their key), 413, 501 `not_implemented` (feature off, or no store wired) |
   | `POST /v1/restore?envelope=json` (`{payload, restore_id}`) | 200, identical bytes | same, plus 400 for a broken envelope |
   | gRPC `Restore` | `RestoreResponse{original}`, byte-identical to the HTTP body | `NotFound` on a miss, `Unimplemented` when the feature is off or no store is wired |
 
@@ -2911,7 +3000,7 @@ exit criteria. Gates M1–M4 are blocking milestones.
   access to the store's internals. The rest: the id format and its round trip
   (`the_ids_are_the_normative_format_and_parse_back`), tampered ids
   (wrong hash, wrong length, truncated, uppercase, two colons, trailing byte,
-  garbage, an id from another payload) as misses on both transports
+  garbage) as misses on both transports
   (`a_tampered_id_is_a_miss_never_wrong_bytes`,
   `a_tampered_id_is_a_miss_on_both_transports`), the corrupted-entry and
   collision cases above, **the marker checksum is demonstrably not the key**
@@ -2964,15 +3053,21 @@ exit criteria. Gates M1–M4 are blocking milestones.
   contains a dead id at the moment it is returned; a later eviction or expiry can
   still turn it into a miss, which is the documented consequence of (a) and of
   the TTL itself.
-  (e) The compressed payload is pre-check *context*, never authority: absent or
-  empty skips the pre-check, so a caller who kept only the id can still restore.
+  (e) **The compressed payload is context, never authority — and, since
+  finding S was fixed, not consulted at all.** §9 wants a caller to be able to
+  address a restore "without parsing markers", so the id is the whole request;
+  the 4-hex `CCCC` the caller can see in its own payload is available to the
+  caller as a pre-check, and the store re-verifies length and hash of the entry
+  it holds. A caller who kept only the id can restore, and so can a caller that
+  presents any other document: the bytes returned are always the exact
+  removal-rule range of that id's own content.
   (f) Both HTTP compress shapes store; gRPC always stores; a build with no store
   wired stores nothing and reports nothing.
   (g) `restore_ids` is always present in the envelope and the gRPC `Stats`
   (an empty list when nothing was stored), never an absent key — §6.2 field 19 is
   a `repeated string`, so "absent" and "empty" are the same wire value and one
   shape is easier to consume.
-  **Deviations from DESIGN: three, recorded here rather than in DESIGN.md.**
+  **Deviations from DESIGN: four, recorded here rather than in DESIGN.md.**
   (1) **§13.2's "CCR store eviction policy under concurrent requests (TTL vs
   LRU-by-bytes)?" is answered by reading (a)** — TTL, with a deterministic
   oldest-insert-first byte bound — and §13.2 should be updated to say so.
@@ -2982,7 +3077,15 @@ exit criteria. Gates M1–M4 are blocking milestones.
   has no CCR defaults row** (TTL, bound) and **§9's "return one `restore_id` per
   committed group" is qualified by the flag gate**: with the `ccr` feature off the
   option resolves but no id exists, because §9 also says the module is
-  flag-gated and "v1 can ship without it". §3's degradation policy, §4.4's
+  flag-gated and "v1 can ship without it". (4) **§9's and §4.5's "the marker's
+  4-hex checksum … is a cheap pre-check only" is read as "advisory, never an
+  admission requirement"** (see "the id is the only admission criterion" above):
+  the marker still embeds `CCCC`, so the pre-check is available to a *caller*,
+  but neither the checksum nor the exact marker bytes can turn a live entry into
+  a miss — §9's "re-verifies length and hash … reports a miss on mismatch" is
+  the complete rule, and §9's "so callers address Restore **without parsing
+  markers**" only holds if the id alone admits. §9/§4.5 could say "advisory"
+  outright; DESIGN.md is not amended. §3's degradation policy, §4.4's
   removal rule, §4.5's marker and its 4-hex checksum, §4.7's caller guidance, §5's
   determinism, §6.1's option semantics and header naming, §6.2's service shape
   and `Stats` message and §9's id format are implemented as written.
@@ -3001,12 +3104,25 @@ exit criteria. Gates M1–M4 are blocking milestones.
   `stage1::split_span` with one — which is **pre-existing** (it fails the same
   way at `b58d361`) and outside this wave's ownership, but it is the one red
   build in the tree and W4.5 should fix it.
+  **Addendum, finding S fixed (2026-09-27).** Three tests added (one unit in
+  `ccr.rs`, one in `crates/core/tests/ccr.rs`, one in
+  `crates/server/tests/restore.rs`), two W4.1 property tests renamed and
+  re-pointed, one core and one unit test re-pointed, no test deleted. Workspace
+  **480 → 483 green** (2 `#[ignore]`d, unchanged), **489 → 492** with
+  `--all-features`, **69 → 70** with `-p quantification-server --features ccr`;
+  `cargo fmt --all --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` clean in the default,
+  `--all-features` and `ccr` states, and
+  `cargo test -p quantification-core --features bench_stages` green (409). No
+  production file outside `crates/core/src/ccr.rs` changed, no new dependency.
 
 ## Wave 4 — verification & perf (overlaps Waves 2–3 where noted)
 
 - **W4.1 Property tests** (§12) — R3 parse validity, splice exactness,
   idempotence, marker escape-safety, restore identity. After W2.9.
-  Status: **complete, with two normative-claim violations found** (2026-09-27).
+  Status: **complete, with two normative-claim violations found** (2026-09-27;
+  finding D is still open, finding **S** was fixed the same day — the fix, its
+  option choice and the re-pointed pins are in the W3.4 record above).
   Two new files, no production change, no new dependency, no golden touched:
   `crates/core/tests/property.rs` (13 tests, 1 of them `#[ignore]`d — see
   finding **D**) and `crates/server/tests/property_restore.rs` (3 tests,
@@ -3124,28 +3240,47 @@ exit criteria. Gates M1–M4 are blocking milestones.
   own anchor's first two residual units are equal in the masked domain) or a
   §4.4 amendment; both are outside this wave's ownership, which is why nothing
   here changes production behaviour.
-  **Finding S — a `restore_id` can stop restoring its own response (§9).** The
-  store is content-addressed and `Store::insert` replaces an existing entry's
-  `marker`/`checksum` when the same original is stored again
-  (`crates/core/src/ccr.rs`), while `Store::restore` treats a payload that does
-  not contain *the entry's* marker as a miss. The same removed bytes can
+  **Finding S — a `restore_id` could stop restoring its own response (§9). FIXED
+  (2026-09-27), see the W3.4 record above for the fix and its justification.**
+  The store is content-addressed and `Store::insert` replaced an existing entry's
+  `marker`/`checksum` when the same original was stored again
+  (`crates/core/src/ccr.rs`), while `Store::restore` treated a payload that did
+  not contain *the entry's* marker as a miss. The same removed bytes could
   therefore be marked twice — once per marker style — and the first response's
-  id is then un-restorable (HTTP 404 / gRPC `NotFound`) even though the stored
-  bytes are correct. Minimal reproducer: one payload, one shared store,
+  id was un-restorable (HTTP 404 / gRPC `NotFound`) even though the stored bytes
+  were correct. Minimal reproducer: one payload, one shared store,
   `reversible=true`, compressed once with `marker_style=ascii` and once with
   `marker_style=unicode`; both responses report the **same** id
   (`bccde1936da3c9e2627e4635690aa9c2:157` for the fixture below) and
-  `restore(ascii_response, id)` is a miss while
-  `restore(unicode_response, id)` and `restore(no payload, id)` both return the
-  right original. The ladder never returns wrong bytes — it returns a miss where
-  §9 promised a hit. Pinned by
+  `restore(ascii_response, id)` was a miss while
+  `restore(unicode_response, id)` and `restore(no payload, id)` both returned the
+  right original. The ladder never returned wrong bytes — it returned a miss
+  where §9 promised a hit. Pinned by
   `an_id_stored_under_two_marker_styles_stops_restoring_the_first_response`, and
   `on_a_shared_store_every_restore_miss_is_an_id_another_response_re_stored`
-  proves over the 512-payload corpus (two styles per payload, one shared store)
-  that **every** miss is of this shape — the entry still holds the exact removal
-  range — so the store never loses an original, and the count of shadowed ids is
-  non-zero. The identity property itself is asserted per response (a store per
-  request), which is the reading of §9 that holds today.
+  proved over the 512-payload corpus (two styles per payload, one shared store)
+  that **every** miss was of this shape — the entry still held the exact removal
+  range — so the store never lost an original, and the count of shadowed ids was
+  non-zero. The identity property itself was asserted per response (a store per
+  request), which was the reading of §9 that held then.
+  **What changed.** The store no longer keeps per-response marker/checksum state
+  and no longer consults the caller's payload, so the id alone admits an entry
+  and §9's length+hash re-verification is the whole rule. Both property tests are
+  re-pointed at the fixed contract and keep their coverage intent:
+  `an_id_stored_under_two_marker_styles_stops_restoring_the_first_response` →
+  `an_id_stored_under_two_marker_styles_restores_both_responses` (the same
+  minimal case: both responses restore their own id, with and without a payload,
+  and both reconstruct the payload), and
+  `on_a_shared_store_every_restore_miss_is_an_id_another_response_re_stored` →
+  `on_a_shared_store_every_returned_id_restores_and_no_miss_is_shadowing`
+  (still 512 payloads × two styles on one shared store, still classifying
+  addresses per id — but now it asserts that **no** returned id ever misses, that
+  every id the store holds is one a response returned
+  (`entries.len() == uses.len()`), that at least 400 ids are addressed by more
+  than one response so the shadowing pressure is real and the test is not
+  vacuous, and that the only misses left are ids no response ever returned). The
+  whole-response identity is now asserted on the **shared** store too, after
+  every sibling response has re-stored the same originals.
   **Non-vacuity** (mutations applied in a scratch copy of the tree, one at a
   time, then reverted; none of them is in the commit): dropping the anchor copy
   in `splice::splice_into` fails `the_output_is_the_input_outside_the_committed_ranges`;
@@ -3166,9 +3301,12 @@ exit criteria. Gates M1–M4 are blocking milestones.
   no detector proposes an overlapping group today — which is why that property is
   a net on the *output* and not a guard test, and why the mutation that fires it
   is an over-claiming removed range.
-  **Not established here**: the §4.4 idempotence claim (finding D), the §9
-  promise that a returned `restore_id` always restores (finding S), the
-  §12 corpus-shape histogram, and the M2/M3 gates (W4.2/W4.3). W4.5 still owns
+  **Not established here**: the §4.4 idempotence claim (finding D, still open),
+  the §12 corpus-shape histogram, and the M2/M3 gates (W4.2/W4.3). Finding S —
+  the §9 promise that a returned `restore_id` always restores — is no longer on
+  that list: it is established, in the W3.4 record above, by
+  `a_returned_id_always_restores_its_own_response` and the two re-pointed
+  property tests. W4.5 still owns
   the `fuzz_splitter` build break recorded above, and the five test files whose
   determinism source-scan is still a substring match (`detect_exact`,
   `detect_wsruns`, `detect_templ`, `detect_templ_blocks`, `splice`) are still

@@ -63,15 +63,8 @@ pub trait Sink {
 struct Entry {
     id: RestoreId,
     original: Vec<u8>,
-    marker: Vec<u8>,
-    checksum: [u8; 4],
+    cost: usize,
     stored_at_ns: u64,
-}
-
-impl Entry {
-    fn cost(&self) -> usize {
-        self.original.len() + self.marker.len()
-    }
 }
 
 pub struct Store {
@@ -106,7 +99,7 @@ impl Store {
         id: RestoreId,
         original: Vec<u8>,
         marker: Vec<u8>,
-        checksum: [u8; 4],
+        _checksum: [u8; 4],
     ) -> bool {
         if let Some(at) = self.entries.iter().position(|entry| entry.id == id) {
             if self.entries[at].original != original {
@@ -122,28 +115,22 @@ impl Store {
         self.expire(now);
         while self.bytes + cost > self.max_bytes && !self.entries.is_empty() {
             let gone = self.entries.remove(0);
-            self.bytes -= gone.cost();
+            self.bytes -= gone.cost;
         }
         self.entries.push(Entry {
             id,
             original,
-            marker,
-            checksum,
+            cost,
             stored_at_ns: now,
         });
         self.bytes += cost;
         true
     }
 
-    pub fn restore(&self, payload: Option<&[u8]>, id: &str) -> Option<Vec<u8>> {
+    pub fn restore(&self, _payload: Option<&[u8]>, id: &str) -> Option<Vec<u8>> {
         let id = RestoreId::parse(id)?;
         let entry = self.entries.iter().find(|entry| entry.id == id)?;
         if self.expired(entry) {
-            return None;
-        }
-        if let Some(payload) = payload.filter(|payload| !payload.is_empty())
-            && (!contains(payload, &entry.checksum) || !contains(payload, &entry.marker))
-        {
             return None;
         }
         if entry.original.len() != id.len || fingerprint(&entry.original) != id.hash {
@@ -177,7 +164,7 @@ impl Store {
         while at < self.entries.len() {
             if Self::expired_at(&self.entries[at], now, self.ttl_ns) {
                 let gone = self.entries.remove(at);
-                self.bytes -= gone.cost();
+                self.bytes -= gone.cost;
             } else {
                 at += 1;
             }
@@ -254,13 +241,6 @@ impl Sink for Shared {
     fn store(&mut self, original: &[u8], marker: &[u8], checksum: [u8; 4]) -> Option<RestoreId> {
         self.put(original, marker, checksum)
     }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -365,6 +345,11 @@ mod tests {
             *b"abcd"
         ));
         assert_eq!(store.restore(None, &id.to_string()), None);
+        assert_eq!(
+            store.restore(Some(marker), &id.to_string()),
+            None,
+            "a payload is never authority: the entry itself disagrees with its key"
+        );
         assert_eq!(store.len(), 1);
     }
 
@@ -439,33 +424,72 @@ mod tests {
     }
 
     #[test]
-    fn the_compressed_payload_is_only_a_cheap_pre_check() {
+    fn the_id_is_the_authority_and_the_payload_is_only_context() {
         let mut store = Store::with_clock(Now::at(0), 1_000_000_000, 1 << 20);
         let original = b"ERROR timeout\nERROR timeout\nERROR timeout";
         let marker = b"[... x2 identical abcd ...]";
         let compressed = b"{\"content\":\"ERROR timeout[... x2 identical abcd ...]\"}";
         assert!(store.store(original, marker, *b"abcd").is_some());
-        assert_eq!(
-            store.restore(Some(compressed), &id_of(original)),
-            Some(original.to_vec())
-        );
-        assert_eq!(
-            store.restore(
-                Some(b"{\"content\":\"nothing to do with it\"}"),
-                &id_of(original)
-            ),
+        let unicode = "{\"content\":\"ERROR timeout\u{27ea}\u{d7}2 identical \u{b7}abcd\u{27eb}\"}"
+            .as_bytes();
+        for payload in [
             None,
-            "a payload without the marker's checksum cannot be the one"
-        );
-        assert_eq!(
-            store.restore(Some(b"[... x2 identical wxyz ...]"), &id_of(original)),
-            None,
-            "the checksum alone is not enough: the marker is compared too"
-        );
-        assert_eq!(
-            store.restore(None, &id_of(original)),
-            Some(original.to_vec()),
-            "an absent payload skips the pre-check"
-        );
+            Some(&b""[..]),
+            Some(&compressed[..]),
+            Some(unicode),
+            Some(&b"{\"content\":\"nothing to do with it\"}"[..]),
+            Some(&b"[... x2 identical wxyz ...]"[..]),
+        ] {
+            assert_eq!(
+                store.restore(payload, &id_of(original)),
+                Some(original.to_vec()),
+                "the id addresses its own original whatever the caller's payload says"
+            );
+        }
+        for wrong in [
+            "00000000000000000000000000000000:0",
+            "garbage",
+            "bccde1936da3c9e2627e4635690aa9c2:157",
+        ] {
+            assert_eq!(
+                store.restore(Some(&compressed[..]), wrong),
+                None,
+                "{wrong} is a miss"
+            );
+        }
+    }
+
+    #[test]
+    fn one_original_stored_under_many_markers_restores_every_time() {
+        let original = b"ERROR timeout\nERROR timeout\nERROR timeout";
+        let id = RestoreId::of(original);
+        let printed = id_of(original);
+        let markers: [&[u8]; 3] = [
+            b"[... x2 identical abcd ...]".as_slice(),
+            "\u{27ea}\u{d7}2 identical \u{b7}abcd\u{27eb}".as_bytes(),
+            b"[... block x2 1234 ...]".as_slice(),
+        ];
+        let mut forwards = Store::with_clock(Now::at(0), 1_000_000_000, 1 << 20);
+        let mut backwards = Store::with_clock(Now::at(0), 1_000_000_000, 1 << 20);
+        for (at, marker) in markers.iter().enumerate() {
+            let other = markers.len() - 1 - at;
+            assert_eq!(forwards.store(original, marker, *b"abcd"), Some(id));
+            assert_eq!(
+                backwards.store(original, markers[other], *b"abcd"),
+                Some(id)
+            );
+        }
+        for store in [&forwards, &backwards] {
+            assert_eq!(store.len(), 1, "one content address, one entry");
+            assert_eq!(store.restore(None, &printed), Some(original.to_vec()));
+            for marker in markers {
+                let payload = format!("{{\"content\":\"{}\"}}", String::from_utf8_lossy(marker));
+                assert_eq!(
+                    store.restore(Some(payload.as_bytes()), &printed),
+                    Some(original.to_vec()),
+                    "the id addresses its own original whatever was stored under it"
+                );
+            }
+        }
     }
 }

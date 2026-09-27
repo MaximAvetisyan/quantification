@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use quantification_core::api::{Compressor, Request};
 use quantification_core::ccr::{RestoreId, Shared};
-use quantification_core::config::{MarkerStyle, RawOptions, ResolvedOptions, resolve};
+use quantification_core::config::{MarkerStyle, RawOptions, ResolvedOptions, ScopePolicy, resolve};
 use quantification_core::fingerprint::marker_checksum;
 use quantification_core::ledger::{Commit, marker_len};
 use quantification_core::pipeline::{self, Stats};
@@ -409,18 +409,100 @@ fn a_tampered_id_is_a_miss_never_wrong_bytes() {
             "{wrong} must be a miss"
         );
     }
-    let other = compress_with(Some(&store), &chat(&group(line, 5)), &reversible());
+    let other_payload = chat(&group(line, 5));
+    let other = compress_with(Some(&store), &other_payload, &reversible());
     assert_ne!(other.stats.restore_ids[0], id);
     assert_eq!(
+        store.restore(Some(&run.compressed), &other.stats.restore_ids[0]),
+        Some(other_payload[other.commits[0].removed.clone()].to_vec()),
+        "each id addresses its own original, whichever payload is presented"
+    );
+    assert_eq!(
         store.restore(Some(&other.compressed), &id),
-        None,
-        "an id from another payload cannot restore this one"
+        Some(payload[run.commits[0].removed.clone()].to_vec()),
+        "an id from another payload is a different id, not a different original"
     );
     assert_eq!(
         store.restore(Some(b"{\"unrelated\":true}"), &id),
-        None,
-        "a payload that does not carry the marker is a miss"
+        Some(payload[run.commits[0].removed.clone()].to_vec()),
+        "a payload that carries no marker is context, never an admission requirement: the id \
+         addresses its own original"
     );
+    assert_eq!(
+        store.restore(Some(b"[... x2 identical wxyz ...]"), &id),
+        Some(payload[run.commits[0].removed.clone()].to_vec()),
+        "another response's marker over the same range is not a miss either"
+    );
+}
+
+#[test]
+fn a_returned_id_always_restores_its_own_response() {
+    let store = store();
+    let option_sets: Vec<(ScopePolicy, MarkerStyle, ResolvedOptions)> =
+        [ScopePolicy::UserContent, ScopePolicy::UserAndTools]
+            .into_iter()
+            .flat_map(|policy| {
+                [MarkerStyle::Ascii, MarkerStyle::Unicode, MarkerStyle::Auto]
+                    .into_iter()
+                    .map(move |style| {
+                        let options = resolve(&RawOptions {
+                            reversible: Some(true),
+                            scope_policy: Some(policy),
+                            marker_style: Some(style),
+                            ..RawOptions::default()
+                        })
+                        .expect("resolve");
+                        (policy, style, options)
+                    })
+            })
+            .collect();
+    let (mut restored, mut runs) = (0usize, 0usize);
+    for (name, payload) in corpus() {
+        let responses: Vec<(ScopePolicy, MarkerStyle, Run)> = option_sets
+            .iter()
+            .map(|(policy, style, options)| {
+                (
+                    *policy,
+                    *style,
+                    compress_with(Some(&store), &payload, options),
+                )
+            })
+            .collect();
+        for (policy, style, run) in &responses {
+            assert_eq!(
+                run.stats.restore_ids.len(),
+                run.commits.len(),
+                "{name} {policy:?} {style:?}: one id per committed group"
+            );
+        }
+        for (policy, style, run) in &responses {
+            for (id, commit) in run.stats.restore_ids.iter().zip(&run.commits) {
+                let original = &payload[commit.removed.clone()];
+                assert_eq!(
+                    store.restore(Some(&run.compressed), id).as_deref(),
+                    Some(original),
+                    "{name} {policy:?} {style:?}: {id} does not restore its own response"
+                );
+                restored += 1;
+            }
+        }
+        for (policy, style, run) in &responses {
+            runs += 1;
+            assert_eq!(
+                reconstruct(
+                    &run.compressed,
+                    &run.commits,
+                    &run.stats.restore_ids,
+                    &store
+                ),
+                payload,
+                "{name} {policy:?} {style:?}: reversibility is the identity after every sibling \
+                 option set re-stored the same originals"
+            );
+        }
+    }
+    assert!(restored >= 100, "only {restored} ids were restored");
+    assert_eq!(runs, corpus().len() * option_sets.len());
 }
 
 #[test]

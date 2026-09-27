@@ -328,6 +328,11 @@ fn fresh() -> Arc<dyn RestoreStore> {
     Arc::new(ccr::Shared::new(TTL_NS, MAX_BYTES))
 }
 
+fn shared() -> (ccr::Shared, Arc<dyn RestoreStore>) {
+    let store = ccr::Shared::new(TTL_NS, MAX_BYTES);
+    (store.clone(), Arc::new(store) as Arc<dyn RestoreStore>)
+}
+
 #[test]
 fn restore_is_the_identity_for_every_id_a_response_returns() {
     assert!(
@@ -376,7 +381,7 @@ fn restore_is_the_identity_for_every_id_a_response_returns() {
 }
 
 #[test]
-fn an_id_stored_under_two_marker_styles_stops_restoring_the_first_response() {
+fn an_id_stored_under_two_marker_styles_restores_both_responses() {
     let store = fresh();
     let run = "ERROR timeout while connecting to the primary shard";
     let block = std::iter::repeat_n(run, 3).collect::<Vec<_>>().join(r"\n");
@@ -408,93 +413,114 @@ fn an_id_stored_under_two_marker_styles_stops_restoring_the_first_response() {
         unicode.compressed, ascii.compressed,
         "the same removed range is marked twice, in two styles"
     );
-    assert_eq!(
-        store.restore_verified(&ascii.compressed, &ascii.ids[0]),
-        None,
-        "the entry now carries the second response's marker, so the first response's id misses"
-    );
-    assert_eq!(
-        store.restore_verified(&unicode.compressed, &unicode.ids[0]),
-        Some(payload[unicode.commits[0].0.clone()].to_vec()),
-        "the second response restores, and the entry is not corrupt"
-    );
-    assert_eq!(
-        store.restore_verified(b"", &ascii.ids[0]),
-        Some(payload[ascii.commits[0].0.clone()].to_vec()),
-        "without a payload the pre-check is skipped: the stored bytes are the right ones"
-    );
-    assert_eq!(
-        reconstruct(&unicode, &payload, &store),
-        payload,
-        "and the second response is still exactly reversible"
-    );
+    let original = payload[unicode.commits[0].0.clone()].to_vec();
+    for (response, style) in [(&ascii, "ascii"), (&unicode, "unicode")] {
+        assert_eq!(
+            store.restore_verified(&response.compressed, &response.ids[0]),
+            Some(original.clone()),
+            "the {style} response restores the id it was handed, whatever was stored after it"
+        );
+        assert_eq!(
+            store.restore_verified(b"", &response.ids[0]),
+            Some(original.clone()),
+            "and with no payload at all"
+        );
+        assert_eq!(
+            reconstruct(response, &payload, &store),
+            payload,
+            "the {style} response is exactly reversible"
+        );
+    }
 }
 
 #[test]
-fn on_a_shared_store_every_restore_miss_is_an_id_another_response_re_stored() {
-    let store = fresh();
-    let mut seen: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    let (mut collapsed, mut restored, mut whole) = (0usize, 0usize, 0usize);
-    for payload in payloads(CORPUS) {
-        let mut responses = Vec::new();
-        for style in [MarkerStyle::Ascii, MarkerStyle::Unicode] {
-            let run = compress(&payload, &reversible_style(style), &store);
-            if !run.commits.is_empty() {
-                responses.push(run);
-            }
+fn on_a_shared_store_every_returned_id_restores_and_no_miss_is_shadowing() {
+    let (entries, store) = shared();
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut collapsed, mut runs, mut restored) = (0usize, 0usize, 0usize);
+    for (at, payload) in payloads(CORPUS).iter().enumerate() {
+        let responses: Vec<(MarkerStyle, Run)> = [MarkerStyle::Ascii, MarkerStyle::Unicode]
+            .into_iter()
+            .map(|style| (style, compress(payload, &reversible_style(style), &store)))
+            .collect();
+        if responses.iter().any(|(_, run)| !run.commits.is_empty()) {
+            collapsed += 1;
         }
-        if responses.is_empty() {
-            continue;
-        }
-        collapsed += 1;
-        let mut every = true;
-        for run in &responses {
+        for (style, run) in &responses {
             for ((removed, _, _), id) in run.commits.iter().zip(&run.ids) {
-                let entry = seen.entry(id.clone()).or_default();
-                entry.0 += 1;
-                match store.restore_verified(&run.compressed, id) {
-                    Some(original) => {
-                        entry.1 += 1;
-                        restored += 1;
-                        assert_eq!(
-                            original,
-                            payload[removed.clone()],
-                            "{id} restored the wrong bytes"
-                        );
-                    }
-                    None => {
-                        every = false;
-                        assert_eq!(
-                            store.restore_verified(b"", id).as_deref(),
-                            Some(&payload[removed.clone()][..]),
-                            "{id} is not a shadowed id: the entry itself is gone or wrong"
-                        );
-                    }
-                }
+                *uses.entry(id.clone()).or_default() += 1;
+                let original = store
+                    .restore_verified(&run.compressed, id)
+                    .unwrap_or_else(|| {
+                        panic!("payload {at} {style:?}: {id} does not restore its own response")
+                    });
+                assert_eq!(
+                    original,
+                    payload[removed.clone()],
+                    "payload {at} {style:?}: {id} restored the wrong bytes"
+                );
+                assert_eq!(
+                    RestoreId::of(&original).to_string(),
+                    *id,
+                    "payload {at} {style:?}: {id} is not the id of the bytes it returned"
+                );
+                restored += 1;
             }
         }
-        if every {
-            whole += 1;
+        for (style, run) in &responses {
+            if run.commits.is_empty() {
+                assert!(run.ids.is_empty(), "payload {at}: an id without a group");
+                continue;
+            }
+            runs += 1;
+            assert_eq!(
+                reconstruct(run, payload, &store),
+                *payload,
+                "payload {at} {style:?}: the response is exactly reversible after its sibling style \
+                 re-stored the same originals"
+            );
         }
     }
-    let shadowed: Vec<&String> = seen
+    let addressed_twice: Vec<&String> = uses
         .iter()
-        .filter(|(_, (uses, hits))| uses > hits)
+        .filter(|(_, count)| **count > 1)
         .map(|(id, _)| id)
         .collect();
     assert!(
         collapsed * 2 >= CORPUS,
         "only {collapsed} of {CORPUS} payloads collapse"
     );
-    assert!(restored > 300, "only {restored} restores");
+    assert!(runs > 700, "only {runs} collapsing responses");
+    assert!(restored > 1_000, "only {restored} restores");
     assert!(
-        !shadowed.is_empty(),
-        "the shared store never shadowed an id: the pin above would be vacuous"
+        addressed_twice.len() >= 400,
+        "only {} ids are addressed by more than one response: the shared store never re-stored the \
+         same original and the assertions above would be vacuous",
+        addressed_twice.len()
     );
-    for id in &shadowed {
-        let (uses, hits) = seen[*id];
-        assert!(hits > 0, "{id} misses everywhere");
-        assert_eq!(uses - hits, 1, "{id} misses in more than one response");
+    assert_eq!(
+        entries.len(),
+        uses.len(),
+        "one live entry per reported id: the store never hands back an id the caller cannot use"
+    );
+    let (hash, len) = uses
+        .keys()
+        .next()
+        .expect("a reported id")
+        .split_once(':')
+        .expect("the normative id has one colon");
+    for never_stored in [
+        String::new(),
+        "garbage".to_string(),
+        format!("{hash}0:{len}"),
+        format!("{}:{}", hash.to_uppercase(), len),
+        format!("{hash}:{}", len.parse::<usize>().expect("a length") + 1),
+    ] {
+        assert_eq!(
+            store.restore_verified(b"{}", &never_stored),
+            None,
+            "{never_stored} was never reported, so it is a miss: the only misses left are ids no \
+             response ever returned"
+        );
     }
-    assert!(whole < collapsed, "no response was shadowed at all");
 }
