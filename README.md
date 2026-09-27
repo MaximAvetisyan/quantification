@@ -143,6 +143,16 @@ only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` and `ld-linux-x86-64.so.2` — no
 same thing as a built image, and it is not a claim that the runtime stage, the
 ports or the `ENTRYPOINT` have been observed working.
 
+**CI now executes it.** The `image` job in `.github/workflows/ci.yml` runs
+`docker build -t quantification:ci .` and then a `docker run` smoke test —
+wait for `/healthz`, `POST /v1/compress` a real payload and assert a `200` with
+a non-empty body, assert `/v1/restore` is not a `501`, then stop the container —
+on every push to `master` and every pull request, and it fails the build if any
+of that fails. GitHub's runners do have working registry access, so that job is
+the first thing that will ever actually assemble this image, and the first
+evidence that `USER 65532:65532` resolves. Until it has been green once, the
+Dockerfile is reviewed-but-unbuilt; it is no longer never-executed.
+
 ### Kubernetes
 
 `k8s/quantification.yaml` holds a `Deployment` and a `Service` for that image,
@@ -557,11 +567,14 @@ recorded as open in the repo history:
   locally. What was done is native: the same `cargo build --release --locked …
   --features ccr`, the binary started and exercised over real sockets, and
   `ldd` on it. The drain behaviour, the distroless runtime stage and the probes
-  are therefore read off the source, not observed on a pod. `kubectl`,
-  `kubeconform` and `yamllint` are not installed, so the manifest has had **no
-  schema validation at all**, only a structural re-check of selectors, probe
-  port names, targetPorts and the grace-above-drain relationship. See the Docker
-  section above and `k8s/README.md`.
+  are therefore read off the source, not observed on a pod. The `image` job in
+  `.github/workflows/ci.yml` now runs `docker build` and a `docker run` smoke
+  test on every push and pull request, so the first actual assembly of the image
+  will happen there rather than here; `kubectl`, `kubeconform` and `yamllint`
+  are not installed, so the manifest has had **no schema validation at all**,
+  only a structural re-check of selectors, probe port names, targetPorts and
+  the grace-above-drain relationship. See the Docker section above and
+  `k8s/README.md`.
 
 Also open, and worth knowing before relying on this:
 

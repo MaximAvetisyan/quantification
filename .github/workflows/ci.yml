@@ -39,3 +39,53 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the image
+        run: docker build -t quantification:ci .
+      - name: smoke-test the image
+        run: |
+          set -euo pipefail
+          docker run -d --name quantification-ci -p 18080:8080 -p 15051:50051 quantification:ci
+          trap 'docker logs quantification-ci; docker rm -f quantification-ci >/dev/null' EXIT
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:18080/healthz; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "the container never answered /healthz within 60s" >&2
+            exit 1
+          fi
+          echo "healthz: $(curl -fsS http://127.0.0.1:18080/healthz)"
+
+          out=$(mktemp)
+          code=$(curl -sS -o "$out" -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' \
+            --data-binary '{"model":"gpt-4","messages":[{"role":"user","content":"2026-08-25T10:00:01Z INFO hc 10.0.0.1 took 1ms ok\n2026-08-25T10:00:02Z INFO hc 10.0.0.2 took 2ms ok\n2026-08-25T10:00:03Z INFO hc 10.0.0.3 took 3ms ok\n2026-08-25T10:00:04Z INFO hc 10.0.0.4 took 4ms ok\n2026-08-25T10:00:05Z INFO hc 10.0.0.5 took 5ms ok\n"}]}' \
+            http://127.0.0.1:18080/v1/compress)
+          if [ "$code" != 200 ]; then
+            echo "POST /v1/compress returned $code, not 200" >&2
+            cat "$out" >&2
+            exit 1
+          fi
+          if [ ! -s "$out" ]; then
+            echo "POST /v1/compress returned 200 with an empty body" >&2
+            exit 1
+          fi
+          echo "compress: $(cat "$out")"
+
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            --data-binary 'x' \
+            'http://127.0.0.1:18080/v1/restore?restore_id=00000000000000000000000000000000:0')
+          echo "restore with a bogus id: $code"
+          if [ "$code" = 501 ]; then
+            echo "the ccr feature is not compiled into the image" >&2
+            exit 1
+          fi
+
+          docker stop --time 30 quantification-ci
