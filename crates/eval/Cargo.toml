@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-quantification-core = { path = "../core" }
+quantification-core = { path = "../core", version = "0.1.0" }
 tiktoken-rs = "0.12.1"
 
 [[bin]]

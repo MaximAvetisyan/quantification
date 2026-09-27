@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 prost = "0.14"
-quantification-core = { path = "../core" }
+quantification-core = { path = "../core", version = "0.1.0" }
 tonic = "0.14"
 tonic-prost = "0.14"
 
