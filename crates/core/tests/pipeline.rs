@@ -1052,6 +1052,7 @@ fn the_stats_carry_every_field_of_the_proto_message() {
             templated_blocks: 0,
             options_echo: defaults().options_echo(),
             record_splits: 0,
+            restore_ids: Vec::new(),
         }
     );
     assert!(run.stats.bytes_out < run.stats.bytes_in);
@@ -1198,24 +1199,48 @@ fn each_span_renders_in_its_own_resolved_style() {
 }
 
 #[test]
-fn reversible_true_is_rejected() {
+fn reversible_true_resolves_and_without_a_sink_reports_no_id() {
     assert_eq!(
         resolve(&RawOptions {
             reversible: Some(true),
             ..RawOptions::default()
-        }),
-        Err(ResolveError::UnsupportedReversible)
+        })
+        .expect("reversible=true resolves"),
+        ResolvedOptions {
+            reversible: true,
+            ..defaults()
+        }
     );
     let payload = doc(&[("user", &joined(&log_burst(6)))]);
     let off = options(&RawOptions {
         reversible: Some(false),
         ..RawOptions::default()
     });
+    let on = options(&RawOptions {
+        reversible: Some(true),
+        ..RawOptions::default()
+    });
     let run = compress(&payload, &off);
+    let reversible_run = compress(&payload, &on);
     assert_eq!(run.payload, compress(&payload, &defaults()).payload);
+    assert_eq!(
+        reversible_run.payload, run.payload,
+        "reversibility is metadata: it perturbs no output byte"
+    );
+    assert_eq!(reversible_run.commits, run.commits);
+    assert!(
+        reversible_run.stats.restore_ids.is_empty(),
+        "no sink is wired, so no span is stored and no id is promised"
+    );
     assert!(
         run.stats.options_echo.ends_with(r#""reversible":false}"#),
         "an affirmative false promise is the only promise made"
+    );
+    assert!(
+        reversible_run
+            .stats
+            .options_echo
+            .ends_with(r#""reversible":true}"#)
     );
 }
 

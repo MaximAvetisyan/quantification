@@ -14,6 +14,7 @@ use axum::routing::{get, post};
 use quantification_core::api::{
     self, ALGO_VERSION, ApiError, Compressor, Request, ScopePolicy, Stats,
 };
+use quantification_core::ccr;
 use quantification_core::config::REQUEST_BODY_LIMIT;
 use quantification_core::locator::{self, SpanClass};
 use serde_json::json;
@@ -23,17 +24,64 @@ pub const SPAN_PREVIEW_LIMIT: usize = 64;
 
 const JSON: &str = "application/json";
 const PLAIN: &str = "text/plain; version=0.0.4; charset=utf-8";
+const OCTET: &str = "application/octet-stream";
 
 const COMPRESS: u8 = 0;
 const DETECT: u8 = 1;
 const RESTORE: u8 = 2;
 
-const CCR_MISSING: &str = "the reversible store (DESIGN section 9) is not implemented yet; reversible=true is refused, so no span has a restore_id";
-const CCR_DISABLED: &str = "the reversible store (DESIGN section 9) is disabled in this build; reversible=true is refused, so no span has a restore_id";
+const CCR_MISSING: &str = "the reversible store (DESIGN section 9) is not implemented here because no store is wired; reversible=true stores no span, so no restore_id is returned";
+const CCR_DISABLED: &str = "the reversible store (DESIGN section 9) is disabled in this build; reversible=true stores no span, so no restore_id is returned";
+
+pub trait RestoreStore: Send + Sync {
+    fn store_committed(
+        &self,
+        _original: &[u8],
+        _marker: &[u8],
+        _checksum: [u8; 4],
+    ) -> Option<ccr::RestoreId> {
+        None
+    }
+
+    fn restore_verified(&self, payload: &[u8], restore_id: &str) -> Option<Vec<u8>>;
+}
+
+impl RestoreStore for ccr::Shared {
+    fn store_committed(
+        &self,
+        original: &[u8],
+        marker: &[u8],
+        checksum: [u8; 4],
+    ) -> Option<ccr::RestoreId> {
+        self.put(original, marker, checksum)
+    }
+
+    fn restore_verified(&self, payload: &[u8], restore_id: &str) -> Option<Vec<u8>> {
+        self.restore(Some(payload), restore_id)
+    }
+}
+
+pub fn shared_store() -> Option<Arc<dyn RestoreStore>> {
+    CCR_ENABLED.then(|| Arc::new(ccr::Shared::default()) as Arc<dyn RestoreStore>)
+}
+
+pub(crate) struct SinkHandle(pub(crate) Arc<dyn RestoreStore>);
+
+impl ccr::Sink for SinkHandle {
+    fn store(
+        &mut self,
+        original: &[u8],
+        marker: &[u8],
+        checksum: [u8; 4],
+    ) -> Option<ccr::RestoreId> {
+        self.0.store_committed(original, marker, checksum)
+    }
+}
 
 #[derive(Clone)]
 pub struct State {
     metrics: Arc<Mutex<Metrics>>,
+    store: Option<Arc<dyn RestoreStore>>,
 }
 
 pub fn app(state: State) -> Router {
@@ -58,7 +106,26 @@ impl State {
     pub fn new() -> Self {
         Self {
             metrics: Arc::new(Mutex::new(Metrics::default())),
+            store: shared_store(),
         }
+    }
+
+    pub fn with_store(store: Arc<dyn RestoreStore>) -> Self {
+        Self {
+            metrics: Arc::new(Mutex::new(Metrics::default())),
+            store: Some(store),
+        }
+    }
+
+    pub fn without_store() -> Self {
+        Self {
+            metrics: Arc::new(Mutex::new(Metrics::default())),
+            store: None,
+        }
+    }
+
+    pub fn store(&self) -> Option<Arc<dyn RestoreStore>> {
+        self.store.clone()
     }
 
     fn record(&self, route: u8, status: StatusCode, in_len: u64, out_len: u64, degraded: bool) {
@@ -126,7 +193,7 @@ async fn compress(
     body: Bytes,
 ) -> Response {
     let query = options::Query::parse(raw.as_deref());
-    match compress_inner(&query, &request_headers, body).await {
+    match compress_inner(&query, &request_headers, body, state.store()).await {
         Ok(outcome) => {
             let out_len = outcome.body.len() as u64;
             let mut response = reply(StatusCode::OK, &outcome.content_type, outcome.body.clone());
@@ -150,11 +217,12 @@ async fn compress_inner(
     query: &options::Query,
     request_headers: &HeaderMap,
     body: Bytes,
+    store: Option<Arc<dyn RestoreStore>>,
 ) -> Result<Outcome, Fault> {
     match query.get("envelope") {
         None => {
             let request = options::request(query).map_err(bad_request)?;
-            let mut outcome = compress_once(body, request).await?;
+            let mut outcome = compress_once(body, request, store).await?;
             outcome.content_type = request_headers
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
@@ -170,7 +238,7 @@ async fn compress_inner(
                 ))
             })?;
             let request = envelope.request().map_err(bad_request)?;
-            let mut outcome = compress_once(Bytes::from(envelope.payload), request).await?;
+            let mut outcome = compress_once(Bytes::from(envelope.payload), request, store).await?;
             let stats = outcome.stats.take().expect("compress_once sets stats");
             outcome.body = Bytes::from(
                 json!({
@@ -187,10 +255,17 @@ async fn compress_inner(
     }
 }
 
-async fn compress_once(payload: Bytes, request: Request) -> Result<Outcome, Fault> {
+async fn compress_once(
+    payload: Bytes,
+    request: Request,
+    store: Option<Arc<dyn RestoreStore>>,
+) -> Result<Outcome, Fault> {
     let in_len = payload.len() as u64;
     let compressed = tokio::task::spawn_blocking(move || {
         let mut compressor = Compressor::new();
+        if let Some(store) = store {
+            compressor = compressor.with_sink(SinkHandle(store));
+        }
         let mut out = Vec::new();
         api::reserve(&mut out, payload.len());
         let stats = compressor
@@ -259,6 +334,7 @@ fn stats_json(stats: &Stats) -> serde_json::Value {
         "templated_blocks": stats.templated_blocks,
         "options_echo": stats.options_echo,
         "record_splits": stats.record_splits,
+        "restore_ids": stats.restore_ids,
     })
 }
 
@@ -324,20 +400,45 @@ fn detect_payload(payload: &[u8], policy: ScopePolicy) -> Result<Outcome, Fault>
     })
 }
 
-async fn restore(AxumState(state): AxumState<State>) -> Response {
-    state.fault(
-        RESTORE,
-        Fault {
-            status: StatusCode::NOT_IMPLEMENTED,
-            code: "not_implemented",
-            message: if CCR_ENABLED {
-                CCR_MISSING
-            } else {
-                CCR_DISABLED
-            }
-            .to_string(),
-        },
-    )
+async fn restore(
+    AxumState(state): AxumState<State>,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    if !CCR_ENABLED {
+        return state.fault(RESTORE, unimplemented(CCR_DISABLED));
+    }
+    let Some(store) = state.store() else {
+        return state.fault(RESTORE, unimplemented(CCR_MISSING));
+    };
+    let query = options::Query::parse(raw.as_deref());
+    let (payload, restore_id) = match options::restore(&query, &body) {
+        Ok(asked) => asked,
+        Err(message) => return state.fault(RESTORE, bad_request(message)),
+    };
+    let in_len = payload.len() as u64;
+    let Some(original) = store.restore_verified(&payload, &restore_id) else {
+        return state.fault(
+            RESTORE,
+            Fault {
+                status: StatusCode::NOT_FOUND,
+                code: "not_found",
+                message: format!("no stored span for restore_id {restore_id}"),
+            },
+        );
+    };
+    let out_len = original.len() as u64;
+    let response = reply(StatusCode::OK, OCTET, Bytes::from(original));
+    state.record(RESTORE, StatusCode::OK, in_len, out_len, false);
+    response
+}
+
+fn unimplemented(message: &str) -> Fault {
+    Fault {
+        status: StatusCode::NOT_IMPLEMENTED,
+        code: "not_implemented",
+        message: message.to_string(),
+    }
 }
 
 async fn healthz() -> Response {

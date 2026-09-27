@@ -65,6 +65,7 @@ const PUBLIC_ITEMS: &[&str] = &[
     "Request",
     "ResolveError",
     "STRICT_VALIDATE",
+    "Sink",
     "ScopePolicy",
     "Stats",
     "as_str",
@@ -74,6 +75,7 @@ const PUBLIC_ITEMS: &[&str] = &[
     "reserve",
     "with_clock",
     "with_options",
+    "with_sink",
 ];
 
 const PARAMETERS: &[&str] = &[
@@ -82,6 +84,7 @@ const PARAMETERS: &[&str] = &[
     "out",
     "request",
     "clock",
+    "sink",
     "content_type",
     "options",
     "input_len",
@@ -92,6 +95,7 @@ const SIGNATURE_TYPES: &[&str] = &[
     "ApiError",
     "Clock",
     "Compressor",
+    "Sink",
     "ContentType",
     "RawOptions",
     "Request",
@@ -269,7 +273,7 @@ fn no_public_signature_exposes_an_internal_type() {
             line.starts_with("pub ") || line.starts_with("pinned:") || line.starts_with("sniffed:")
         })
         .collect();
-    assert_eq!(functions.len(), 7, "the public functions are {functions:?}");
+    assert_eq!(functions.len(), 8, "the public functions are {functions:?}");
     assert_eq!(
         fields,
         [
@@ -620,22 +624,19 @@ fn a_reserved_option_is_an_options_error_and_not_a_degrade() {
 }
 
 #[test]
-fn reversible_true_is_refused_and_false_echoes_false() {
+fn reversible_true_resolves_echoes_true_and_changes_no_output_byte() {
     let payload = chat(&log_lines(4));
-    assert_eq!(
-        error_of(
-            &payload,
-            &request(
-                None,
-                RawOptions {
-                    reversible: Some(true),
-                    ..defaults()
-                },
-            ),
+    let (on, stats) = compress(
+        &payload,
+        &request(
+            None,
+            RawOptions {
+                reversible: Some(true),
+                ..defaults()
+            },
         ),
-        ApiError::Options(ResolveError::UnsupportedReversible)
     );
-    let (out, stats) = compress(
+    let (off, off_stats) = compress(
         &payload,
         &request(
             None,
@@ -646,12 +647,44 @@ fn reversible_true_is_refused_and_false_echoes_false() {
         ),
     );
     let (without, _) = compress(&payload, &Request::default());
-    assert_eq!(
-        out, without,
-        "reversible=false changes nothing and claims nothing"
+    assert_eq!(on, off, "reversibility is metadata and perturbs no byte");
+    assert_eq!(on, without);
+    assert!(stats.options_echo.ends_with(r#""reversible":true}"#));
+    assert!(off_stats.options_echo.ends_with(r#""reversible":false}"#));
+    assert_eq!(stats.bytes_out, on.len() as u64);
+    assert!(
+        stats.restore_ids.is_empty(),
+        "no sink is wired through this call, so no id is promised"
     );
-    assert!(stats.options_echo.ends_with(r#""reversible":false}"#));
-    assert_eq!(stats.bytes_out, out.len() as u64);
+}
+
+#[test]
+fn a_wired_sink_receives_the_committed_range_of_every_group() {
+    let line = "ERROR timeout while connecting to the primary database shard";
+    let payload = chat(&repeated(line, 4));
+    let store = quantification_core::ccr::Shared::default();
+    let mut out = Vec::new();
+    let stats = Compressor::new()
+        .with_sink(store.clone())
+        .compress(
+            &payload,
+            &request(
+                None,
+                RawOptions {
+                    reversible: Some(true),
+                    ..defaults()
+                },
+            ),
+            &mut out,
+        )
+        .expect("reversible=true resolves");
+    assert_eq!(stats.groups_collapsed, 1);
+    assert_eq!(stats.restore_ids.len(), 1);
+    assert_eq!(
+        store.restore(Some(&out), &stats.restore_ids[0]),
+        Some(repeated(line, 4).into_bytes()),
+        "the stored original is the range the marker replaced"
+    );
 }
 
 // ---------------------------------------------------------------- pass-through

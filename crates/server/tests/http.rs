@@ -521,7 +521,7 @@ async fn the_default_options_echo_is_the_section_seven_default() {
 }
 
 #[tokio::test]
-async fn reversible_true_is_refused_and_reversible_false_resolves() {
+async fn reversible_true_resolves_and_false_resolves() {
     let envelope = |reversible: bool| {
         serde_json::to_vec(&serde_json::json!({
             "payload": String::from_utf8(EXACT_RUN.to_vec()).expect("utf8"),
@@ -529,30 +529,47 @@ async fn reversible_true_is_refused_and_reversible_false_resolves() {
         }))
         .expect("json")
     };
-    let target = "/v1/compress?reversible=true";
-    let answer = compress(&router(), target, EXACT_RUN).await;
-    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{target}");
-    assert_eq!(answer.error_code(), "invalid_options", "{target}");
-    assert!(
-        answer.json["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("reversible=true is not accepted"),
-        "{target}"
+    let plain = compress(&router(), "/v1/compress", EXACT_RUN).await;
+    let on = compress(&router(), "/v1/compress?reversible=true", EXACT_RUN).await;
+    assert_eq!(on.status, StatusCode::OK);
+    assert_eq!(on.body, plain.body, "reversibility perturbs no output byte");
+    assert_eq!(
+        compress(&router(), "/v1/compress?reversible=false", EXACT_RUN)
+            .await
+            .body,
+        plain.body
     );
     let answer = compress(&router(), "/v1/compress?envelope=json", &envelope(true)).await;
-    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
-    assert_eq!(answer.error_code(), "invalid_options");
-    assert_eq!(
-        answer.json.get("stats"),
-        None,
-        "a refused option answers no stats and no ids"
+    assert_eq!(answer.status, StatusCode::OK);
+    assert!(
+        answer.json["stats"]["options_echo"]
+            .as_str()
+            .expect("echo")
+            .ends_with("\"reversible\":true}")
     );
+    let ids = answer.json["stats"]["restore_ids"]
+        .as_array()
+        .expect("the envelope always carries the list");
+    if CCR_ENABLED {
+        assert_eq!(ids.len(), 1, "one restore_id per committed group");
+        let id = ids[0].as_str().expect("a string id");
+        let (hash, len) = id.split_once(':').expect("the normative id format");
+        assert_eq!(hash.len(), 32, "lower hex xxh3-128");
+        assert!(
+            hash.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            len.parse::<usize>().expect("a length"),
+            3 * b"ERROR timeout".len() + 2 * 2
+        );
+    } else {
+        assert!(
+            ids.is_empty(),
+            "no store in this build, so no id is promised"
+        );
+    }
 
-    let plain = compress(&router(), "/v1/compress", EXACT_RUN).await;
-    let off = compress(&router(), "/v1/compress?reversible=false", EXACT_RUN).await;
-    assert_eq!(off.status, StatusCode::OK);
-    assert_eq!(off.body, plain.body, "false changes no output byte");
     let answer = compress(&router(), "/v1/compress?envelope=json", &envelope(false)).await;
     assert_eq!(answer.status, StatusCode::OK);
     assert!(
@@ -562,9 +579,8 @@ async fn reversible_true_is_refused_and_reversible_false_resolves() {
             .ends_with("\"reversible\":false}")
     );
     assert_eq!(
-        answer.json["stats"].get("restore_ids"),
-        None,
-        "no store, so no ids"
+        answer.json["stats"]["restore_ids"],
+        Value::Array(Vec::new())
     );
 }
 
@@ -718,16 +734,27 @@ async fn a_long_span_list_is_previewed_not_dumped() {
 #[tokio::test]
 async fn restore_is_flag_gated_and_never_guesses() {
     let answer = send(&router(), "POST", "/v1/restore", b"{}").await;
+    assert_eq!(answer.header("content-type"), Some("application/json"));
+    if CCR_ENABLED {
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "the store answers, so a missing restore_id is the caller's mistake"
+        );
+        assert_eq!(answer.error_code(), "invalid_argument");
+        assert!(
+            answer.json["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("restore_id"),
+            "the message names what is missing"
+        );
+        return;
+    }
     assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(answer.error_code(), "not_implemented");
-    assert_eq!(answer.header("content-type"), Some("application/json"));
     let message = answer.json["error"]["message"].as_str().expect("message");
-    let expected = if CCR_ENABLED {
-        "not implemented"
-    } else {
-        "disabled"
-    };
-    assert!(message.contains(expected), "{message} must say {expected}");
+    assert!(message.contains("disabled"), "{message} must say disabled");
 }
 
 #[tokio::test]

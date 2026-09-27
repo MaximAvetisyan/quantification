@@ -108,9 +108,6 @@ pub fn resolve_message(error: ResolveError) -> String {
         ResolveError::UnsupportedScopePolicy(policy) => {
             format!("scope_policy={} is reserved", policy.as_str())
         }
-        ResolveError::UnsupportedReversible => {
-            "reversible=true is not accepted; the reversible store (DESIGN section 9) is not implemented yet".to_string()
-        }
         ResolveError::MinGroupSizeBelowTwo(size) => {
             format!("min_group_size={size} is below the minimum of 2")
         }
@@ -126,6 +123,39 @@ pub fn only_envelope(query: &Query) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreEnvelope {
+    pub payload: String,
+    pub restore_id: String,
+}
+
+pub fn restore(query: &Query, body: &[u8]) -> Result<(Vec<u8>, String), String> {
+    match query.get("envelope") {
+        None => {
+            for key in query.keys() {
+                if key != "restore_id" {
+                    return Err(format!(
+                        "unknown query parameter {key}; /v1/restore takes restore_id only"
+                    ));
+                }
+            }
+            let id = query.get("restore_id").ok_or_else(|| {
+                "restore_id is required: pass ?restore_id=<id> with the compressed bytes as the body, or ?envelope=json with {payload, restore_id}".to_string()
+            })?;
+            Ok((body.to_vec(), id.to_string()))
+        }
+        Some("json") => {
+            only_envelope(query)?;
+            let envelope: RestoreEnvelope = serde_json::from_slice(body).map_err(|error| {
+                format!("envelope is not a valid {{payload, restore_id}} document: {error}")
+            })?;
+            Ok((envelope.payload.into_bytes(), envelope.restore_id))
+        }
+        Some(other) => Err(format!("envelope={other} is not accepted; expected json")),
+    }
 }
 
 impl Envelope {

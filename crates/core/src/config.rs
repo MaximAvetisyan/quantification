@@ -85,7 +85,6 @@ pub struct ResolvedOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
     UnsupportedScopePolicy(ScopePolicy),
-    UnsupportedReversible,
     MinGroupSizeBelowTwo(u32),
 }
 
@@ -102,9 +101,6 @@ pub fn resolve(raw: &RawOptions) -> Result<ResolvedOptions, ResolveError> {
         Some(1) => return Err(ResolveError::MinGroupSizeBelowTwo(1)),
         Some(n) => n,
     };
-    if raw.reversible == Some(true) {
-        return Err(ResolveError::UnsupportedReversible);
-    }
     Ok(ResolvedOptions {
         scope_policy,
         min_group_size,
@@ -249,21 +245,22 @@ mod tests {
     }
 
     #[test]
-    fn reversible_true_is_rejected_and_false_resolves() {
-        assert_eq!(
-            resolve(&RawOptions {
-                reversible: Some(true),
+    fn reversible_true_and_false_both_resolve() {
+        for wire in [None, Some(false), Some(true)] {
+            let resolved = resolve(&RawOptions {
+                reversible: wire,
                 ..RawOptions::default()
-            }),
-            Err(ResolveError::UnsupportedReversible)
-        );
-        let off = resolve(&RawOptions {
-            reversible: Some(false),
+            })
+            .unwrap();
+            assert_eq!(resolved.reversible, wire.unwrap_or(false));
+        }
+        let on = resolve(&RawOptions {
+            reversible: Some(true),
             ..RawOptions::default()
         })
         .unwrap();
-        assert!(!off.reversible);
-        assert!(off.options_echo().ends_with(r#""reversible":false}"#));
+        assert!(on.reversible);
+        assert!(on.options_echo().ends_with(r#""reversible":true}"#));
     }
 
     #[test]

@@ -118,28 +118,25 @@ mod tests {
     }
 
     #[test]
-    fn reversible_true_is_refused_and_absent_or_false_resolves() {
-        for wire in [None, Some(false)] {
+    fn reversible_true_absent_or_false_all_resolve() {
+        for wire in [None, Some(false), Some(true)] {
             let options = roundtrip(Options {
                 reversible: wire,
                 ..Options::default()
             });
             assert_eq!(options.reversible, wire);
-            assert!(!resolve(&request(options)).unwrap().reversible);
+            assert_eq!(
+                resolve(&request(options)).unwrap().reversible,
+                wire.unwrap_or(false)
+            );
         }
-        let options = roundtrip(Options {
+        let resolved = resolve(&request(roundtrip(Options {
             reversible: Some(true),
             ..Options::default()
-        });
-        assert_eq!(
-            options.reversible,
-            Some(true),
-            "the refused value still occupies the wire"
-        );
-        assert_eq!(
-            resolve(&request(options)),
-            Err(ResolveError::UnsupportedReversible)
-        );
+        })))
+        .expect("reversible=true resolves");
+        assert!(resolved.reversible);
+        assert!(resolved.options_echo().ends_with(r#""reversible":true}"#));
     }
 
     #[test]

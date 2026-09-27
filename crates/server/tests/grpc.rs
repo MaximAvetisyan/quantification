@@ -755,32 +755,34 @@ async fn a_degraded_pass_through_is_never_an_error() {
 struct Store;
 
 impl RestoreStore for Store {
-    fn restore_verified(&self, restore_id: &str) -> Option<Vec<u8>> {
+    fn restore_verified(&self, payload: &[u8], restore_id: &str) -> Option<Vec<u8>> {
         restore_id
             .strip_prefix("hit:")
+            .filter(|_| payload.is_empty())
             .map(|rest| rest.as_bytes().to_vec())
     }
 }
 
 #[tokio::test]
-async fn restore_is_unimplemented_until_a_store_is_wired() {
+async fn restore_is_unimplemented_without_a_store_or_a_feature() {
     let bare = client()
         .restore(RestoreRequest {
             payload: b"whatever".to_vec(),
             restore_id: "hit:7".to_string(),
         })
-        .await
-        .expect_err("no store in the default service");
-    assert_eq!(bare.code(), Code::Unimplemented);
-    assert!(
-        bare.message().contains(if CCR_ENABLED {
-            "not implemented"
-        } else {
-            "disabled"
-        }),
-        "{}",
-        bare.message()
-    );
+        .await;
+    if CCR_ENABLED {
+        let status = bare.expect_err("the real store holds no such id");
+        assert_eq!(status.code(), Code::NotFound, "a miss, never bytes");
+    } else {
+        let status = bare.expect_err("disabled in this build");
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert!(
+            status.message().contains("disabled"),
+            "{}",
+            status.message()
+        );
+    }
 
     let mut client =
         CompressorClient::new(grpc::routes(grpc::Service::with_store(Arc::new(Store))));
@@ -811,6 +813,14 @@ async fn restore_is_unimplemented_until_a_store_is_wired() {
         .await
         .expect_err("a miss");
     assert_eq!(miss.code(), Code::NotFound);
+    let refused = client
+        .restore(RestoreRequest {
+            payload: b"a payload the store did not write".to_vec(),
+            restore_id: "hit:7".to_string(),
+        })
+        .await
+        .expect_err("the store rejects a payload it never produced");
+    assert_eq!(refused.code(), Code::NotFound);
 }
 
 async fn probe(method: &str) -> (i32, String) {
@@ -945,8 +955,8 @@ async fn repeated_identical_requests_answer_byte_identically() {
 }
 
 #[tokio::test]
-async fn reversible_true_is_refused_by_both_transports_and_false_resolves() {
-    let refused = case(
+async fn reversible_true_is_honoured_by_both_transports_and_false_resolves() {
+    let on = case(
         "reversible_true",
         EXACT_RUN,
         "?reversible=true",
@@ -957,19 +967,9 @@ async fn reversible_true_is_refused_by_both_transports_and_false_resolves() {
             ..Options::default()
         },
     );
-    let status = compress(request(&refused)).await.expect_err("refused");
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert!(
-        status.message().contains("reversible"),
-        "{} must name the option",
-        status.message()
-    );
-    let (http_status, body) =
-        http_status_and_bytes("/v1/compress?reversible=true", EXACT_RUN).await;
-    assert_eq!(http_status, 400, "the transports must agree");
-    let http: Value = serde_json::from_slice(&body).expect("error json");
-    assert_eq!(http["error"]["code"], "invalid_options");
-
+    let answer = compress(request(&on))
+        .await
+        .expect("reversible=true resolves");
     let off = case(
         "reversible_false",
         EXACT_RUN,
@@ -981,20 +981,55 @@ async fn reversible_true_is_refused_by_both_transports_and_false_resolves() {
             ..Options::default()
         },
     );
-    let answer = compress(request(&off)).await.expect("false resolves");
+    let false_run = compress(request(&off)).await.expect("false resolves");
+    assert_eq!(
+        answer.payload, false_run.payload,
+        "reversibility is metadata and perturbs no output byte"
+    );
     assert_eq!(
         answer.payload,
-        http_bytes("/v1/compress?reversible=false", EXACT_RUN).await
+        http_bytes("/v1/compress?reversible=true", EXACT_RUN).await,
+        "the transports return the same bytes"
     );
-    let stats = answer.stats.expect("stats");
+    let stats = answer.stats.clone().expect("stats");
+    let http = http_envelope(&on).await;
+    assert!(stats.options_echo.ends_with("\"reversible\":true}"));
+    if CCR_ENABLED {
+        assert_eq!(stats.groups_collapsed, 1);
+        assert_eq!(
+            stats.restore_ids.len(),
+            1,
+            "one restore_id per committed group"
+        );
+        let id = &stats.restore_ids[0];
+        let (hash, len) = id.split_once(':').expect("the normative id format");
+        assert_eq!(hash.len(), 32, "lower hex xxh3-128");
+        assert!(
+            hash.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            len.parse::<usize>().expect("a length"),
+            3 * b"ERROR timeout".len() + 2 * 2,
+            "the three dropped rows and the two joiners between them"
+        );
+        assert_eq!(
+            http["stats"]["restore_ids"],
+            serde_json::json!([id]),
+            "both transports report the same content addressed id"
+        );
+    } else {
+        assert!(
+            stats.restore_ids.is_empty(),
+            "no store in this build, so no id is promised"
+        );
+        assert_eq!(http["stats"]["restore_ids"], serde_json::json!([]));
+    }
+    let off_stats = false_run.stats.expect("stats");
+    assert!(off_stats.options_echo.ends_with("\"reversible\":false}"));
     assert!(
-        stats.options_echo.ends_with("\"reversible\":false}"),
-        "{}",
-        stats.options_echo
-    );
-    assert!(
-        stats.restore_ids.is_empty(),
-        "no store, so no ids next to the echoed false"
+        off_stats.restore_ids.is_empty(),
+        "reversible=false stores nothing"
     );
 }
 

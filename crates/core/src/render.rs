@@ -65,7 +65,13 @@ fn write_count(out: &mut Vec<u8>, count: u64) {
 }
 
 fn write_checksum(out: &mut Vec<u8>, checksum: u16) {
-    for shift in [12, 8, 4, 0] {
-        out.push(HEX[(checksum >> shift) as usize & 0xf]);
+    out.extend_from_slice(&checksum_hex(checksum));
+}
+
+pub fn checksum_hex(checksum: u16) -> [u8; 4] {
+    let mut out = [0; 4];
+    for (at, shift) in [12, 8, 4, 0].into_iter().enumerate() {
+        out[at] = HEX[(checksum >> shift) as usize & 0xf];
     }
+    out
 }

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod ccr;
 pub mod config;
 pub mod detect;
 pub mod fingerprint;

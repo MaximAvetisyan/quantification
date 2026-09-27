@@ -15,15 +15,21 @@ use tonic::service::Routes;
 use tonic::{Request as RpcRequest, Response, Status};
 
 use crate::options;
-use crate::{CCR_DISABLED, CCR_ENABLED, CCR_MISSING};
+use crate::{CCR_DISABLED, CCR_ENABLED, CCR_MISSING, SinkHandle, shared_store};
 
-pub trait RestoreStore: Send + Sync {
-    fn restore_verified(&self, restore_id: &str) -> Option<Vec<u8>>;
-}
+pub use crate::RestoreStore;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Service {
     store: Option<Arc<dyn RestoreStore>>,
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self {
+            store: shared_store(),
+        }
+    }
 }
 
 impl Service {
@@ -35,7 +41,7 @@ impl Service {
         Self { store: Some(store) }
     }
 
-    fn restored(&self, restore_id: &str) -> Result<Vec<u8>, Status> {
+    fn restored(&self, payload: &[u8], restore_id: &str) -> Result<Vec<u8>, Status> {
         if !CCR_ENABLED {
             return Err(Status::unimplemented(CCR_DISABLED));
         }
@@ -44,7 +50,7 @@ impl Service {
             .as_deref()
             .ok_or_else(|| Status::unimplemented(CCR_MISSING))?;
         store
-            .restore_verified(restore_id)
+            .restore_verified(payload, restore_id)
             .ok_or_else(|| Status::not_found(format!("no stored span for restore_id {restore_id}")))
     }
 }
@@ -67,8 +73,12 @@ impl Rpc for Service {
     ) -> Result<Response<CompressResponse>, Status> {
         let core = core_request(request.get_ref())?;
         let payload = request.into_inner().payload;
+        let store = self.store.clone();
         let compressed = tokio::task::spawn_blocking(move || {
             let mut compressor = Core::new();
+            if let Some(store) = store {
+                compressor = compressor.with_sink(SinkHandle(store));
+            }
             let mut out = Vec::new();
             api::reserve(&mut out, payload.len());
             let stats = compressor
@@ -91,7 +101,8 @@ impl Rpc for Service {
         &self,
         request: RpcRequest<RestoreRequest>,
     ) -> Result<Response<RestoreResponse>, Status> {
-        let original = self.restored(request.get_ref().restore_id.as_str())?;
+        let asked = request.get_ref();
+        let original = self.restored(asked.payload.as_slice(), asked.restore_id.as_str())?;
         Ok(Response::new(RestoreResponse { original }))
     }
 }
@@ -159,7 +170,7 @@ fn stats_message(stats: &Stats) -> GrpcStats {
         templated_blocks: stats.templated_blocks,
         options_echo: stats.options_echo.clone(),
         record_splits: stats.record_splits,
-        restore_ids: Vec::new(),
+        restore_ids: stats.restore_ids.clone(),
     }
 }
 
@@ -329,48 +340,58 @@ mod tests {
     }
 
     impl RestoreStore for Store {
-        fn restore_verified(&self, restore_id: &str) -> Option<Vec<u8>> {
+        fn restore_verified(&self, payload: &[u8], restore_id: &str) -> Option<Vec<u8>> {
             self.asked
                 .lock()
                 .expect("unpoisoned")
                 .push(restore_id.to_string());
-            (restore_id == "hit").then(|| self.original.clone())
+            (restore_id == "hit" && payload != b"wrong").then(|| self.original.clone())
         }
     }
 
     #[test]
     fn restore_is_gated_on_the_ccr_feature() {
-        let status = Service::new()
-            .restored("hit")
-            .expect_err("there is no store in this build");
-        assert_eq!(status.code(), Code::Unimplemented);
-        assert_eq!(
-            status.message(),
-            if CCR_ENABLED {
-                CCR_MISSING
-            } else {
-                CCR_DISABLED
-            }
-        );
         let asked = Arc::new(Mutex::new(Vec::new()));
         let store = Store {
             original: vec![7, 7],
             asked: asked.clone(),
         };
         let wired = Service::with_store(Arc::new(store));
-        if CCR_ENABLED {
-            assert_eq!(wired.restored("hit").expect("hit"), vec![7, 7]);
-            assert_eq!(
-                wired.restored("miss").expect_err("a miss").code(),
-                Code::NotFound
-            );
-            assert_eq!(*asked.lock().expect("unpoisoned"), ["hit", "miss"]);
-        } else {
-            let status = wired.restored("hit").expect_err("disabled");
+        if !CCR_ENABLED {
+            let status = Service::new()
+                .restored(b"", "hit")
+                .expect_err("disabled in this build");
+            assert_eq!(status.code(), Code::Unimplemented);
+            assert_eq!(status.message(), CCR_DISABLED);
+            let status = wired.restored(b"", "hit").expect_err("disabled");
             assert_eq!(status.code(), Code::Unimplemented);
             assert_eq!(status.message(), CCR_DISABLED);
             assert!(asked.lock().expect("unpoisoned").is_empty());
+            return;
         }
+        assert_eq!(wired.restored(b"", "hit").expect("hit"), vec![7, 7]);
+        assert_eq!(
+            wired.restored(b"", "miss").expect_err("a miss").code(),
+            Code::NotFound
+        );
+        assert_eq!(
+            wired
+                .restored(b"wrong", "hit")
+                .expect_err("a pre-check miss")
+                .code(),
+            Code::NotFound
+        );
+        assert_eq!(*asked.lock().expect("unpoisoned"), ["hit", "miss", "hit"]);
+        let bare = Service::new();
+        assert_eq!(
+            bare.store.is_some(),
+            CCR_ENABLED,
+            "the default service wires the reversible store when the feature is on"
+        );
+        let unwired = Service { store: None };
+        let status = unwired.restored(b"", "hit").expect_err("no store");
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.message(), CCR_MISSING);
     }
 
     #[test]

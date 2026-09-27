@@ -1,11 +1,13 @@
 use std::ops::Range;
 use std::time::Instant;
 
+use crate::ccr::Sink;
 use crate::config::{MAX_BLOCK_LINES, MIN_BLOCK_LINES, MarkerStyle, ResolvedOptions};
 use crate::detect::{blocks, exact, templ, templ_blocks, wsruns};
+use crate::fingerprint::marker_checksum;
 use crate::ledger::{Commit, Ledger, StageStats};
 use crate::locator::{NoopReason, Span, locate_into};
-use crate::render::resolve_style;
+use crate::render::{self, resolve_style};
 use crate::sniff::{self, Schema};
 use crate::splice::splice_into;
 use crate::stage1;
@@ -32,6 +34,7 @@ pub struct Stats {
     pub templated_blocks: u64,
     pub options_echo: String,
     pub record_splits: u64,
+    pub restore_ids: Vec<String>,
 }
 
 impl Stats {
@@ -112,6 +115,7 @@ pub struct Compressor {
     spans: Vec<Span>,
     commits: Vec<Commit>,
     stages: Stages,
+    sink: Option<Box<dyn Sink>>,
 }
 
 impl Default for Compressor {
@@ -131,7 +135,12 @@ impl Compressor {
             spans: Vec::new(),
             commits: Vec::new(),
             stages: Stages::new(),
+            sink: None,
         }
+    }
+
+    pub fn set_sink(&mut self, sink: Box<dyn Sink>) {
+        self.sink = Some(sink);
     }
 
     pub fn commits(&self) -> &[Commit] {
@@ -169,6 +178,7 @@ impl Compressor {
             spans,
             commits,
             stages,
+            sink,
         } = self;
         let detect_start = clock.now_ns();
         let noop = match pinned.or_else(|| sniff::sniff(payload)) {
@@ -220,8 +230,29 @@ impl Compressor {
             ..Stats::default()
         };
         stats.absorb(&stage);
+        if options.reversible {
+            stats.restore_ids = reversals(payload, commits, sink);
+        }
         stats
     }
+}
+
+fn reversals(payload: &[u8], commits: &[Commit], sink: &mut Option<Box<dyn Sink>>) -> Vec<String> {
+    let Some(sink) = sink.as_deref_mut() else {
+        return Vec::new();
+    };
+    let mut ids = Vec::with_capacity(commits.len());
+    for commit in commits {
+        let anchor = &payload[commit.anchor.clone()];
+        let mut marker = Vec::new();
+        render::render_into(&mut marker, commit.style, commit.kind, commit.count, anchor);
+        let original = &payload[commit.removed.clone()];
+        let checksum = render::checksum_hex(marker_checksum(anchor));
+        if let Some(id) = sink.store(original, &marker, checksum) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 struct SpanResult {

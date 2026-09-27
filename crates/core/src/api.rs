@@ -3,6 +3,7 @@ use crate::pipeline;
 use crate::sniff;
 use crate::splice;
 
+pub use crate::ccr::Sink;
 pub use crate::config::{MarkerStyle, RawOptions, ResolveError, ScopePolicy};
 pub use crate::locator::NoopReason;
 pub use crate::pipeline::{ALGO_VERSION, Clock, MonotonicClock, Stats};
@@ -86,6 +87,11 @@ impl Compressor {
         Self {
             inner: pipeline::Compressor::with_clock(clock),
         }
+    }
+
+    pub fn with_sink(mut self, sink: impl Sink + 'static) -> Self {
+        self.inner.set_sink(Box::new(sink));
+        self
     }
 
     pub fn compress(

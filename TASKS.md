@@ -1993,8 +1993,13 @@ exit criteria. Gates M1–M4 are blocking milestones.
     not a 200) and W3.3's `crates/proto/src/convert.rs::explicit_false_survives_wire_and_resolves_false`
     (`resolve` now returns `Err`). Both are outside this hunk's ownership and are
     **left failing on purpose**; the transport's own `resolve_message` already
-    carries an `UnsupportedReversible` arm (W3.3), so only the two expectations
-    need flipping.
+     carries an `UnsupportedReversible` arm (W3.3), so only the two expectations
+     need flipping.
+     **Done, by W3.4 (2026-09-27, recorded below):** the refusal is gone
+     (`ResolveError::UnsupportedReversible` is deleted, not just unused),
+     `reversible=true` resolves and is honoured, and all three transport tests
+     plus the three core tests now assert the honoured behaviour. The rationale
+     above stays as the record of *why* the refusal existed for one wave.
   - **The golden did *not* have to be re-baselined, and here is why.** This hunk
     was told to expect `edges/prior-markers.json`'s golden output to change; it
     does not, and `the_chat_goldens_are_reproduced_byte_for_byte` still passes
@@ -2350,8 +2355,8 @@ exit criteria. Gates M1–M4 are blocking milestones.
 - **W3.2 HTTP/axum** (§6.1) ∥ **W3.3 gRPC/tonic unary** (§6.2) ∥
   **W3.4 CCR store + Restore** (§9, flag-gated) — all parallel behind W3.1;
   W3.2 implements `X-Stats-*` naming verbatim.
-  Status: **complete** (2026-09-27) for W3.2; **W3.3 is recorded below** and
-  W3.4 is open. `crates/server` is now a lib plus a thin bin: `src/lib.rs`
+  Status: **complete** (2026-09-27) for W3.2; **W3.3 and W3.4 are recorded
+  below**. `crates/server` is now a lib plus a thin bin: `src/lib.rs`
   (router, handlers, error mapping, Prometheus counters),
   `src/options.rs` (query parser + option mapping, the only place a §6.1 option
   is spelled), `src/headers.rs` (`Stats` → `X-Stats-*`), `src/main.rs`
@@ -2581,9 +2586,15 @@ exit criteria. Gates M1–M4 are blocking milestones.
   it answers `Unimplemented` with the "not implemented yet" message; a wired
   store is consulted through `RestoreStore::restore_verified(&str) ->
   Option<Vec<u8>>`, whose `None` (a miss, i.e. §9's length+hash re-verification
-  failing) is `NotFound`. No store behaviour is invented here — the trait is an
-  interface with no implementation in the tree, and W3.4 plugs one in without
-  touching this file.
+   failing) is `NotFound`. No store behaviour is invented here — the trait is an
+   interface with no implementation in the tree, and W3.4 plugs one in without
+   touching this file. **(W3.4, 2026-09-27: the field is no longer always empty —
+   see the W3.4 record below. It did touch this file, for two reasons W3.3 could
+   not foresee: the seam had to become shared with the HTTP transport, so
+   `RestoreStore` moved to `src/lib.rs` with a `pub use` here (the name
+   `grpc::RestoreStore` still resolves), and its `restore_verified` now takes the
+   caller's compressed payload, which §9's cheap pre-check needs. No status
+   code, no path and no method name of §6.2 changed.)**
   **Option semantics are W3.2's**, because W1.6's `optional bool` restores
   presence: an absent `options` message and an absent `normalize_ws` resolve to
   the §7 default `true` (echo
@@ -2717,6 +2728,279 @@ exit criteria. Gates M1–M4 are blocking milestones.
     reproduces: `windowed_blocks` takes six parameters because 99fc0f7 already
     grouped the closure/domain arguments into `Domain`, so no `#[allow]` was
     needed.
+
+- **W3.4 CCR store + Restore** (§9, flag-gated) — the reversible store,
+  `/v1/restore`, gRPC `Restore` and `Stats.restore_ids`; the wave that makes
+  `reversible=true` honest.
+  Status: **complete** (2026-09-27). Three new files —
+  `crates/core/src/ccr.rs` (the store), `crates/core/tests/ccr.rs` (13 tests) and
+  `crates/server/tests/restore.rs` (6 tests) — and the minimum wiring: one new
+  line in `crates/core/src/lib.rs` (`pub mod ccr;`), `pipeline.rs`
+  (`Stats.restore_ids`, the sink field, `set_sink`, the private `reversals`
+  walk), `api.rs` (`with_sink`), `render.rs` (`checksum_hex`, factored out of
+  the existing `write_checksum`), `config.rs` (the flip), the two guard tests
+  that enumerate the `api` surface, `crates/proto/src/convert.rs` (one test
+  re-pointed), and `crates/server/src/{lib,grpc,options,main}.rs` plus the two
+  transport test files. No new dependency, no golden re-baseline, no DESIGN.md
+  change.
+  **The store** (`quantification_core::ccr`) is content-addressed, TTL-bounded
+  and feature-agnostic — the gate lives in the transports, exactly where W3.2
+  and W3.3 put it:
+
+  ```rust
+  pub const DEFAULT_TTL_NS: u64 = 900 * 1_000_000_000;   // 15 minutes
+  pub const DEFAULT_MAX_BYTES: usize = 67_108_864;       // 64 MiB
+
+  pub struct RestoreId { pub hash: u128, pub len: usize }
+  impl RestoreId {
+      pub fn of(original: &[u8]) -> Self;                 // xxh3-128 + byte length
+      pub fn parse(id: &str) -> Option<Self>;             // strict, canonical only
+  }
+  impl std::fmt::Display for RestoreId                   // lower-hex(len) form
+
+  pub trait Sink {                                       // the write side
+      fn store(&mut self, original: &[u8], marker: &[u8], checksum: [u8; 4])
+          -> Option<RestoreId>;
+  }
+
+  pub struct Store { /* clock, ttl_ns, max_bytes, bytes, entries */ }
+  impl Store {
+      pub fn new(ttl_ns: u64, max_bytes: usize) -> Self;
+      pub fn with_clock(clock: impl Clock + Send + Sync + 'static,
+                        ttl_ns: u64, max_bytes: usize) -> Self;
+      pub fn insert(&mut self, id: RestoreId, original: Vec<u8>,
+                    marker: Vec<u8>, checksum: [u8; 4]) -> bool;
+      pub fn restore(&self, payload: Option<&[u8]>, id: &str) -> Option<Vec<u8>>;
+      pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool;
+      pub fn bytes(&self) -> usize;
+  }
+
+  #[derive(Clone)] pub struct Shared { /* Arc<Mutex<Store>> */ }
+  // Shared::{new, with_clock, insert, put, restore, len, is_empty, bytes} + Default
+  ```
+  **The id is §9's normative format, exactly**:
+  `lower-hex(xxh3-128(original_span_bytes)) + ":" + decimal(byte_length)` — 32
+  lowercase hex characters, one colon, a canonical decimal (no leading zeros, so
+  it round-trips), and `RestoreId::of(bytes).to_string() == id` for every input.
+  Nothing time-derived, no process id, no counter, no sequence number: the same
+  original always yields the same id, in any process, at any time, which is what
+  makes the store content-addressed and the ids safe to cache client-side.
+  **"original span bytes" is read as the §4.4 removal-rule range of the committed
+  group** — the exact range §4.4 says "the marker replaces exactly that range",
+  i.e. the union of the member ranges plus the joiners between them. That is the
+  only reading under which `restore` reproduces the input byte for byte
+  (`restore_is_the_identity_over_the_corpus` is the proof), and the anchor is
+  that range's prefix, so the id's byte length is a length a caller can check
+  against the marker it sees. `id = <hex>:<removed range length>`, never the
+  anchor's.
+  **Nothing may return wrong bytes.** `restore` is a five-step ladder and any
+  step that fails is a **miss** (`None` ⇒ HTTP 404 `not_found` / gRPC
+  `NotFound`), never a guess:
+  1. `RestoreId::parse` — a malformed id (wrong hex width, uppercase, a second
+     colon, a non-canonical length, trailing bytes, garbage) is a miss;
+  2. the entry must exist and must not be past its TTL;
+  3. **the cheap pre-check**, only when the caller supplied a compressed payload
+     and it is non-empty: the marker's 4-hex `CCCC` must occur in it, and the
+     exact marker bytes the core rendered for that group must occur in it. §9
+     and §4.5 are explicit that `CCCC` is "a cheap pre-check only — never the
+     storage key", and it is used only here: the key is always the 128-bit hash
+     plus the length;
+  4. **re-verification, §9's requirement**: `entry.original.len() == id.len`;
+  5. `fingerprint(&entry.original) == id.hash`.
+  The key and the bytes are stored in *separate* fields precisely so that step 5
+  can catch an entry whose bytes no longer hash to their key
+  (`a_mutated_entry_is_caught_by_re_verification` mutates the stored `Vec` in
+  place), and so that an entry filed under a valid id with different bytes is a
+  miss rather than a restoration (`an_entry_whose_bytes_disagree_with_its_key_is_a_miss`).
+  **A collision can never overwrite a live entry**: `insert` refuses (and
+  reports no id) when an entry with that id holds different bytes, so a
+  hypothetical xxh3-128 collision costs the second group its id instead of
+  handing the first group's caller the wrong original
+  (`a_collision_never_replaces_a_live_entry`).
+  **The clock is a seam, never a sleep.** `Store`/`Shared` take
+  `impl Clock + Send + Sync` (W2.9's `pipeline::Clock`, the same trait the
+  elapsed stats read), defaulting to `MonotonicClock`; `Send + Sync` is what
+  makes the store storable in an `Arc<Mutex<…>>` and therefore shareable by
+  axum/tonic state, and the tests inject an `AtomicU64` clock they move by hand,
+  so TTL expiry is asserted without a wall clock and without flakiness
+  (`the_ttl_and_the_byte_bound_are_injected_not_slept`). The core still reads no
+  clock of its own on the output path: `reversals` runs *after* the fourth
+  `now_ns()` read, so the three `elapsed_*` fields are byte-identical whether
+  `reversible` is true or false.
+  **The ids come from `commits()`, in marker output order.** `pipeline::run`
+  walks the merged commit list — which W2.9 froze as ascending by anchor byte
+  offset and which is the order `splice_into` renders markers in — and for each
+  commit hands the sink `(payload[commit.removed], the rendered marker,
+  checksum_hex(marker_checksum(anchor)))`. One id per committed group, in the
+  order the markers appear in the output: `one_id_per_committed_group_in_marker_output_order`
+  compares the reported ids against the ids derived from `commits()` element by
+  element, and because a permutation would misplace the bytes, the §12 identity
+  property is itself the order proof.
+  **The one hook in the core, and why it had to be there.** The store must be
+  fed from *inside* the splice, because the removed ranges exist nowhere else,
+  and the transports must not reach around W3.1's `api`. So the sink is a
+  builder beside `with_clock` —
+  `api::Compressor::with_sink(mut self, sink: impl Sink + 'static) -> Self`
+  delegating to a new `pipeline::Compressor::set_sink(Box<dyn Sink>)` — which is
+  why `crates/core/tests/api.rs`'s two enumerating guards moved with it:
+  `the_public_surface_is_exactly_the_documented_items` now expects 23 items
+  (`Sink`, `with_sink`) instead of 21, and
+  `no_public_signature_exposes_an_internal_type` counts 8 public functions and
+  allows `sink` as a parameter name and `Sink` as a signature type. `Sink` is a
+  *public* type in a new public module, not one of the internals those guards
+  exist to keep out of the signature. W3.1's api record asked for exactly this
+  ("any addition breaks the test and must be recorded here"); nothing else in
+  `api.rs` changed, it still reads no clock of its own and still carries no
+  comment.
+  **`reversible=true` is re-admitted.** `config::resolve` no longer refuses
+  `Some(true)` and `ResolveError::UnsupportedReversible` is **deleted** (a
+  never-constructed variant plus a message that can no longer be sent is a trap,
+  so W3.2's `resolve_message` lost its arm too — the same forced, purely
+  mechanical edit W3.3 recorded for the same reason). Every test that pinned the
+  refusal now asserts the honoured behaviour instead of being deleted:
+  `config.rs::reversible_true_and_false_both_resolve`,
+  `tests/pipeline.rs::reversible_true_resolves_and_without_a_sink_reports_no_id`
+  (also asserts the output bytes and the commit list are identical either way),
+  `tests/api.rs::reversible_true_resolves_echoes_true_and_changes_no_output_byte`
+  plus a new `a_wired_sink_receives_the_committed_range_of_every_group`,
+  `crates/proto/src/convert.rs::reversible_true_absent_or_false_all_resolve`,
+  `tests/http.rs::reversible_true_resolves_and_false_resolves` and
+  `tests/grpc.rs::reversible_true_is_honoured_by_both_transports_and_false_resolves`
+  (both assert the ids, their exact format, and that the two transports report
+  the same ids for the same bytes).
+  **Both transports, one seam.** W3.3's `RestoreStore` is now the seam for both:
+  it moved to `crates/server/src/lib.rs` (`grpc::RestoreStore` is a `pub use`
+  re-export, so the name W3.3 froze still resolves) and grew the write half,
+  `store_committed(&self, original, marker, checksum) -> Option<ccr::RestoreId>`,
+  defaulting to `None` so a read-only fake still compiles.
+  `impl RestoreStore for ccr::Shared` is the one implementation, and
+  `pub(crate) SinkHandle(Arc<dyn RestoreStore>)` adapts it to the core's
+  `&mut self` sink trait. `State` grew `with_store`/`without_store`/`store`, and
+  `grpc::Service::new()`/`State::new()` now wire `shared_store()` — a real
+  `ccr::Shared` when the `ccr` feature is on, `None` when it is off — while
+  `with_store` stays the injection point W3.3 froze. `main.rs` builds **one**
+  store and hands it to both listeners, so a compress over HTTP is restorable
+  over gRPC.
+
+  | Transport | Success | Failures |
+  |---|---|---|
+  | `POST /v1/restore?restore_id=<id>` (raw compressed body) | 200, the original bytes, `Content-Type: application/octet-stream` | 400 `invalid_argument` (no `restore_id`, an unknown query key), 404 `not_found` (a miss: unknown, expired, evicted, malformed or mismatched id; a payload that is not the one the id came from), 413, 501 `not_implemented` (feature off, or no store wired) |
+  | `POST /v1/restore?envelope=json` (`{payload, restore_id}`) | 200, identical bytes | same, plus 400 for a broken envelope |
+  | gRPC `Restore` | `RestoreResponse{original}`, byte-identical to the HTTP body | `NotFound` on a miss, `Unimplemented` when the feature is off or no store is wired |
+
+  §6.1 pins neither the request nor the response shape of `/v1/restore`
+  ("compressed + id → original"), so both are readings, frozen here: the
+  **bare** form carries the compressed bytes as the body and the id in the query
+  (the bare compress path already carries arbitrary bytes — W3.2's deviation (3)
+  notes a non-UTF-8 payload is reachable there — so nothing is lost and no
+  escaping is invented), the **`envelope=json`** form mirrors §6.2's
+  `RestoreRequest` field for field and is the shape a polyglot client already
+  speaks, and the response is raw bytes labelled `application/octet-stream`
+  because a restored original is a fragment of a JSON string interior (escaped
+  bytes), not a document. Both compress shapes store (the bare path's ids are
+  simply not reported, since §6.1 forbids a `restore_ids` header), so a repeated
+  compress of the same payload refreshes the same content-addressed entry
+  (`both_compress_shapes_store_the_same_originals`).
+  **The properties, and where they are asserted.** `restore(reversible) ==
+  identity` is the headline: over all 26 corpus fixtures and 11 generated shapes
+  (log bursts of 3–33 rows, a repeated block, a stage-1b single-line record
+  dump, a unicode span, two messages with a run each), the compressed output
+  with **every** reported id substituted back reproduces the input byte for
+  byte, and `restore_ids.len() == groups_collapsed` in every case — the harness
+  rebuilds the payload from the output, the commits and the ids alone, with no
+  access to the store's internals. The rest: the id format and its round trip
+  (`the_ids_are_the_normative_format_and_parse_back`), tampered ids
+  (wrong hash, wrong length, truncated, uppercase, two colons, trailing byte,
+  garbage, an id from another payload) as misses on both transports
+  (`a_tampered_id_is_a_miss_never_wrong_bytes`,
+  `a_tampered_id_is_a_miss_on_both_transports`), the corrupted-entry and
+  collision cases above, **the marker checksum is demonstrably not the key**
+  (`the_marker_checksum_is_not_the_storage_key` constructs the pair: it searches
+  4096 candidate anchors for two whose `xxh3-64` low 16 bits agree, puts both
+  in one payload, and asserts that both markers carry the *same* four hex digits
+  while the two ids differ, the store holds two entries, and each restores its
+  own original), the injected TTL and byte bound
+  (`the_bound_and_the_ttl_decide_which_restores_succeed_and_nothing_else`:
+  a 1-byte store and a zero-TTL store report **no** ids and change **no** output
+  byte, and the roomy store still restores), one shared original across two
+  groups (`a_shared_original_is_one_entry_and_two_ids`), the forced marker
+  styles, the degenerate payloads, and the parity of both transports
+  (`http_and_grpc_restore_the_same_original_for_the_same_id` compresses once per
+  transport over separate store instances, asserts the same bytes and the same
+  ids, then restores every id through gRPC, through the bare HTTP form and
+  through the HTTP envelope and gets the same original three times).
+  **R1 holds**: `reversible_changes_no_output_byte` diffs the corpus three ways
+  (`true` with a store, `false` with a store, `true` with no store) and
+  `reversible_true_resolves_and_without_a_sink_reports_no_id` pins it at the
+  pipeline; the 12 chat goldens, the 64-round determinism loops and the
+  idempotence property tests are unchanged, and the elapsed fields are read
+  before the sink ever runs.
+  **Feature states.** With `--features ccr` the option resolves, originals are
+  stored, `restore_ids` is populated and restore answers 200/404. Without it
+  the option *still* resolves and echoes `true` (the core is not feature-gated),
+  but no store is wired, so nothing is stored, `restore_ids` is `[]` and restore
+  is 501 / `Unimplemented` — pinned in both transports, with the reason spelled
+  out in the 501 message so the echo is not read as a promise the build cannot
+  keep.
+  **Frozen readings** (§5.7 freezes behaviour per release; all seven are
+  readings of points §9/§6.1/§7/§13.2 leave open):
+  (a) **Eviction policy — §13.2's open question, decided: TTL with an
+  oldest-insert-first byte bound.** §9's normative wording is "local TTL cache",
+  so TTL is the primary policy and LRU-by-bytes is not used; a reader of a
+  restore is not a writer, and recency of *reads* is not observable in what a
+  caller can restore. On insert, entries past their TTL are swept, then entries
+  are dropped oldest-insert-first until the new one fits, and the sweep/eviction
+  is keyed on `stored_at_ns` with ties broken by insertion order, so it is fully
+  deterministic. Rationale for evicting rather than refusing: refusing would
+  return an id the caller can never use, and the byte bound must not let one
+  large request poison the cache for everyone; an entry larger than the whole
+  bound, a zero TTL and a colliding id are the three cases that store nothing.
+  (b) "original span bytes" = the §4.4 removal-rule range (above).
+  (c) The defaults `DEFAULT_TTL_NS` (15 min) and `DEFAULT_MAX_BYTES` (64 MiB);
+  DESIGN §7 has no CCR row, and these are the values a single-process server can
+  hold without a memory ceiling of its own. Both are constructor arguments, and
+  `max_bytes` counts `original + marker` bytes per entry.
+  (d) An id is reported **only** when the entry is live, so `restore_ids` never
+  contains a dead id at the moment it is returned; a later eviction or expiry can
+  still turn it into a miss, which is the documented consequence of (a) and of
+  the TTL itself.
+  (e) The compressed payload is pre-check *context*, never authority: absent or
+  empty skips the pre-check, so a caller who kept only the id can still restore.
+  (f) Both HTTP compress shapes store; gRPC always stores; a build with no store
+  wired stores nothing and reports nothing.
+  (g) `restore_ids` is always present in the envelope and the gRPC `Stats`
+  (an empty list when nothing was stored), never an absent key — §6.2 field 19 is
+  a `repeated string`, so "absent" and "empty" are the same wire value and one
+  shape is easier to consume.
+  **Deviations from DESIGN: three, recorded here rather than in DESIGN.md.**
+  (1) **§13.2's "CCR store eviction policy under concurrent requests (TTL vs
+  LRU-by-bytes)?" is answered by reading (a)** — TTL, with a deterministic
+  oldest-insert-first byte bound — and §13.2 should be updated to say so.
+  (2) **§6.1's `/v1/restore` row pins no request or response shape**, so the two
+  strict shapes and the `application/octet-stream` response above are readings;
+  §6.1 should state them, as W3.2's record already asks for its own two. (3) **§7
+  has no CCR defaults row** (TTL, bound) and **§9's "return one `restore_id` per
+  committed group" is qualified by the flag gate**: with the `ccr` feature off the
+  option resolves but no id exists, because §9 also says the module is
+  flag-gated and "v1 can ship without it". §3's degradation policy, §4.4's
+  removal rule, §4.5's marker and its 4-hex checksum, §4.7's caller guidance, §5's
+  determinism, §6.1's option semantics and header naming, §6.2's service shape
+  and `Stats` message and §9's id format are implemented as written.
+  **Tests and verification.** 27 new tests (7 unit in `ccr.rs`, 13 in
+  `crates/core/tests/ccr.rs`, 6 in `crates/server/tests/restore.rs`, 1 net in
+  `crates/core/tests/api.rs`); six existing tests re-pointed, no test deleted.
+  Workspace **441 → 468 green** (469 collected, the one `#[ignore]`d golden
+  generator), **470** with `--all-features` and with
+  `--features quantification-core/strict_validate`, **66** with
+  `-p quantification-server --features ccr`;
+  `cargo fmt --all --check` clean and
+  `cargo clippy --workspace --all-targets -- -D warnings` clean in the default,
+  `ccr`, `strict_validate` and `--all-features` states. No new dependency, so
+  `Cargo.lock` and `deny.toml` are untouched. The `fuzz/` crate does not
+  compile — `fuzz_splitter.rs` still calls W2.6's two-argument
+  `stage1::split_span` with one — which is **pre-existing** (it fails the same
+  way at `b58d361`) and outside this wave's ownership, but it is the one red
+  build in the tree and W4.5 should fix it.
 
 ## Wave 4 — verification & perf (overlaps Waves 2–3 where noted)
 
