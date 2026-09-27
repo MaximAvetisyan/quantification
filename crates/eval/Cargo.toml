@@ -1,0 +1,13 @@
+[package]
+name = "quantification-eval"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+quantification-core = { path = "../core" }
+tiktoken-rs = "0.12.1"
+
+[[bin]]
+name = "quant-eval"
+path = "src/main.rs"

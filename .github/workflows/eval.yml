@@ -1,0 +1,40 @@
+name: eval
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    env:
+      QUANT_EVAL_JSON: target/eval-report
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: W4.6 is REPORTING-ONLY and can never fail this build
+        run: |
+          echo "DESIGN.md 12: the token-reduction metric and the task-quality parity gates are"
+          echo "tracked in CI reports and become blocking only once the reference corpus (13.4)"
+          echo "and the task suite (13.5) are ratified. continue-on-error is true and no step"
+          echo "below exits nonzero on a metric value; the harness exits 2 only on a bad flag."
+      - name: token reduction over every real tokenizer baseline, plus the bytes/4 proxy
+        run: cargo run -p quantification-eval --bin quant-eval -- --tokenizer o200k_base,cl100k_base,bytes/4
+      - name: harness tests (the measurement is reproducible and non-vacuous)
+        run: cargo test -p quantification-eval
+      - name: report
+        if: always()
+        run: |
+          cat target/eval-report.tokens.json || echo "no token report was written"
+          cat target/eval-report.tasks.json || echo "no task report was written"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: |
+            target/eval-report.tokens.json
+            target/eval-report.tasks.json
