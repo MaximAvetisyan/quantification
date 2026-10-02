@@ -4,8 +4,6 @@ on:
   pull_request:
   push:
     branches: [master]
-  schedule:
-    - cron: "41 3 * * *"
   workflow_dispatch:
 
 jobs:
@@ -71,6 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: isa-leg
+    env:
+      QUANT_ISA_DIR: ${{ github.workspace }}/target/isa-legs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

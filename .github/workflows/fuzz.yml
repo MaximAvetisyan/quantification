@@ -3,8 +3,6 @@ name: fuzz
 on:
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "17 2 * * *"
 
 jobs:
   smoke:
